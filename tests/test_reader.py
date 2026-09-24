@@ -85,10 +85,26 @@ def test_reader_returns_empty_frame_with_columns_when_no_rows(seeded_mart) -> No
 
 def test_reader_empty_and_populated_frames_share_dtypes(seeded_mart) -> None:
     """The empty-result path must not silently downgrade dtypes (e.g. NaN-capable float64
-    collapsing to int64, or event_date losing its datetime64[ns] contract) just because
-    there was no data to infer from.
+    collapsing to int64, event_date losing its datetime64[ns] contract, or a string column
+    inferring as plain `object` instead of `str`) just because there was no data to infer
+    from.
     """
     populated = read_campaign_daily(DSN)
     empty = read_campaign_daily(DSN, start=date(1990, 1, 1), end=date(1990, 1, 2))
     assert populated["event_date"].dtype == empty["event_date"].dtype == "datetime64[ns]"
     assert populated["cpa"].dtype == empty["cpa"].dtype == "float64"
+    for column in ("campaign_id", "advertiser_id", "channel", "anomaly_cause"):
+        assert populated[column].dtype == empty[column].dtype, column
+
+
+def test_reader_preserves_anomaly_cause_null_as_missing(seeded_mart) -> None:
+    """A NULL anomaly_cause (every non-anomalous row) must still read as missing after the
+    explicit string-dtype cast, not as the literal text "None" or "nan".
+    """
+    frame = read_campaign_daily(DSN)
+    is_target = (frame["campaign_id"] == "cmp_t1") & (
+        frame["event_date"] == pd.Timestamp("2024-01-01")
+    )
+    row = frame[is_target]
+    assert len(row) == 1
+    assert pd.isna(row["anomaly_cause"].iloc[0])

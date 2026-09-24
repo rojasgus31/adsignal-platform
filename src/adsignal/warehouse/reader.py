@@ -37,6 +37,15 @@ _INT_COLUMNS = ("impressions", "clicks", "conversions")
 # dtype is required, which for a plain (non-nullable-Int) numpy dtype means float64.
 _FLOAT_COLUMNS = ("spend", "revenue", "ctr", "cpc", "cpm", "cpa", "roas", "anomaly_severity")
 
+# campaign_id/advertiser_id/channel are NOT NULL text; anomaly_cause is nullable text (NULL
+# for every non-anomalous row). All four are pinned to pandas' "str" dtype explicitly: an
+# empty object column otherwise infers as plain `object`, while a populated one infers as
+# `str` under pandas >= 3.0 - the same empty/populated divergence the numeric and datetime
+# columns above were fixed for. pandas' "str" dtype preserves missing values as NA (verified
+# by test_reader_preserves_anomaly_cause_null_as_missing below), so anomaly_cause keeps its
+# NULL fidelity under the cast.
+_STRING_COLUMNS = ("campaign_id", "advertiser_id", "channel", "anomaly_cause")
+
 
 def read_campaign_daily(
     dsn: str,
@@ -79,4 +88,6 @@ def read_campaign_daily(
     for column in _FLOAT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
     frame["is_anomaly"] = frame["is_anomaly"].astype("bool")
+    for column in _STRING_COLUMNS:
+        frame[column] = frame[column].astype("str")
     return frame
