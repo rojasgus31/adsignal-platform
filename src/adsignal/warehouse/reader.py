@@ -30,10 +30,12 @@ MART_COLUMNS: tuple[str, ...] = (
     "is_anomaly",
 )
 
-_NUMERIC_COLUMNS = (
-    "impressions", "clicks", "conversions", "spend", "revenue",
-    "ctr", "cpc", "cpm", "cpa", "roas", "anomaly_severity",
-)
+_INT_COLUMNS = ("impressions", "clicks", "conversions")
+
+# spend/revenue are NOT NULL but kept float64 since they are currency amounts, not counts.
+# ctr/cpc/cpm/cpa/roas/anomaly_severity are nullable, so they cannot be int64: a NaN-capable
+# dtype is required, which for a plain (non-nullable-Int) numpy dtype means float64.
+_FLOAT_COLUMNS = ("spend", "revenue", "ctr", "cpc", "cpm", "cpa", "roas", "anomaly_severity")
 
 
 def read_campaign_daily(
@@ -65,7 +67,16 @@ def read_campaign_daily(
         rows = conn.execute(query, params).fetchall()
 
     frame = pd.DataFrame(rows, columns=list(MART_COLUMNS))
-    frame["event_date"] = pd.to_datetime(frame["event_date"])
-    for column in _NUMERIC_COLUMNS:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    # Dtypes are made explicit rather than left to inference, so the empty-result path
+    # (no rows to infer from) and the populated path always agree. Without the trailing
+    # astype, an empty object column infers as int64/datetime64[s] regardless of the
+    # column's real, populated dtype - silently breaking both the `datetime64[ns]`
+    # contract and NaN-fidelity for the rate columns.
+    frame["event_date"] = pd.to_datetime(frame["event_date"]).astype("datetime64[ns]")
+    for column in _INT_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("int64")
+    for column in _FLOAT_COLUMNS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
+    frame["is_anomaly"] = frame["is_anomaly"].astype("bool")
     return frame

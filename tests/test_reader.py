@@ -54,7 +54,8 @@ def seeded_mart():
 def test_reader_returns_all_mart_columns(seeded_mart) -> None:
     frame = read_campaign_daily(DSN)
     assert tuple(frame.columns) == MART_COLUMNS
-    assert len(frame) >= 3
+    subset = frame[frame["campaign_id"] == "cmp_t1"]
+    assert len(subset) == 3
 
 
 def test_reader_preserves_nulls_as_nan(seeded_mart) -> None:
@@ -80,3 +81,14 @@ def test_reader_returns_empty_frame_with_columns_when_no_rows(seeded_mart) -> No
     frame = read_campaign_daily(DSN, start=date(1990, 1, 1), end=date(1990, 1, 2))
     assert len(frame) == 0
     assert tuple(frame.columns) == MART_COLUMNS
+
+
+def test_reader_empty_and_populated_frames_share_dtypes(seeded_mart) -> None:
+    """The empty-result path must not silently downgrade dtypes (e.g. NaN-capable float64
+    collapsing to int64, or event_date losing its datetime64[ns] contract) just because
+    there was no data to infer from.
+    """
+    populated = read_campaign_daily(DSN)
+    empty = read_campaign_daily(DSN, start=date(1990, 1, 1), end=date(1990, 1, 2))
+    assert populated["event_date"].dtype == empty["event_date"].dtype == "datetime64[ns]"
+    assert populated["cpa"].dtype == empty["cpa"].dtype == "float64"
