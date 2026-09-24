@@ -63,3 +63,36 @@ def test_anomaly_label_rejects_unknown_cause() -> None:
             cause="sunspots",
             severity=3,
         )
+
+
+def test_campaign_rejects_end_date_before_start_date() -> None:
+    with pytest.raises(ValueError, match="end_date precedes start_date"):
+        Campaign(
+            id="cmp_0001",
+            advertiser_id="adv_0001",
+            name="Q1 Brand",
+            channel="search",
+            start_date=date(2024, 3, 31),
+            end_date=date(2024, 1, 1),
+            daily_budget=500.0,
+        )
+
+
+def test_anomaly_label_rejects_severity_too_low() -> None:
+    with pytest.raises(ValueError, match="severity must be between 1 and 5"):
+        AnomalyLabel(
+            event_date=date(2024, 1, 1),
+            campaign_id="cmp_0001",
+            cause="budget_pacing",
+            severity=0,
+        )
+
+
+def test_anomaly_label_rejects_severity_too_high() -> None:
+    with pytest.raises(ValueError, match="severity must be between 1 and 5"):
+        AnomalyLabel(
+            event_date=date(2024, 1, 1),
+            campaign_id="cmp_0001",
+            cause="budget_pacing",
+            severity=6,
+        )
