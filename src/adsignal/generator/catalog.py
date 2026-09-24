@@ -47,6 +47,11 @@ _HEADLINES = (
     "Start today",
 )
 
+_MIN_CAMPAIGN_DURATION_DAYS = 30
+_MAX_CAMPAIGN_DURATION_DAYS = 180
+_MIN_DAILY_BUDGET = 200.0
+_MAX_DAILY_BUDGET = 5000.0
+
 
 def build_catalog(
     *,
@@ -76,7 +81,7 @@ def build_catalog(
         for campaign_index in range(campaigns_per_advertiser):
             campaign_id = f"cmp_{advertiser_index:04d}_{campaign_index:03d}"
             offset = rng.randint(0, max(window_days - 30, 0))
-            duration = rng.randint(30, 180)
+            duration = rng.randint(_MIN_CAMPAIGN_DURATION_DAYS, _MAX_CAMPAIGN_DURATION_DAYS)
             campaign_start = start_date + timedelta(days=offset)
             campaign_end = min(campaign_start + timedelta(days=duration), end_date)
             campaigns.append(
@@ -87,7 +92,7 @@ def build_catalog(
                     channel=rng.choice(CHANNELS),
                     start_date=campaign_start,
                     end_date=campaign_end,
-                    daily_budget=round(rng.uniform(200.0, 5000.0), 2),
+                    daily_budget=round(rng.uniform(_MIN_DAILY_BUDGET, _MAX_DAILY_BUDGET), 2),
                 )
             )
 
