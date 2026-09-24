@@ -35,8 +35,12 @@ _EFFECTS: dict[str, _Effect] = {
 class AnomalyInjector:
     """Perturbs an event stream and records ground truth.
 
-    Labels are appended as the stream is consumed. Read `.labels` only after
-    the iterator returned by `.rows()` has been exhausted.
+    Labels are appended as the stream is consumed, one per campaign-day that
+    actually had a row processed for it — never for a day with no row. Read
+    `.labels` only after the iterator returned by `.rows()` has been
+    exhausted. Windows are refused if they would overlap an existing window
+    for the same campaign, so at most one label is ever produced per
+    campaign-day, regardless of the order rows for that campaign arrive in.
     """
 
     def __init__(
@@ -60,16 +64,32 @@ class AnomalyInjector:
         self._forced_cause = forced_cause
         self.labels: list[AnomalyLabel] = []
         self._windows: dict[str, list[tuple[date, date, str, int]]] = {}
-        self._claimed: set[tuple[str, date]] = set()
+        self._labelled: set[tuple[str, date]] = set()
 
     def rows(self, source: Iterable[EventRow]) -> Iterator[EventRow]:
-        """Yield the source rows, perturbing those inside an anomaly window."""
+        """Yield the source rows, perturbing those inside an anomaly window.
+
+        A label is appended only when a row for that campaign-day is actually
+        processed, guarded by `_labelled` so that multiple creatives sharing a
+        campaign-day still produce exactly one label.
+        """
         for row in source:
             match = self._window_for(row.campaign_id, row.event_date)
             if match is None:
                 yield row
                 continue
             _, _, cause, severity = match
+            key = (row.campaign_id, row.event_date)
+            if key not in self._labelled:
+                self._labelled.add(key)
+                self.labels.append(
+                    AnomalyLabel(
+                        event_date=row.event_date,
+                        campaign_id=row.campaign_id,
+                        cause=cause,
+                        severity=severity,
+                    )
+                )
             yield _apply(row, _EFFECTS[cause], severity)
 
     def _window_for(
@@ -77,8 +97,12 @@ class AnomalyInjector:
     ) -> tuple[date, date, str, int] | None:
         """Return the anomaly window covering this campaign-day, deciding lazily.
 
-        A campaign-day already claimed by a window is never reconsidered, which
-        is what guarantees one label per campaign-day.
+        A new window is refused if it would overlap any existing window for
+        this campaign, regardless of the order rows arrive in. This is what
+        guarantees at most one label per campaign-day even for an
+        out-of-order input stream: without this check, a later out-of-order
+        row could open a second window over days an earlier-opened window
+        already covers.
         """
         for window in self._windows.get(campaign_id, ()):
             start, end, _, _ = window
@@ -86,8 +110,6 @@ class AnomalyInjector:
                 return window
 
         if self._rate <= 0.0:
-            return None
-        if (campaign_id, event_date) in self._claimed:
             return None
 
         # random.Random only accepts None/int/float/str/bytes/bytearray, so the
@@ -102,22 +124,19 @@ class AnomalyInjector:
         duration = rng.randint(self._min_duration, self._max_duration)
         end = event_date + timedelta(days=duration - 1)
 
+        if self._overlaps_existing(campaign_id, event_date, end):
+            return None
+
         window = (event_date, end, cause, severity)
         self._windows.setdefault(campaign_id, []).append(window)
-
-        for offset in range(duration):
-            day = event_date + timedelta(days=offset)
-            self._claimed.add((campaign_id, day))
-            self.labels.append(
-                AnomalyLabel(
-                    event_date=day,
-                    campaign_id=campaign_id,
-                    cause=cause,
-                    severity=severity,
-                )
-            )
-
         return window
+
+    def _overlaps_existing(self, campaign_id: str, start: date, end: date) -> bool:
+        """Return True if [start, end] overlaps any existing window for this campaign."""
+        for existing_start, existing_end, _, _ in self._windows.get(campaign_id, ()):
+            if start <= existing_end and existing_start <= end:
+                return True
+        return False
 
 
 def _apply(row: EventRow, effect: _Effect, severity: int) -> EventRow:
@@ -136,7 +155,10 @@ def _apply(row: EventRow, effect: _Effect, severity: int) -> EventRow:
         conversions = 0
     else:
         conversions = min(clicks, max(0, round(scale(row.conversions, effect.conversions))))
-    revenue = 0.0 if conversions == 0 else row.revenue * (conversions / max(row.conversions, 1))
+    # scale(0, mult) is always 0, so conversions == 0 whenever row.conversions
+    # == 0; reaching the else branch therefore implies row.conversions > 0,
+    # making a divisor guard unreachable and unnecessary.
+    revenue = 0.0 if conversions == 0 else row.revenue * (conversions / row.conversions)
 
     return EventRow(
         event_date=row.event_date,
