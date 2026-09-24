@@ -16,8 +16,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    # The author's machine has 8 GB shared with Docker. Caps keep the stack
-    # from starving the host during a full generation run.
+    # Memory caps keep the stack from starving the host during a full
+    # generation run on a typical development machine.
     deploy:
       resources:
         limits:
@@ -28,6 +28,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
       ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@postgres:5432/adsignal
       ADSIGNAL_DUCKDB_PATH: /app/data/adsignal.duckdb
