@@ -1,3 +1,4 @@
+import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -7,6 +8,25 @@ from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
+
+_DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_dbt_packages() -> None:
+    """Install dbt packages once per session if they are missing.
+
+    `dbt/dbt_packages/` is gitignored, so a fresh clone that runs the test
+    suite without first running `dbt deps` (README Quick Start, or CI/the
+    Dockerfile) would otherwise fail every dbt-building test. This makes the
+    suite self-sufficient in that third environment too.
+    """
+    if (_DBT_DIR / "dbt_packages").exists():
+        return
+    subprocess.run(
+        ["dbt", "deps", "--project-dir", str(_DBT_DIR), "--profiles-dir", str(_DBT_DIR)],
+        check=True,
+    )
 
 
 @pytest.fixture
