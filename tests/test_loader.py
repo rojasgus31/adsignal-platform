@@ -1,11 +1,16 @@
 import os
+from datetime import date
 from pathlib import Path
 
 import psycopg
 import pytest
 
+from adsignal.generator.anomalies import AnomalyInjector
+from adsignal.generator.catalog import build_catalog
+from adsignal.generator.events import generate_events
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema, load_mart_to_postgres
+from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
 
@@ -85,6 +90,52 @@ def test_reload_updates_changed_values(built_duckdb) -> None:
             "SELECT count(*) FROM fct_campaign_daily WHERE impressions = -1"
         ).fetchone()[0]
     assert stale == 0
+
+
+def test_reload_with_fewer_keys_drops_stale_rows(tmp_path, small_dataset) -> None:
+    """C5: a per-key upsert is idempotent for keys that reappear but never
+    deletes keys that don't. Load mart A, then a mart B with strictly fewer
+    keys (a subset of advertisers), and assert the final row count equals
+    B's — not A's plus B's. `test_load_is_idempotent` reloads the *same*
+    file, which is exactly the case where a missing-delete bug is invisible;
+    this covers the case where it is not."""
+    catalog, events_path, labels_path = small_dataset
+
+    def _build(name: str, n_advertisers: int) -> Path:
+        sub_catalog = build_catalog(
+            seed=99,
+            n_advertisers=n_advertisers,
+            campaigns_per_advertiser=3,
+            creatives_per_campaign=2,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+        )
+        injector = AnomalyInjector(seed=99, rate=0.08)
+        sub_events_path = tmp_path / f"{name}_events.parquet"
+        sub_labels_path = tmp_path / f"{name}_labels.parquet"
+        write_events_parquet(
+            injector.rows(generate_events(sub_catalog, seed=99)), sub_events_path
+        )
+        write_labels_parquet(injector.labels, sub_labels_path)
+
+        duckdb_path = tmp_path / f"{name}.duckdb"
+        with open_duckdb(duckdb_path) as conn:
+            register_sources(
+                conn, events_path=sub_events_path, labels_path=sub_labels_path, catalog=sub_catalog
+            )
+        run_dbt(project_dir=DBT_DIR, duckdb_path=duckdb_path, command="build")
+        return duckdb_path
+
+    mart_a = _build("mart_a", n_advertisers=3)
+    mart_b = _build("mart_b", n_advertisers=1)
+
+    load_mart_to_postgres(mart_a, DSN)
+    loaded_b = load_mart_to_postgres(mart_b, DSN)
+
+    with psycopg.connect(DSN) as conn:
+        final_count = conn.execute("SELECT count(*) FROM fct_campaign_daily").fetchone()[0]
+
+    assert final_count == loaded_b
 
 
 def test_null_rate_metrics_survive_the_load(built_duckdb) -> None:

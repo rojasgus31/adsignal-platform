@@ -1,7 +1,14 @@
 """Loading aggregated marts from DuckDB into Postgres.
 
-This is the only module that talks to Postgres. Loads are upserts keyed on
-(event_date, campaign_id), so re-running a pipeline never duplicates rows.
+This is the only module that talks to Postgres. Loads are full refreshes:
+each load truncates the serving table and reinserts every mart row inside a
+single transaction. The mart is a full-refresh dbt `table` and is small, so
+this is both simpler than a per-key upsert and a stronger guarantee — a
+per-key upsert (`INSERT ... ON CONFLICT DO UPDATE`) is idempotent for keys
+that reappear, but rows from a previous run that a new run does not produce
+(e.g. after changing `ADSIGNAL_TARGET_EVENTS`, the seed, or the date window)
+would otherwise survive forever, silently mixing two datasets in the
+serving table.
 """
 
 from pathlib import Path
@@ -65,20 +72,20 @@ def ensure_schema(dsn: str) -> None:
 
 
 def load_mart_to_postgres(duckdb_path: Path, dsn: str, batch_size: int = 10_000) -> int:
-    """Upsert the DuckDB mart into Postgres. Returns the number of rows upserted."""
+    """Full-refresh the DuckDB mart into Postgres. Returns the number of rows loaded.
+
+    Truncates the serving table and reinserts every row inside a single
+    transaction, so the final table always matches this run's mart exactly —
+    including removing rows for keys the previous run produced but this one
+    does not.
+    """
     ensure_schema(dsn)
 
     columns = sql.SQL(", ").join(sql.Identifier(name) for name in _MART_COLUMNS)
     placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in _MART_COLUMNS)
-    updates = sql.SQL(", ").join(
-        sql.SQL("{col} = EXCLUDED.{col}").format(col=sql.Identifier(name))
-        for name in _MART_COLUMNS
-        if name not in ("event_date", "campaign_id")
-    )
     statement = sql.SQL(
-        "INSERT INTO fct_campaign_daily ({columns}) VALUES ({placeholders}) "
-        "ON CONFLICT (event_date, campaign_id) DO UPDATE SET {updates}"
-    ).format(columns=columns, placeholders=placeholders, updates=updates)
+        "INSERT INTO fct_campaign_daily ({columns}) VALUES ({placeholders})"
+    ).format(columns=columns, placeholders=placeholders)
 
     total = 0
     select = f"SELECT {', '.join(_MART_COLUMNS)} FROM main_marts.fct_campaign_daily"  # noqa: S608
@@ -86,6 +93,7 @@ def load_mart_to_postgres(duckdb_path: Path, dsn: str, batch_size: int = 10_000)
     with open_duckdb(duckdb_path) as duck, psycopg.connect(dsn) as pg:
         cursor = duck.execute(select)
         with pg.cursor() as pg_cursor:
+            pg_cursor.execute("TRUNCATE TABLE fct_campaign_daily")
             while True:
                 batch = cursor.fetchmany(batch_size)
                 if not batch:
