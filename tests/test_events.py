@@ -1,3 +1,4 @@
+import inspect
 from collections import Counter
 from datetime import date, timedelta
 
@@ -20,7 +21,11 @@ def _tiny_catalog(start: date, end: date):
 def test_generate_events_is_a_lazy_iterator() -> None:
     catalog = _tiny_catalog(date(2024, 1, 1), date(2024, 3, 31))
     events = generate_events(catalog, seed=1)
-    assert not isinstance(events, list)
+    # inspect.isgenerator is true only for a generator object produced by a
+    # yield-bearing function. Unlike `not isinstance(events, list)`, it also
+    # rejects a tuple and an eagerly-materialized `iter(some_list)` — the
+    # regression this test exists to catch.
+    assert inspect.isgenerator(events)
     assert next(iter(events)) is not None
 
 
