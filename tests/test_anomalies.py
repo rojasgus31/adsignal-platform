@@ -46,7 +46,7 @@ def test_at_most_one_anomaly_per_campaign_day() -> None:
     assert not duplicates, f"duplicate campaign-day labels: {duplicates}"
 
 
-def test_injection_is_deterministic() -> None:
+def test_injection_is_deterministic_for_a_fixed_input_order() -> None:
     first = AnomalyInjector(seed=4, rate=0.1)
     first_rows = list(first.rows(_rows()))
     second = AnomalyInjector(seed=4, rate=0.1)

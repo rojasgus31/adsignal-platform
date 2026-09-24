@@ -41,6 +41,12 @@ class AnomalyInjector:
     exhausted. Windows are refused if they would overlap an existing window
     for the same campaign, so at most one label is ever produced per
     campaign-day, regardless of the order rows for that campaign arrive in.
+
+    The *set* of labels produced is, by design, order-dependent: a window
+    that a given arrival order refuses for overlapping an already-opened
+    window may open under a different arrival order. Only the one-label-
+    per-campaign-day guarantee above is order-independent — determinism of
+    the exact label set holds only for a fixed input order.
     """
 
     def __init__(
