@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.19 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
@@ -26,7 +26,12 @@ RUN uv run dbt deps --project-dir dbt --profiles-dir dbt
 ENV PATH="/app/.venv/bin:$PATH" \
     DAGSTER_HOME=/app/.dagster
 
-RUN mkdir -p /app/.dagster /app/data
+RUN groupadd --gid 1000 adsignal \
+    && useradd --uid 1000 --gid adsignal --create-home --shell /bin/bash adsignal \
+    && mkdir -p /app/.dagster /app/data \
+    && chown -R adsignal:adsignal /app
+
+USER adsignal
 
 EXPOSE 3000
 
