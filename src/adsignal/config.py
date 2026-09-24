@@ -1,4 +1,9 @@
-"""Application settings. This is the only module that reads the environment."""
+"""Application settings.
+
+`Settings` is the only module that reads configuration *from* the
+environment. `adsignal.warehouse.duckdb_io` *passes* settings on to the dbt
+subprocess's environment — it does not itself read configuration.
+"""
 
 from datetime import date
 from functools import lru_cache

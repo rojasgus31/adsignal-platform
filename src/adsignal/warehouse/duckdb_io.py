@@ -3,6 +3,7 @@
 This is the only module that opens a DuckDB connection.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -96,6 +97,4 @@ def run_dbt(*, project_dir: Path, duckdb_path: Path, command: str = "build") -> 
 
 
 def _dbt_env(duckdb_path: Path) -> dict[str, str]:
-    import os
-
     return {**os.environ, "ADSIGNAL_DUCKDB_PATH": str(duckdb_path)}
