@@ -1,0 +1,7 @@
+adsignal:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: "{{ env_var('ADSIGNAL_DUCKDB_PATH', 'data/adsignal.duckdb') }}"
+      threads: 4

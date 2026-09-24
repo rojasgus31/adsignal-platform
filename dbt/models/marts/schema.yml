@@ -1,0 +1,31 @@
+version: 2
+
+models:
+  - name: fct_campaign_daily
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns: [event_date, campaign_id]
+    columns:
+      - name: event_date
+        tests: [not_null]
+      - name: campaign_id
+        tests:
+          - not_null
+          - relationships:
+              to: ref('stg_campaigns')
+              field: campaign_id
+      - name: impressions
+        tests: [not_null]
+      - name: is_anomaly
+        tests: [not_null]
+      - name: anomaly_cause
+        tests:
+          - accepted_values:
+              values:
+                - budget_pacing
+                - creative_fatigue
+                - audience_saturation
+                - tracking_error
+                - competitive_pressure
+              config:
+                where: "anomaly_cause is not null"

@@ -9,6 +9,8 @@ dependencies = [
     "pyarrow>=18.0",
     "duckdb>=1.1",
     "psycopg[binary]>=3.2",
+    "dbt-core>=1.9",
+    "dbt-duckdb>=1.9",
 ]
 
 [dependency-groups]

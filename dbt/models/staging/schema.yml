@@ -1,0 +1,40 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: main
+    tables:
+      - name: raw_events
+      - name: raw_anomaly_labels
+      - name: raw_campaigns
+      - name: raw_creatives
+      - name: raw_advertisers
+
+models:
+  - name: stg_events
+    columns:
+      - name: campaign_id
+        tests: [not_null]
+      - name: event_date
+        tests: [not_null]
+      - name: impressions
+        tests: [not_null]
+
+  - name: stg_campaigns
+    columns:
+      - name: campaign_id
+        tests: [not_null, unique]
+      - name: channel
+        tests:
+          - accepted_values:
+              values: ["search", "social", "display", "video", "native"]
+
+  - name: stg_creatives
+    columns:
+      - name: creative_id
+        tests: [not_null, unique]
+      - name: campaign_id
+        tests:
+          - relationships:
+              to: ref('stg_campaigns')
+              field: campaign_id
