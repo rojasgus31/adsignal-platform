@@ -33,6 +33,23 @@ _LABEL_COLUMNS = ("is_anomaly", "anomaly_cause", "anomaly_severity")
 
 CATEGORICAL_COLUMNS: tuple[str, ...] = ("channel",)
 
+# Explicit dtypes for the empty-frame path, mirroring `warehouse.reader`'s
+# `_INT_COLUMNS`/`_FLOAT_COLUMNS`/`_STRING_COLUMNS` split. Without this, every
+# declared column defaulted to float64 - wrong for 9 of them - so an empty
+# date-window read produced a frame whose dtypes silently diverged from the
+# populated path's (this is the same defect class fixed twice in
+# `reader.py`, one module downstream). Any column not named here is a ratio,
+# baseline or z-score and is genuinely float64.
+_EMPTY_INT_COLUMNS = ("impressions", "clicks", "conversions")
+# `.dt.dayofweek` yields int32, not the int64 of the mart's count columns.
+_EMPTY_INT32_COLUMNS = ("day_of_week",)
+# campaign_id/channel are non-nullable text; anomaly_cause is nullable text
+# (NULL for every non-anomalous row). pandas' "str" dtype preserves missing
+# values as NA, same as `reader._STRING_COLUMNS`.
+_EMPTY_STRING_COLUMNS = ("campaign_id", "channel", "anomaly_cause")
+_EMPTY_DATETIME_COLUMNS = ("event_date",)
+_EMPTY_BOOL_COLUMNS = ("is_anomaly",)
+
 FEATURE_COLUMNS: tuple[str, ...] = (
     *_PASSTHROUGH,
     "cvr",
@@ -123,8 +140,27 @@ def _add_zscores(working: pd.DataFrame, baseline_window: int, zscore_window: int
 
 
 def _empty_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return an empty frame that still carries every declared column."""
+    """Return an empty frame that still carries every declared column.
+
+    Dtypes are made explicit rather than left to default to float64, so this
+    path agrees with the populated path's dtypes column-for-column - see
+    `test_empty_frame_dtypes_match_the_populated_path`.
+    """
     columns = [*_IDENTIFIER_COLUMNS, *FEATURE_COLUMNS]
     if "is_anomaly" in frame.columns:
         columns.extend(_LABEL_COLUMNS)
-    return pd.DataFrame({column: pd.Series(dtype="float64") for column in columns})
+
+    def _dtype(column: str) -> str:
+        if column in _EMPTY_INT_COLUMNS:
+            return "int64"
+        if column in _EMPTY_INT32_COLUMNS:
+            return "int32"
+        if column in _EMPTY_STRING_COLUMNS:
+            return "str"
+        if column in _EMPTY_DATETIME_COLUMNS:
+            return "datetime64[ns]"
+        if column in _EMPTY_BOOL_COLUMNS:
+            return "bool"
+        return "float64"
+
+    return pd.DataFrame({column: pd.Series(dtype=_dtype(column)) for column in columns})

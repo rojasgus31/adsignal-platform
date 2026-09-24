@@ -107,3 +107,26 @@ def test_empty_frame_returns_empty_with_feature_columns(flat_series) -> None:
     assert len(features) == 0
     for column in FEATURE_COLUMNS:
         assert column in features.columns
+
+
+def test_empty_frame_dtypes_match_the_populated_path(flat_series) -> None:
+    """I1: the empty path must not silently diverge from the populated one.
+
+    A frame with no rows to infer from previously defaulted every column to
+    float64, which is wrong for `event_date` (datetime), `campaign_id`/
+    `channel`/`anomaly_cause` (text), `impressions`/`clicks`/`conversions`/
+    `day_of_week` (int) and `is_anomaly` (bool) - the same defect class fixed
+    twice in `warehouse.reader` during Task 1, left standing here.
+    """
+    # `flat_series` itself doesn't emulate `warehouse.reader`'s explicit casts
+    # (real callers always go through the reader first), so apply the two
+    # casts that matter here before comparing - otherwise the comparison
+    # would be checking `flat_series`'s incidental construction, not the
+    # populated-vs-empty dtype contract `build_features` promises its callers.
+    populated_input = flat_series(5)
+    populated_input["event_date"] = populated_input["event_date"].astype("datetime64[ns]")
+    populated_input["anomaly_cause"] = populated_input["anomaly_cause"].astype("str")
+
+    populated = build_features(populated_input)
+    empty = build_features(flat_series(0))
+    assert empty.dtypes.equals(populated.dtypes)
