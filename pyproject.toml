@@ -13,6 +13,9 @@ dependencies = [
     "dbt-duckdb>=1.9",
     "dagster>=1.9",
     "dagster-webserver>=1.9",
+    "pandas>=2.2",
+    "scikit-learn>=1.5",
+    "mlflow>=2.17",
 ]
 
 [dependency-groups]
@@ -20,6 +23,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.8",
     "mypy>=1.13",
+    "pandas-stubs>=3.0.5.260914",
 ]
 
 [build-system]
