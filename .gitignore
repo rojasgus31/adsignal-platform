@@ -13,3 +13,4 @@ dbt/logs/
 dbt/dbt_packages/
 dbt/.user.yml
 .DS_Store
+.omc/
