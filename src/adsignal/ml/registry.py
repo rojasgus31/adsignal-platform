@@ -19,12 +19,6 @@ _EXPERIMENT = "adsignal"
 _DETECTOR_FILE = "detector.pkl"
 _CLASSIFIER_FILE = "triage.pkl"
 
-# MLflow >=3 refuses the plain filesystem tracking backend by default, steering
-# users toward a database-backed store. This project deliberately wants local,
-# file-based tracking with no server to run — see the module docstring — so
-# this is the documented opt-out, not a workaround for a bug.
-os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-
 
 def save_models(directory: Path, detector: AnomalyDetector, classifier: TriageClassifier) -> None:
     """Persist both fitted models to `directory`."""
@@ -41,8 +35,12 @@ def load_models(directory: Path) -> tuple[AnomalyDetector, TriageClassifier]:
         if not path.exists():
             raise FileNotFoundError(f"no model artifact at {path}")
 
-    detector: AnomalyDetector = pickle.loads(detector_path.read_bytes())  # noqa: S301
-    classifier: TriageClassifier = pickle.loads(classifier_path.read_bytes())  # noqa: S301
+    # Bandit's pickle-deserialization rule isn't in this project's ruff
+    # `select`, so silencing it here would suppress nothing that is actually
+    # checked - these artifacts are only ever the models this same process
+    # just wrote to `directory` in `save_models`, never untrusted input.
+    detector: AnomalyDetector = pickle.loads(detector_path.read_bytes())
+    classifier: TriageClassifier = pickle.loads(classifier_path.read_bytes())
     return detector, classifier
 
 
@@ -54,8 +52,26 @@ def log_training_run(
     triage_metrics: TriageMetrics,
     detector_metrics: DetectorMetrics,
     params: dict[str, object],
-) -> str:
-    """Log one training run to MLflow and return its run id."""
+) -> tuple[str, Path]:
+    """Log one training run to MLflow; return its run id and artifact directory.
+
+    The artifact directory is returned (not just the run id) so a caller can
+    persist it alongside the run in `model_metrics` - the run registry
+    (Postgres, shared) and the artifact store (`tracking_dir`, per-`Settings`)
+    are otherwise two independent sources of truth that can silently
+    disagree about where a run's models live. See
+    `adsignal.pipeline.assets._latest_run`.
+    """
+    # MLflow >=3 refuses the plain filesystem tracking backend by default,
+    # steering users toward a database-backed store. This project
+    # deliberately wants local, file-based tracking with no server to run —
+    # see the module docstring — so this is the documented opt-out, not a
+    # workaround for a bug. Set here, immediately before the call that needs
+    # it, rather than at import time: importing this module (transitively,
+    # just importing `adsignal.pipeline.definitions`) must not mutate the
+    # process environment for every embedding host.
+    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
     tracking_dir.mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_dir.resolve().as_uri())
     mlflow.set_experiment(_EXPERIMENT)
@@ -70,6 +86,7 @@ def log_training_run(
                 "detector_precision": detector_metrics.precision,
                 "detector_recall": detector_metrics.recall,
                 "detector_f1": detector_metrics.f1,
+                "detector_roc_auc": detector_metrics.roc_auc,
             }
         )
         for cause, score in triage_metrics.per_class_f1.items():
@@ -79,4 +96,4 @@ def log_training_run(
         save_models(artifacts, detector, classifier)
         mlflow.log_artifacts(str(artifacts))
 
-        return str(run.info.run_id)
+        return str(run.info.run_id), artifacts

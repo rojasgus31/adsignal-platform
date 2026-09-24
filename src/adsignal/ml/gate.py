@@ -35,31 +35,18 @@ would show. See `adsignal.ml.evaluation.evaluate_pipeline`.
 import sys
 
 from adsignal.config import get_settings
-from adsignal.ml.detector import AnomalyDetector
-from adsignal.ml.evaluation import (
-    MINIMUM_DETECTOR_AUC,
-    MINIMUM_MACRO_F1,
-    evaluate_detector,
-    evaluate_pipeline,
-    evaluate_triage,
-)
-from adsignal.ml.features import build_features
-from adsignal.ml.splits import temporal_split
-from adsignal.ml.triage import TriageClassifier
+from adsignal.ml.evaluation import MINIMUM_DETECTOR_AUC, MINIMUM_MACRO_F1
+from adsignal.ml.training import train_and_evaluate
 from adsignal.warehouse.reader import read_campaign_daily
 
 
 def main() -> int:
     """Train on the mart, evaluate on the holdout, and gate on both models."""
     settings = get_settings()
-    features = build_features(read_campaign_daily(settings.postgres_dsn))
-    train, holdout = temporal_split(features, holdout_fraction=0.25)
-
-    detector = AnomalyDetector(random_state=settings.seed).fit(train)
-    classifier = TriageClassifier(random_state=settings.seed).fit(train)
-
-    triage_metrics = evaluate_triage(classifier, holdout)
-    detector_metrics = evaluate_detector(detector, holdout)
+    result = train_and_evaluate(read_campaign_daily(settings.postgres_dsn), seed=settings.seed)
+    triage_metrics = result.triage_metrics
+    detector_metrics = result.detector_metrics
+    pipeline_metrics = result.pipeline_metrics
 
     print(f"triage macro F1: {triage_metrics.macro_f1:.4f} (floor {MINIMUM_MACRO_F1})")
     print(f"triage accuracy: {triage_metrics.accuracy:.4f} over {triage_metrics.n_samples} samples")
@@ -75,7 +62,6 @@ def main() -> int:
     )
 
     print("\n--- end-to-end (detector -> classifier, as production runs it) ---")
-    pipeline_metrics = evaluate_pipeline(detector, classifier, holdout)
     print(
         f"flagged {pipeline_metrics.n_flagged} rows, "
         f"{pipeline_metrics.n_true_anomalies_flagged} of them true anomalies "

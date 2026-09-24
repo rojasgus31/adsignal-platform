@@ -13,13 +13,12 @@ from adsignal.config import Settings
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
-from adsignal.ml.detector import DETECTOR_FEATURES, AnomalyDetector
+from adsignal.ml.detector import DETECTOR_FEATURES
 from adsignal.ml.drift import feature_drift
-from adsignal.ml.evaluation import evaluate_detector, evaluate_triage
 from adsignal.ml.features import build_features
 from adsignal.ml.registry import load_models, log_training_run
 from adsignal.ml.splits import temporal_split
-from adsignal.ml.triage import TriageClassifier
+from adsignal.ml.training import BASELINE_WINDOW, HOLDOUT_FRACTION, train_and_evaluate
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import load_mart_to_postgres
 from adsignal.warehouse.metrics_store import (
@@ -113,54 +112,52 @@ def campaign_daily_mart(context: AssetExecutionContext) -> None:
     context.add_output_metadata({"rows_upserted": MetadataValue.int(loaded)})
 
 
-_HOLDOUT_FRACTION = 0.25
-_BASELINE_WINDOW = 7
-
-
 @asset(
     deps=[campaign_daily_mart],
     required_resource_keys={"settings"},
     description="Trained anomaly detector and triage classifier, logged to MLflow",
 )
 def trained_models(context: AssetExecutionContext) -> None:
-    """Train both models on a temporal split of the mart and record the run."""
+    """Train both models on a temporal split of the mart and record the run.
+
+    Feature building, the split, fitting, and evaluation all live in
+    `adsignal.ml.training.train_and_evaluate` - the same recipe `adsignal.ml.gate`
+    uses, so the CI gate can never certify a model trained differently from
+    the one this asset produces (I7).
+    """
     settings: Settings = context.resources.settings
 
-    features = build_features(
-        read_campaign_daily(settings.postgres_dsn), baseline_window=_BASELINE_WINDOW
-    )
-    train, holdout = temporal_split(features, holdout_fraction=_HOLDOUT_FRACTION)
+    result = train_and_evaluate(read_campaign_daily(settings.postgres_dsn), seed=settings.seed)
 
-    detector = AnomalyDetector(random_state=settings.seed).fit(train)
-    classifier = TriageClassifier(random_state=settings.seed).fit(train)
-
-    triage_metrics = evaluate_triage(classifier, holdout)
-    detector_metrics = evaluate_detector(detector, holdout)
-
-    run_id = log_training_run(
+    run_id, artifact_dir = log_training_run(
         tracking_dir=settings.mlflow_dir,
-        detector=detector,
-        classifier=classifier,
-        triage_metrics=triage_metrics,
-        detector_metrics=detector_metrics,
+        detector=result.detector,
+        classifier=result.classifier,
+        triage_metrics=result.triage_metrics,
+        detector_metrics=result.detector_metrics,
         params={
-            "baseline_window": _BASELINE_WINDOW,
-            "holdout_fraction": _HOLDOUT_FRACTION,
+            "baseline_window": BASELINE_WINDOW,
+            "holdout_fraction": HOLDOUT_FRACTION,
             "seed": settings.seed,
         },
     )
     write_model_metrics(
-        settings.postgres_dsn, run_id, datetime.now(UTC), triage_metrics, detector_metrics
+        settings.postgres_dsn,
+        run_id,
+        datetime.now(UTC),
+        result.triage_metrics,
+        result.detector_metrics,
+        str(artifact_dir),
     )
 
     context.add_output_metadata(
         {
             "run_id": MetadataValue.text(run_id),
-            "triage_macro_f1": MetadataValue.float(triage_metrics.macro_f1),
-            "triage_accuracy": MetadataValue.float(triage_metrics.accuracy),
-            "detector_recall": MetadataValue.float(detector_metrics.recall),
-            "train_rows": MetadataValue.int(len(train)),
-            "holdout_rows": MetadataValue.int(len(holdout)),
+            "triage_macro_f1": MetadataValue.float(result.triage_metrics.macro_f1),
+            "triage_accuracy": MetadataValue.float(result.triage_metrics.accuracy),
+            "detector_roc_auc": MetadataValue.float(result.detector_metrics.roc_auc),
+            "train_rows": MetadataValue.int(len(result.train)),
+            "holdout_rows": MetadataValue.int(len(result.holdout)),
         }
     )
 
@@ -173,12 +170,12 @@ def trained_models(context: AssetExecutionContext) -> None:
 def anomaly_scores(context: AssetExecutionContext) -> None:
     """Score every campaign-day and upsert the predictions."""
     settings: Settings = context.resources.settings
-    run_id = _latest_run_id(settings)
+    run_id, artifact_dir = _latest_run(settings)
 
     features = build_features(
-        read_campaign_daily(settings.postgres_dsn), baseline_window=_BASELINE_WINDOW
+        read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
     )
-    detector, classifier = load_models(settings.mlflow_dir / "artifacts" / run_id)
+    detector, classifier = load_models(artifact_dir)
 
     flagged = features[detector.predict(features)]
     if flagged.empty:
@@ -202,12 +199,12 @@ def anomaly_scores(context: AssetExecutionContext) -> None:
 def drift_report(context: AssetExecutionContext) -> None:
     """Compare the holdout window's feature distributions against the training window."""
     settings: Settings = context.resources.settings
-    run_id = _latest_run_id(settings)
+    run_id, _ = _latest_run(settings)
 
     features = build_features(
-        read_campaign_daily(settings.postgres_dsn), baseline_window=_BASELINE_WINDOW
+        read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
     )
-    reference, current = temporal_split(features, holdout_fraction=_HOLDOUT_FRACTION)
+    reference, current = temporal_split(features, holdout_fraction=HOLDOUT_FRACTION)
 
     reports = feature_drift(reference, current, list(DETECTOR_FEATURES))
     write_drift_report(settings.postgres_dsn, run_id, datetime.now(UTC), reports)
@@ -220,12 +217,32 @@ def drift_report(context: AssetExecutionContext) -> None:
     )
 
 
-def _latest_run_id(settings: Settings) -> str:
-    """Return the most recent training run id recorded in Postgres."""
+def _latest_run(settings: Settings) -> tuple[str, Path]:
+    """Return the most recent training run's id and artifact directory.
+
+    The run registry (this Postgres table, shared across processes) and the
+    artifact store (a directory under this process's `settings.mlflow_dir`)
+    are two independent sources of truth. Reading `artifact_uri` from the
+    same row as `run_id` - rather than reconstructing
+    `settings.mlflow_dir / "artifacts" / run_id` and hoping it matches -
+    is what keeps them from silently disagreeing (I4): a run trained under a
+    different `mlflow_dir` (a different container, a test's `tmp_path`, a
+    concurrent run) is caught here with a clear error instead of surfacing as
+    a `FileNotFoundError` three calls downstream in `load_models`.
+    """
     with psycopg.connect(settings.postgres_dsn) as conn:
         row = conn.execute(
-            "SELECT run_id FROM model_metrics ORDER BY trained_at DESC LIMIT 1"
+            "SELECT run_id, artifact_uri FROM model_metrics "
+            "ORDER BY trained_at DESC, id DESC LIMIT 1"
         ).fetchone()
     if row is None:
         raise RuntimeError("no training run recorded; materialize trained_models first")
-    return str(row[0])
+    run_id, artifact_uri = str(row[0]), Path(str(row[1]))
+    if not artifact_uri.exists():
+        raise RuntimeError(
+            f"training run {run_id!r} recorded artifact_uri {artifact_uri}, which does not "
+            f"exist under this process's settings (mlflow_dir={settings.mlflow_dir}); the run "
+            "was likely trained with a different ADSIGNAL_MLFLOW_DIR, or its artifacts were "
+            "cleaned up separately from its model_metrics row"
+        )
+    return run_id, artifact_uri

@@ -69,26 +69,50 @@ def pipeline_run(settings: Settings):
     return result, settings
 
 
+def _run_id(pipeline_run) -> str:
+    result, _ = pipeline_run
+    metadata = result.asset_materializations_for_node("trained_models")[0].metadata
+    return str(metadata["run_id"].value)
+
+
 def test_training_asset_records_metrics_and_a_run_id(pipeline_run) -> None:
     result, settings = pipeline_run
     metadata = result.asset_materializations_for_node("trained_models")[0].metadata
     assert metadata["run_id"].value
     assert 0.0 <= metadata["triage_macro_f1"].value <= 1.0
 
+    run_id = _run_id(pipeline_run)
     with psycopg.connect(settings.postgres_dsn) as conn:
-        count = conn.execute("SELECT count(*) FROM model_metrics").fetchone()[0]
+        count = conn.execute(
+            "SELECT count(*) FROM model_metrics WHERE run_id = %s", (run_id,)
+        ).fetchone()[0]
+    # >= rather than == : this fixture's module scope means a re-run within
+    # the same test session (e.g. under -p randomly) could add more than one
+    # row for the same run_id if trained_models were re-materialized, but it
+    # must never be zero - this scoped WHERE is what makes the assertion mean
+    # something, unlike an unscoped `count(*) >= 1` on an append-only table
+    # that would pass on residue from any earlier test (P1-2).
     assert count >= 1
 
 
 def test_training_asset_writes_model_artifacts(pipeline_run) -> None:
+    """P1-3: the property that matters is the artifact files `anomaly_scores`
+    depends on, not merely that `mlflow_dir` (created on the first line of
+    `log_training_run`, before anything is saved) exists."""
     _, settings = pipeline_run
-    assert settings.mlflow_dir.exists()
+    run_id = _run_id(pipeline_run)
+    artifact_dir = settings.mlflow_dir / "artifacts" / run_id
+    assert (artifact_dir / "detector.pkl").exists()
+    assert (artifact_dir / "triage.pkl").exists()
 
 
 def test_scoring_asset_writes_predictions(pipeline_run) -> None:
     _, settings = pipeline_run
+    run_id = _run_id(pipeline_run)
     with psycopg.connect(settings.postgres_dsn) as conn:
-        count = conn.execute("SELECT count(*) FROM anomaly_predictions").fetchone()[0]
+        count = conn.execute(
+            "SELECT count(*) FROM anomaly_predictions WHERE run_id = %s", (run_id,)
+        ).fetchone()[0]
     assert count > 0
 
 
@@ -103,8 +127,11 @@ def test_predictions_only_carry_known_causes(pipeline_run) -> None:
 
 def test_drift_asset_writes_one_row_per_feature(pipeline_run) -> None:
     _, settings = pipeline_run
+    run_id = _run_id(pipeline_run)
     with psycopg.connect(settings.postgres_dsn) as conn:
-        count = conn.execute("SELECT count(*) FROM drift_reports").fetchone()[0]
+        count = conn.execute(
+            "SELECT count(*) FROM drift_reports WHERE run_id = %s", (run_id,)
+        ).fetchone()[0]
     assert count > 0
 
 

@@ -32,7 +32,7 @@ def test_models_round_trip_through_disk(tmp_path, labelled_series) -> None:
 
 def test_log_training_run_returns_a_run_id_and_writes_the_store(tmp_path, labelled_series) -> None:
     detector, classifier, holdout = _trained(labelled_series)
-    run_id = log_training_run(
+    run_id, artifact_dir = log_training_run(
         tracking_dir=tmp_path / "mlruns",
         detector=detector,
         classifier=classifier,
@@ -42,6 +42,9 @@ def test_log_training_run_returns_a_run_id_and_writes_the_store(tmp_path, labell
     )
     assert isinstance(run_id, str) and run_id
     assert (tmp_path / "mlruns").exists()
+    assert artifact_dir == tmp_path / "mlruns" / "artifacts" / run_id
+    assert (artifact_dir / "detector.pkl").exists()
+    assert (artifact_dir / "triage.pkl").exists()
 
 
 def test_two_runs_get_distinct_ids(tmp_path, labelled_series) -> None:
@@ -54,4 +57,6 @@ def test_two_runs_get_distinct_ids(tmp_path, labelled_series) -> None:
         detector_metrics=evaluate_detector(detector, holdout),
         params={"baseline_window": 7},
     )
-    assert log_training_run(**common) != log_training_run(**common)
+    first_run_id, _ = log_training_run(**common)
+    second_run_id, _ = log_training_run(**common)
+    assert first_run_id != second_run_id
