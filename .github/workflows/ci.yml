@@ -45,6 +45,9 @@ jobs:
       - name: Type check
         run: uv run mypy
 
+      - name: Install dbt packages
+        run: uv run dbt deps --project-dir dbt --profiles-dir dbt
+
       - name: Test
         env:
           ADSIGNAL_TEST_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal

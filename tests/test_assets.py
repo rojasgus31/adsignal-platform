@@ -39,12 +39,16 @@ def test_raw_events_asset_is_rerunnable(settings) -> None:
     second = materialize([catalog_and_raw_events], resources={"settings": settings})
     assert first.success and second.success
 
-    first_rows = first.asset_materializations_for_node("catalog_and_raw_events")[0].metadata[
-        "row_count"
-    ].value
-    second_rows = second.asset_materializations_for_node("catalog_and_raw_events")[0].metadata[
-        "row_count"
-    ].value
+    first_rows = (
+        first.asset_materializations_for_node("catalog_and_raw_events")[0]
+        .metadata["row_count"]
+        .value
+    )
+    second_rows = (
+        second.asset_materializations_for_node("catalog_and_raw_events")[0]
+        .metadata["row_count"]
+        .value
+    )
     assert first_rows == second_rows
 
 
@@ -106,11 +110,15 @@ def test_catalog_size_scales_with_target_events(tmp_path) -> None:
     large_result = materialize([catalog_and_raw_events], resources={"settings": large_settings})
     assert small_result.success and large_result.success
 
-    small_rows = small_result.asset_materializations_for_node("catalog_and_raw_events")[
-        0
-    ].metadata["row_count"].value
-    large_rows = large_result.asset_materializations_for_node("catalog_and_raw_events")[
-        0
-    ].metadata["row_count"].value
+    small_rows = (
+        small_result.asset_materializations_for_node("catalog_and_raw_events")[0]
+        .metadata["row_count"]
+        .value
+    )
+    large_rows = (
+        large_result.asset_materializations_for_node("catalog_and_raw_events")[0]
+        .metadata["row_count"]
+        .value
+    )
 
     assert large_rows > small_rows

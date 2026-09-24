@@ -14,17 +14,37 @@ from adsignal.generator.models import (
 )
 
 _BRAND_WORDS = (
-    "Nimbus", "Vertex", "Harbor", "Lumen", "Cobalt", "Juniper",
-    "Meridian", "Quarry", "Solstice", "Thicket", "Vantage", "Wren",
+    "Nimbus",
+    "Vertex",
+    "Harbor",
+    "Lumen",
+    "Cobalt",
+    "Juniper",
+    "Meridian",
+    "Quarry",
+    "Solstice",
+    "Thicket",
+    "Vantage",
+    "Wren",
 )
 _BRAND_SUFFIXES = ("Group", "Labs", "Co", "Collective", "Partners")
 _CAMPAIGN_THEMES = (
-    "Always On", "Spring Launch", "Summer Push", "Back to School",
-    "Holiday Retail", "Brand Lift", "Retargeting", "Prospecting",
+    "Always On",
+    "Spring Launch",
+    "Summer Push",
+    "Back to School",
+    "Holiday Retail",
+    "Brand Lift",
+    "Retargeting",
+    "Prospecting",
 )
 _HEADLINES = (
-    "Made for the everyday", "See the difference", "Built to last",
-    "Your next favorite", "Now in more places", "Start today",
+    "Made for the everyday",
+    "See the difference",
+    "Built to last",
+    "Your next favorite",
+    "Now in more places",
+    "Start today",
 )
 
 
@@ -51,9 +71,7 @@ def build_catalog(
     for advertiser_index in range(n_advertisers):
         advertiser_id = f"adv_{advertiser_index:04d}"
         name = f"{rng.choice(_BRAND_WORDS)} {rng.choice(_BRAND_SUFFIXES)}"
-        advertisers.append(
-            Advertiser(id=advertiser_id, name=name, vertical=rng.choice(VERTICALS))
-        )
+        advertisers.append(Advertiser(id=advertiser_id, name=name, vertical=rng.choice(VERTICALS)))
 
         for campaign_index in range(campaigns_per_advertiser):
             campaign_id = f"cmp_{advertiser_index:04d}_{campaign_index:03d}"

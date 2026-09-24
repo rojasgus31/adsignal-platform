@@ -92,9 +92,7 @@ class AnomalyInjector:
                 )
             yield _apply(row, _EFFECTS[cause], severity)
 
-    def _window_for(
-        self, campaign_id: str, event_date: date
-    ) -> tuple[date, date, str, int] | None:
+    def _window_for(self, campaign_id: str, event_date: date) -> tuple[date, date, str, int] | None:
         """Return the anomaly window covering this campaign-day, deciding lazily.
 
         A new window is refused if it would overlap any existing window for

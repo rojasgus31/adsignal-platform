@@ -1,0 +1,52 @@
+name: adsignal
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: adsignal
+      POSTGRES_PASSWORD: adsignal
+      POSTGRES_DB: adsignal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adsignal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # The author's machine has 8 GB shared with Docker. Caps keep the stack
+    # from starving the host during a full generation run.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  pipeline:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@postgres:5432/adsignal
+      ADSIGNAL_DUCKDB_PATH: /app/data/adsignal.duckdb
+      ADSIGNAL_DATA_DIR: /app/data
+      ADSIGNAL_TARGET_EVENTS: ${ADSIGNAL_TARGET_EVENTS:-10000000}
+      # The dbt project is copied to /app/dbt in the image, but `uv sync`
+      # installs the adsignal package into site-packages, so the
+      # source-relative fallback in `_dbt_project_dir` cannot resolve it.
+      # Settings.dbt_dir (added in Task 9) exists precisely for this override.
+      ADSIGNAL_DBT_DIR: /app/dbt
+    ports:
+      - "3000:3000"
+    volumes:
+      - pipeline_data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+volumes:
+  postgres_data:
+  pipeline_data:

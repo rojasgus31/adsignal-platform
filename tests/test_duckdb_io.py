@@ -6,8 +6,13 @@ def test_register_sources_exposes_every_table(tmp_path, small_dataset) -> None:
     with open_duckdb(tmp_path / "test.duckdb") as conn:
         register_sources(conn, events_path=events_path, labels_path=labels_path, catalog=catalog)
         tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
-        assert {"raw_events", "raw_anomaly_labels", "raw_campaigns", "raw_creatives",
-                "raw_advertisers"} <= tables
+        assert {
+            "raw_events",
+            "raw_anomaly_labels",
+            "raw_campaigns",
+            "raw_creatives",
+            "raw_advertisers",
+        } <= tables
 
 
 def test_registered_row_counts_match_the_catalog(tmp_path, small_dataset) -> None:
