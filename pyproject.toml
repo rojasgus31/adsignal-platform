@@ -15,6 +15,7 @@ dependencies = [
     "dagster-webserver>=1.9",
     "pandas>=2.2",
     "scikit-learn>=1.5",
+    "scipy>=1.14",
     "mlflow>=2.17",
 ]
 
