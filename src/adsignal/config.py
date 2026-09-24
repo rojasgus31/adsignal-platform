@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # Override for the dbt project location when running inside a container.
     # Not used in this task; consumed by a later task.
     dbt_dir: Path | None = None
+    mlflow_dir: Path = Path("mlruns")
 
     @property
     def raw_events_path(self) -> Path:
