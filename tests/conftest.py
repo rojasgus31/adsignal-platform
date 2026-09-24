@@ -9,6 +9,7 @@ import pytest
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
+from adsignal.generator.models import ANOMALY_CAUSES
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 _DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
@@ -79,5 +80,38 @@ def flat_series():
                 "is_anomaly": [False] * days,
             }
         )
+
+    return _build
+
+
+@pytest.fixture
+def labelled_series(flat_series):
+    """A `flat_series` where every 6th day is an anomaly, cycling all 5 causes."""
+
+    def _build(days: int = 120) -> pd.DataFrame:
+        frame = flat_series(days)
+        rng = np.random.default_rng(0)
+        for index in range(5, days, 6):
+            cause = ANOMALY_CAUSES[(index // 6) % len(ANOMALY_CAUSES)]
+            frame.loc[index, "anomaly_cause"] = cause
+            frame.loc[index, "anomaly_severity"] = 1 + (index // 6) % 5
+            frame.loc[index, "is_anomaly"] = True
+            multiplier = {
+                "budget_pacing": 2.5,
+                "creative_fatigue": 1.0,
+                "audience_saturation": 1.3,
+                "tracking_error": 1.0,
+                "competitive_pressure": 1.6,
+            }[cause]
+            frame.loc[index, "spend"] = frame.loc[index, "spend"] * multiplier
+            frame.loc[index, "clicks"] = int(
+                frame.loc[index, "clicks"] * (0.45 if cause == "creative_fatigue" else 1.0)
+            )
+            frame.loc[index, "conversions"] = 0 if cause == "tracking_error" else 2
+            frame.loc[index, "ctr"] = (
+                frame.loc[index, "clicks"] / frame.loc[index, "impressions"]
+            )
+            frame.loc[index, "spend"] += rng.normal(0, 0.5)
+        return frame
 
     return _build
