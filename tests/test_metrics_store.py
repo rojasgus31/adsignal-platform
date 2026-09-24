@@ -55,9 +55,7 @@ def _detector_metrics() -> DetectorMetrics:
 
 
 def test_model_metrics_round_trip() -> None:
-    write_model_metrics(
-        DSN, "run_1", datetime.now(UTC), _triage_metrics(), _detector_metrics()
-    )
+    write_model_metrics(DSN, "run_1", datetime.now(UTC), _triage_metrics(), _detector_metrics())
     with psycopg.connect(DSN) as conn:
         row = conn.execute(
             "SELECT run_id, triage_macro_f1, detector_recall FROM model_metrics"

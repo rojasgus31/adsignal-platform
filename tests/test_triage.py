@@ -42,9 +42,7 @@ def test_escalate_matches_the_severity_threshold(labelled_series) -> None:
     classifier = TriageClassifier(random_state=0).fit(features)
     predictions = classifier.predict(features[features["is_anomaly"]])
     expected = predictions["severity"] >= ESCALATE_SEVERITY
-    pd.testing.assert_series_equal(
-        predictions["escalate"], expected, check_names=False
-    )
+    pd.testing.assert_series_equal(predictions["escalate"], expected, check_names=False)
 
 
 def test_fit_rejects_single_class_training_set(flat_series) -> None:

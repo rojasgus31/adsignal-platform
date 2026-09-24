@@ -113,9 +113,7 @@ def test_reload_with_fewer_keys_drops_stale_rows(tmp_path, small_dataset) -> Non
         injector = AnomalyInjector(seed=99, rate=0.08)
         sub_events_path = tmp_path / f"{name}_events.parquet"
         sub_labels_path = tmp_path / f"{name}_labels.parquet"
-        write_events_parquet(
-            injector.rows(generate_events(sub_catalog, seed=99)), sub_events_path
-        )
+        write_events_parquet(injector.rows(generate_events(sub_catalog, seed=99)), sub_events_path)
         write_labels_parquet(injector.labels, sub_labels_path)
 
         duckdb_path = tmp_path / f"{name}.duckdb"

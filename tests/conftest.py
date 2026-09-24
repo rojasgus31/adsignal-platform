@@ -108,9 +108,7 @@ def labelled_series(flat_series):
                 frame.loc[index, "clicks"] * (0.45 if cause == "creative_fatigue" else 1.0)
             )
             frame.loc[index, "conversions"] = 0 if cause == "tracking_error" else 2
-            frame.loc[index, "ctr"] = (
-                frame.loc[index, "clicks"] / frame.loc[index, "impressions"]
-            )
+            frame.loc[index, "ctr"] = frame.loc[index, "clicks"] / frame.loc[index, "impressions"]
             frame.loc[index, "spend"] += rng.normal(0, 0.5)
         return frame
 

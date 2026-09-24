@@ -12,9 +12,7 @@ from adsignal.ml.splits import temporal_split
 FlatSeries = Callable[..., pd.DataFrame]
 
 
-def _with_spike(
-    flat_series: FlatSeries, days: int = 60, spike_at: int = 40
-) -> pd.DataFrame:
+def _with_spike(flat_series: FlatSeries, days: int = 60, spike_at: int = 40) -> pd.DataFrame:
     frame = flat_series(days)
     frame.loc[spike_at, "spend"] = frame.loc[spike_at, "spend"] * 8
     frame.loc[spike_at, "ctr"] = frame.loc[spike_at, "ctr"] / 4
