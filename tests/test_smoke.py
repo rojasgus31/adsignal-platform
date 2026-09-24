@@ -12,9 +12,10 @@ from adsignal.pipeline.assets import catalog_and_raw_events, dbt_marts
 @pytest.fixture
 def tiny_settings(tmp_path) -> Settings:
     return Settings(
+        target_events=5_000,
         seed=2024,
         start_date=date(2024, 1, 1),
-        end_date=date(2024, 1, 31),
+        end_date=date(2024, 3, 31),
         data_dir=tmp_path,
         duckdb_path=tmp_path / "smoke.duckdb",
     )
@@ -42,4 +43,4 @@ def test_generate_then_transform_produces_queryable_marts(tiny_settings) -> None
     days, campaigns, anomalies = row
     assert days > 0
     assert campaigns > 0
-    assert anomalies >= 0
+    assert anomalies > 0
