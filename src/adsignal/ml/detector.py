@@ -20,6 +20,13 @@ DETECTOR_FEATURES: tuple[str, ...] = (
     "ctr_zscore",
 )
 
+# Bounds for a label-derived contamination rate. IsolationForest itself only
+# accepts (0, 0.5], so 0.5 is a hard ceiling; 0.01 is a floor to keep a
+# vanishingly rare (or all-zero, post-clip-away-from-0) label rate from
+# collapsing the model to "nothing is anomalous".
+_MIN_DERIVED_CONTAMINATION = 0.01
+_MAX_DERIVED_CONTAMINATION = 0.5
+
 
 class AnomalyDetector:
     """IsolationForest wrapper with the project's NaN policy baked in.
@@ -32,6 +39,7 @@ class AnomalyDetector:
     """
 
     def __init__(self, contamination: float = 0.05, random_state: int = 0) -> None:
+        self._contamination = contamination
         self._forest = IsolationForest(
             contamination=contamination,
             random_state=random_state,
@@ -40,13 +48,38 @@ class AnomalyDetector:
         self._fitted = False
 
     def fit(self, features: pd.DataFrame) -> "AnomalyDetector":
-        """Fit on the detector's feature subset. Returns self for chaining."""
+        """Fit on the detector's feature subset. Returns self for chaining.
+
+        Contamination precedence: when `features` carries an `is_anomaly`
+        column, the observed anomaly rate in *this* frame overrides the
+        constructor's `contamination` for this fit — a fixed 5% assumption is
+        almost always wrong for a real mart, where the true rate can be far
+        higher (or lower). When `is_anomaly` is absent, the constructor value
+        is used unchanged, so a caller scoring unlabelled data can still pin
+        it explicitly.
+
+        The derived rate is computed only from the frame passed in here. It
+        must never be computed from a holdout: the holdout's labels exist to
+        be withheld from training, and leaking its anomaly rate into the
+        threshold the model uses to score that same holdout would invalidate
+        every metric built on it. Callers are responsible for calling `fit`
+        with a training frame, never with the holdout.
+        """
         matrix = self._matrix(features)
         if matrix.shape[0] == 0:
             raise ValueError("cannot fit an anomaly detector on no rows")
+        contamination = self._resolve_contamination(features)
+        self._forest.set_params(contamination=contamination)
         self._forest.fit(matrix)
         self._fitted = True
         return self
+
+    def _resolve_contamination(self, features: pd.DataFrame) -> float:
+        """Return the contamination rate to fit with, per the precedence in `fit`."""
+        if "is_anomaly" not in features.columns:
+            return self._contamination
+        observed_rate = float(features["is_anomaly"].fillna(False).astype(bool).mean())
+        return min(_MAX_DERIVED_CONTAMINATION, max(_MIN_DERIVED_CONTAMINATION, observed_rate))
 
     def predict(self, features: pd.DataFrame) -> np.ndarray:
         """Return a boolean array: True where the row is anomalous."""
