@@ -7,6 +7,7 @@ from adsignal.ml.evaluation import (
     MINIMUM_MACRO_F1,
     DetectorMetrics,
     evaluate_detector,
+    evaluate_pipeline,
     evaluate_triage,
 )
 from adsignal.ml.features import build_features
@@ -97,6 +98,56 @@ def test_roc_auc_is_computed_from_the_continuous_score_not_the_boolean_flags(
     # The boolean flags were all wrong, so recall/precision are near zero -
     # confirming AUC could not have been computed from `predict()`'s output.
     assert metrics.recall == pytest.approx(0.0)
+
+
+def test_evaluate_pipeline_only_feeds_the_classifier_flagged_rows(labelled_series) -> None:
+    """D4: the classifier must see exactly what production feeds it.
+
+    `evaluate_triage` scores the classifier against the holdout's true
+    anomalies directly; `evaluate_pipeline` must not do that - it has to
+    route through the detector's own flags first, the same way
+    `adsignal.pipeline.assets.anomaly_scores` does.
+    """
+    features = build_features(labelled_series(240))
+    train, holdout = temporal_split(features, holdout_fraction=0.25)
+    detector = AnomalyDetector(random_state=0).fit(train)
+    classifier = TriageClassifier(random_state=0).fit(train)
+
+    metrics = evaluate_pipeline(detector, classifier, holdout)
+
+    assert metrics.n_flagged == int(detector.predict(holdout).sum())
+    assert 0 <= metrics.n_true_anomalies_flagged <= metrics.n_flagged
+    assert 0.0 <= metrics.flagged_precision <= 1.0
+    assert 0.0 <= metrics.cause_accuracy_on_true_positives <= 1.0
+    assert metrics.n_escalated >= 0
+    assert 0.0 <= metrics.false_alarm_rate_among_escalations <= 1.0
+
+
+def test_evaluate_pipeline_flagged_precision_matches_detector_precision(labelled_series) -> None:
+    """The pipeline's flagged-row composition must agree with the detector's own metric."""
+    features = build_features(labelled_series(240))
+    train, holdout = temporal_split(features, holdout_fraction=0.25)
+    detector = AnomalyDetector(random_state=0).fit(train)
+    classifier = TriageClassifier(random_state=0).fit(train)
+
+    pipeline_metrics = evaluate_pipeline(detector, classifier, holdout)
+    detector_metrics = evaluate_detector(detector, holdout)
+
+    assert pipeline_metrics.flagged_precision == pytest.approx(detector_metrics.precision)
+    assert pipeline_metrics.n_flagged == detector_metrics.n_flagged
+
+
+def test_evaluate_pipeline_raises_when_the_detector_flags_nothing(labelled_series) -> None:
+    features = build_features(labelled_series(240))
+    train, holdout = temporal_split(features, holdout_fraction=0.25)
+    classifier = TriageClassifier(random_state=0).fit(train)
+
+    class _NothingFlaggedDetector:
+        def predict(self, frame) -> np.ndarray:  # noqa: ANN001
+            return np.zeros(len(frame), dtype=bool)
+
+    with pytest.raises(ValueError, match="flagged no rows"):
+        evaluate_pipeline(_NothingFlaggedDetector(), classifier, holdout)  # type: ignore[arg-type]
 
 
 def test_split_is_temporal_not_random(labelled_series) -> None:

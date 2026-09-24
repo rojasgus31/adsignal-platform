@@ -85,6 +85,28 @@ class DetectorMetrics:
         return self.roc_auc >= minimum
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineMetrics:
+    """Quality of the detector and classifier run together, as production runs them.
+
+    `evaluate_triage` scores the classifier against the holdout's *true*
+    anomalies; `evaluate_detector` scores the detector alone. Neither is what
+    `adsignal.pipeline.assets.anomaly_scores` actually does: it feeds the
+    classifier `holdout[detector.predict(holdout)]` - whatever the detector
+    flagged, true anomaly or not. On a 0.35-precision detector, most of what
+    the classifier receives is not an anomaly at all, and that composition is
+    invisible to the two metrics above. This is the number a user of the
+    system actually experiences.
+    """
+
+    n_flagged: int
+    n_true_anomalies_flagged: int
+    flagged_precision: float
+    cause_accuracy_on_true_positives: float
+    n_escalated: int
+    false_alarm_rate_among_escalations: float
+
+
 def evaluate_triage(classifier: TriageClassifier, holdout: pd.DataFrame) -> TriageMetrics:
     """Score the cause model on the labelled anomalies in `holdout`."""
     labelled = holdout[holdout["is_anomaly"].fillna(False).astype(bool)]
@@ -132,6 +154,53 @@ def evaluate_detector(detector: AnomalyDetector, holdout: pd.DataFrame) -> Detec
         roc_auc=_safe_roc_auc(truth, scores),
         n_samples=int(len(holdout)),
         n_flagged=int(flagged.sum()),
+    )
+
+
+def evaluate_pipeline(
+    detector: AnomalyDetector, classifier: TriageClassifier, holdout: pd.DataFrame
+) -> PipelineMetrics:
+    """Score the real production path: detector flags, then classifier triages the flags.
+
+    Unlike `evaluate_triage`, the classifier here only ever sees rows the
+    detector itself flagged - never the holdout's true anomalies directly -
+    exactly like `adsignal.pipeline.assets.anomaly_scores`. Reported, not
+    gated: this is diagnostic, not (yet) a regression gate.
+    """
+    truth = holdout["is_anomaly"].fillna(False).astype(bool)
+    flagged = holdout[detector.predict(holdout)]
+    if flagged.empty:
+        raise ValueError(
+            "the detector flagged no rows in this holdout; cannot evaluate the pipeline"
+        )
+
+    predictions = classifier.predict(flagged)
+    flagged_truth = truth.loc[flagged.index]
+    n_true_positive = int(flagged_truth.sum())
+
+    true_positives = flagged.loc[flagged_truth]
+    if true_positives.empty:
+        cause_accuracy = float("nan")
+    else:
+        predicted_causes = predictions.loc[true_positives.index, "cause"].to_numpy()
+        cause_accuracy = float(
+            (predicted_causes == true_positives["anomaly_cause"].to_numpy()).mean()
+        )
+
+    escalated = predictions[predictions["escalate"]]
+    if escalated.empty:
+        false_alarm_rate = float("nan")
+    else:
+        escalated_truth = flagged_truth.loc[escalated.index]
+        false_alarm_rate = float((~escalated_truth).mean())
+
+    return PipelineMetrics(
+        n_flagged=int(len(flagged)),
+        n_true_anomalies_flagged=n_true_positive,
+        flagged_precision=float(n_true_positive / len(flagged)),
+        cause_accuracy_on_true_positives=cause_accuracy,
+        n_escalated=int(len(escalated)),
+        false_alarm_rate_among_escalations=false_alarm_rate,
     )
 
 

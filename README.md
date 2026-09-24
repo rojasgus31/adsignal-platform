@@ -126,3 +126,40 @@ regression gate. AUC asks a base-rate-independent question instead — does the
 detector's score still separate anomalies from normal days at all. Both
 gates must pass for the build to succeed; a regression on either cannot reach
 `main` unnoticed.
+
+The detector's contamination is derived from the training window's own
+observed anomaly rate, which a sweep on real pipeline data confirmed
+maximises F1 — this is an **F1-optimal pre-filter, not a recall-oriented
+one**. At a ~5% base rate that costs about two thirds of recall (0.31
+measured against 0.35 precision): most real anomalies never reach the
+classifier at all. That is the trade accepted, because a lower-precision
+pre-filter would make the downstream triage output unusable.
+
+Because the two models are evaluated separately, neither number answers what
+a user of the system actually experiences. `evaluate_pipeline` (also printed
+by `gate.py`, not yet gated on) runs the real path — the classifier scoring
+whatever the detector flagged, true anomaly or not — and reports it: on the
+live holdout the detector flags 85 rows, of which only 30 (35%) are true
+anomalies; and 22 of the 37 rows marked `escalate=True` (60%) are false
+alarms. The headline triage macro F1 (0.8118) is measured on the
+classifier's best case (true anomalies only) — the end-to-end numbers are
+the honest picture of what the pipeline pages a human about. Exact figures
+move slightly run to run as the models retrain; run `uv run python -m
+adsignal.ml.gate` for the current ones.
+
+### Model features
+
+`min_samples_leaf` for both triage models is a named constant
+(`adsignal.ml.triage._MIN_SAMPLES_LEAF`), picked from a sweep against the
+real mart's temporal holdout rather than tuned to a synthetic test fixture:
+5 → 0.8119, 10 → 0.8118, 20 → 0.7777, 30 → 0.7907, 50 → 0.8358 macro F1. 50
+scores highest on that single holdout split, but only values below 10 still
+learn per-row signal from a cold-start-sized training window (~15 labelled
+anomalies) instead of collapsing to the class prior — see
+`test_small_training_window_still_learns_per_row_signal`. 5 and 10 are
+statistically indistinguishable on the real mart, so 5 is kept.
+
+`channel` is fed to the triage classifier as a native categorical
+(`HistGradientBoostingClassifier`/`Regressor` support `categorical_features`
+directly), delivering the categorical feature named in the spec rather than
+leaving it declared but unused.
