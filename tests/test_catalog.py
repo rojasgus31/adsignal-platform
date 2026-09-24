@@ -72,3 +72,34 @@ def test_foreign_keys_resolve() -> None:
     campaign_ids = {c.id for c in catalog.campaigns}
     assert all(c.advertiser_id in advertiser_ids for c in catalog.campaigns)
     assert all(cr.campaign_id in campaign_ids for cr in catalog.creatives)
+
+
+def test_catalog_respects_short_window_boundary() -> None:
+    """Campaigns fit within a window shorter than 30 days."""
+    short_start = date(2024, 1, 1)
+    short_end = date(2024, 1, 10)
+    catalog = build_catalog(
+        seed=5,
+        n_advertisers=2,
+        campaigns_per_advertiser=2,
+        creatives_per_campaign=2,
+        start_date=short_start,
+        end_date=short_end,
+    )
+    for campaign in catalog.campaigns:
+        assert short_start <= campaign.start_date <= campaign.end_date <= short_end
+
+
+def test_catalog_respects_single_day_window() -> None:
+    """Campaigns fit within a degenerate single-day window."""
+    single_day = date(2024, 6, 15)
+    catalog = build_catalog(
+        seed=6,
+        n_advertisers=2,
+        campaigns_per_advertiser=2,
+        creatives_per_campaign=2,
+        start_date=single_day,
+        end_date=single_day,
+    )
+    for campaign in catalog.campaigns:
+        assert single_day <= campaign.start_date <= campaign.end_date <= single_day
