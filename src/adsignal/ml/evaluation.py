@@ -23,6 +23,15 @@ from adsignal.ml.triage import TriageClassifier
 # catches a broken pipeline, not a mediocre model.
 MINIMUM_MACRO_F1 = 0.45
 
+# A detector with a badly-mismatched contamination assumption (e.g. the old
+# hardcoded 0.05 against a mart with a ~29% real anomaly rate) lands around
+# 0.20 recall — it misses roughly 4 of every 5 real anomalies while still
+# reporting high precision, which reads as "healthy" on a dashboard that only
+# shows precision. This floor is set above that failure mode and below what a
+# correctly-configured detector clears in practice; see the evaluation report
+# for the measured before/after recall this gate is calibrated against.
+MINIMUM_DETECTOR_RECALL = 0.5
+
 
 @dataclass(frozen=True, slots=True)
 class TriageMetrics:
@@ -48,6 +57,10 @@ class DetectorMetrics:
     f1: float
     n_samples: int
     n_flagged: int
+
+    def meets_gate(self, minimum: float = MINIMUM_DETECTOR_RECALL) -> bool:
+        """Whether this run clears the CI quality gate."""
+        return self.recall >= minimum
 
 
 def evaluate_triage(classifier: TriageClassifier, holdout: pd.DataFrame) -> TriageMetrics:
