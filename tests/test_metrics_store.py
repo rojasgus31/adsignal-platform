@@ -49,7 +49,9 @@ def _triage_metrics() -> TriageMetrics:
 
 
 def _detector_metrics() -> DetectorMetrics:
-    return DetectorMetrics(precision=0.6, recall=0.9, f1=0.72, n_samples=100, n_flagged=15)
+    return DetectorMetrics(
+        precision=0.6, recall=0.9, f1=0.72, roc_auc=0.85, n_samples=100, n_flagged=15
+    )
 
 
 def test_model_metrics_round_trip() -> None:

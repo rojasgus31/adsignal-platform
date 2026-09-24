@@ -114,9 +114,15 @@ explainable.
 
 `.github/workflows/eval.yml` trains on a fresh mart and fails the build when
 triage macro F1 falls below the floor in `adsignal/ml/evaluation.py`, or when
-the detector's recall falls below its own floor. The detector is a hard
+the detector's ROC AUC falls below its own floor. The detector is a hard
 pre-filter ahead of the classifier — the scoring asset only triages the rows
-the detector flags — so a detector with poor recall can silently starve the
-classifier of real anomalies while triage metrics still look healthy. Both
+the detector flags — so a detector whose signal has degraded can silently
+starve the classifier of real anomalies while triage metrics still look
+healthy. AUC gates the detector rather than recall: recall is threshold- and
+base-rate-dependent (contamination, and therefore the flagging threshold, is
+derived from the training data's own anomaly rate), so a fixed recall floor
+moves whenever the dataset's anomaly rate moves and is not a stable
+regression gate. AUC asks a base-rate-independent question instead — does the
+detector's score still separate anomalies from normal days at all. Both
 gates must pass for the build to succeed; a regression on either cannot reach
 `main` unnoticed.

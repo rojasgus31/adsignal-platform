@@ -5,7 +5,7 @@ import pandas as pd
 import pytest
 
 from adsignal.ml.detector import DETECTOR_FEATURES, AnomalyDetector
-from adsignal.ml.evaluation import MINIMUM_DETECTOR_RECALL, evaluate_detector
+from adsignal.ml.evaluation import evaluate_detector
 from adsignal.ml.features import build_features
 from adsignal.ml.splits import temporal_split
 
@@ -98,17 +98,23 @@ def test_derived_contamination_raises_recall_on_a_temporal_holdout(
     """This is the test that would have caught the mismatched-default bug.
 
     A detector fit with the old hardcoded 0.05 contamination against a mart
-    whose real anomaly rate is much higher lands around 0.20 recall (see
-    evaluation.py's MINIMUM_DETECTOR_RECALL rationale). With contamination
-    derived from the training frame's own labels, recall on a genuine
-    temporal holdout must clear that floor.
+    whose real anomaly rate is much higher lands around 0.20 recall. With
+    contamination derived from the training frame's own labels, recall on a
+    genuine temporal holdout must clear a level well above that failure mode.
+
+    This threshold is a fixture-specific regression check, not the CI quality
+    gate: `labelled_series` is a controlled synthetic series, not real
+    pipeline data, and the CI gate itself (`MINIMUM_DETECTOR_AUC`) checks ROC
+    AUC precisely because recall is base-rate-dependent and does not travel
+    from this fixture to a real mart. See evaluation.py's
+    `MINIMUM_DETECTOR_AUC` rationale.
     """
     features = build_features(labelled_series(240))
     train, holdout = temporal_split(features, holdout_fraction=0.25)
 
     detector = AnomalyDetector(random_state=0).fit(train)
     metrics = evaluate_detector(detector, holdout)
-    assert metrics.recall >= MINIMUM_DETECTOR_RECALL
+    assert metrics.recall >= 0.5
 
 
 def test_explicit_contamination_is_honoured_when_labels_are_absent(
