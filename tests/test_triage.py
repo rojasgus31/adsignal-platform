@@ -88,3 +88,27 @@ def test_triage_features_are_all_produced_by_build_features(labelled_series) -> 
     features = build_features(labelled_series())
     for column in TRIAGE_FEATURES:
         assert column in features.columns
+
+
+def test_small_training_window_still_learns_per_row_signal(labelled_series) -> None:
+    """I5: pins the failure mode `_MIN_SAMPLES_LEAF` exists to guard against.
+
+    A training window with only a few dozen labelled anomalies is the normal
+    case, not an edge case - the plan's original default (20) collapsed a
+    20-row fixture to predicting the class prior for every row. Fit on ~15
+    labelled anomalies spanning every cause (90 days at a 1-in-6 injection
+    rate) and require that predictions still vary row to row, not just that
+    the model fits without raising.
+    """
+    features = build_features(labelled_series(90))
+    labelled = features[features["is_anomaly"]]
+    assert labelled["anomaly_cause"].nunique() >= 2, "fixture must span multiple causes"
+    assert 10 <= len(labelled) <= 20, "fixture must land in the small-window regime being tested"
+
+    classifier = TriageClassifier(random_state=0).fit(features)
+    probabilities = classifier._cause_model.predict_proba(  # noqa: SLF001
+        classifier._matrix(labelled)  # noqa: SLF001
+    )
+    assert not (probabilities == probabilities[0]).all(), (
+        "every row got an identical prediction - the model degenerated to the class prior"
+    )

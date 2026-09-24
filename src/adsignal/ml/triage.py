@@ -18,8 +18,26 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
 from adsignal.generator.models import ANOMALY_CAUSES
+from adsignal.ml.features import CATEGORICAL_COLUMNS
 
 ESCALATE_SEVERITY = 4
+
+# sklearn's own default (20) is tuned for large datasets; labelled anomalies
+# are rare by construction, so a training window can easily supply only a
+# few dozen rows. A `min_samples_leaf` sweep against the *real* mart's
+# temporal holdout (319 labelled train / 98 labelled holdout rows) measured:
+#   5 -> 0.8119, 10 -> 0.8118, 20 -> 0.7777, 30 -> 0.7907, 50 -> 0.8358
+# 50 scores highest on that single holdout split, but it and every value
+# >= 10 collapse to a single constant prediction (the class prior, identical
+# for every row) when fit on a small-training-window fixture of ~15 labelled
+# anomalies spanning all 5 causes - see
+# `test_small_training_window_still_learns_per_row_signal` in
+# `tests/test_triage.py`, which pins exactly the failure mode this parameter
+# exists to guard against. 5 and 10 are statistically indistinguishable on
+# the real mart (0.8119 vs 0.8118), so 5 is kept: it costs nothing in
+# measured holdout quality and is the only value that still learns from a
+# cold-start-sized training window.
+_MIN_SAMPLES_LEAF = 5
 
 TRIAGE_FEATURES: tuple[str, ...] = (
     "spend_ratio",
@@ -34,24 +52,34 @@ TRIAGE_FEATURES: tuple[str, ...] = (
     "cpa",
     "roas",
     "day_of_week",
+    "channel",
 )
+
+# `channel` is the only categorical in `TRIAGE_FEATURES`; every other column is
+# a ratio, rate or numeric label. `HistGradientBoostingClassifier`/`Regressor`
+# take categorical columns natively via `categorical_features`, so this is
+# passed straight from `adsignal.ml.features.CATEGORICAL_COLUMNS` rather than
+# one-hot encoding it by hand.
+_CATEGORICAL_FEATURES: tuple[str, ...] = CATEGORICAL_COLUMNS
 
 
 class TriageClassifier:
     """Predicts an anomaly's cause and severity from its feature row."""
 
     def __init__(self, random_state: int = 0) -> None:
-        # min_samples_leaf defaults to 20, tuned for large datasets. Labelled
-        # anomalies are rare by construction, so a training window can easily
-        # supply only a few dozen rows; the default would then forbid any
-        # split at all and the model would degenerate to predicting the
-        # class prior. A small leaf size lets it actually learn from small
-        # anomaly counts.
+        # See `_MIN_SAMPLES_LEAF` above for why 5, backed by a sweep on real
+        # pipeline data rather than tuned to one small fixture.
         self._cause_model = HistGradientBoostingClassifier(
-            random_state=random_state, max_iter=200, min_samples_leaf=5
+            random_state=random_state,
+            max_iter=200,
+            min_samples_leaf=_MIN_SAMPLES_LEAF,
+            categorical_features=list(_CATEGORICAL_FEATURES),
         )
         self._severity_model = HistGradientBoostingRegressor(
-            random_state=random_state, max_iter=200, min_samples_leaf=5
+            random_state=random_state,
+            max_iter=200,
+            min_samples_leaf=_MIN_SAMPLES_LEAF,
+            categorical_features=list(_CATEGORICAL_FEATURES),
         )
         self._fitted = False
 
