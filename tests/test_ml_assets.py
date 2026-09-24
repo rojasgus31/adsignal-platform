@@ -15,7 +15,9 @@ from adsignal.pipeline.assets import (
     trained_models,
 )
 
-DSN = os.environ.get("ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal")
+DSN = os.environ.get(
+    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
+)
 
 
 def _postgres_available() -> bool:

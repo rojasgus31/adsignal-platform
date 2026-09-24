@@ -50,5 +50,8 @@ jobs:
 
       - name: Test
         env:
-          ADSIGNAL_TEST_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal
+          # A separate database on the same service, never the serving
+          # "adsignal" database - the suite truncates ML tables and does a
+          # full mart refresh (see conftest.py's `_ensure_test_database`, I2).
+          ADSIGNAL_TEST_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal_test
         run: uv run pytest -v

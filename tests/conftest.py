@@ -1,9 +1,11 @@
+import os
 import subprocess
 from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import psycopg
 import pytest
 
 from adsignal.generator.anomalies import AnomalyInjector
@@ -13,6 +15,56 @@ from adsignal.generator.models import ANOMALY_CAUSES
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 _DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
+
+# The database the demo/dashboard reads. Tests must never point at it - see
+# `_ensure_test_database` below (I2 in the ML layer review).
+_SERVING_DSN = "postgresql://adsignal:adsignal@localhost:5432/adsignal"
+
+# Every DSN-driven test module falls back to this constant, so the default is
+# a sibling database on the same server rather than the serving one. Set
+# ADSIGNAL_TEST_DSN to point elsewhere (a CI service, a different host).
+TEST_DSN = os.environ.get(
+    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
+)
+
+
+def _ensure_test_database(dsn: str) -> None:
+    """Create the database `dsn` names if it does not already exist.
+
+    The suite truncates `model_metrics`/`drift_reports`/`anomaly_predictions`
+    and does a full refresh of `fct_campaign_daily` (see `test_metrics_store`,
+    `test_ml_assets`, `test_loader`). Running that against the same database
+    the dashboard reads means "run the tests" and "demo the dashboard" are
+    mutually destructive - which is exactly what happened during the final
+    review (I2). This runs at import time, before any test module's own
+    `_postgres_available()` skip guard evaluates its DSN, so the database
+    exists by the time collection needs it.
+    """
+    if dsn == _SERVING_DSN:
+        raise RuntimeError(
+            "ADSIGNAL_TEST_DSN resolved to the serving database "
+            f"({_SERVING_DSN}); running the suite would truncate model_metrics, "
+            "drift_reports and anomaly_predictions and replace fct_campaign_daily "
+            "wholesale under a running demo. Point ADSIGNAL_TEST_DSN at a "
+            "separate database instead."
+        )
+    info = psycopg.conninfo.conninfo_to_dict(dsn)
+    dbname = info.pop("dbname", None) or "adsignal_test"
+    admin_dsn = psycopg.conninfo.make_conninfo(**info, dbname="postgres")
+    try:
+        with psycopg.connect(admin_dsn, connect_timeout=2, autocommit=True) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)
+            ).fetchone()
+            if exists is None:
+                conn.execute(f'CREATE DATABASE "{dbname}"')
+    except psycopg.OperationalError:
+        # Postgres itself isn't reachable here; each test module's own
+        # `_postgres_available()` guard is what skips in that case.
+        return
+
+
+_ensure_test_database(TEST_DSN)
 
 
 @pytest.fixture(scope="session", autouse=True)
