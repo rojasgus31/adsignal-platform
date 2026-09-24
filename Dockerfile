@@ -17,6 +17,12 @@ COPY src ./src
 COPY dbt ./dbt
 RUN uv sync --frozen --no-dev
 
+# The dbt project's packages (dbt_utils) are never committed or copied from
+# the host (see .dockerignore) — install them at build time so the image is
+# self-sufficient and does not depend on the build host having already run
+# `dbt deps`.
+RUN uv run dbt deps --project-dir dbt --profiles-dir dbt
+
 ENV PATH="/app/.venv/bin:$PATH" \
     DAGSTER_HOME=/app/.dagster
 
