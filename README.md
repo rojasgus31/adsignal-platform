@@ -78,3 +78,45 @@ uv run ruff check . && uv run mypy && uv run pytest
 
 Tests that need Postgres skip automatically when it is not reachable. Start
 it with `docker compose up -d postgres`.
+
+## Models
+
+| Model | Purpose | Framework |
+|---|---|---|
+| IsolationForest | flag campaign-days that depart from the campaign's own recent behaviour | scikit-learn |
+| HistGradientBoostingClassifier | predict an anomaly's cause, severity and whether to escalate | scikit-learn |
+
+Features are rolling ratios and z-scores computed over a window that **ends the
+day before** the row it describes. A baseline including the current day would
+let the model see the anomaly it is meant to predict.
+
+The train/holdout split is by date, never random: a random split over a time
+series trains on the future to predict the past.
+
+### What these models do and do not show
+
+`anomaly_cause` is assigned by the synthetic generator from deterministic
+effect multipliers, so the classifier recovers an encoded signal rather than
+discovering one. What this demonstrates is the engineering around a model —
+feature design that avoids leakage, temporal evaluation, versioned training
+runs, a CI quality gate, and drift monitoring in production — not a research
+result.
+
+### Monitoring
+
+`drift_reports` records a Population Stability Index and a two-sample
+Kolmogorov–Smirnov test per feature on every run. PSI above 0.2 or a KS
+p-value below 0.01 marks a feature as drifted. Implemented directly rather
+than via a monitoring library: it is forty lines and every number is
+explainable.
+
+### Quality gate
+
+`.github/workflows/eval.yml` trains on a fresh mart and fails the build when
+triage macro F1 falls below the floor in `adsignal/ml/evaluation.py`, or when
+the detector's recall falls below its own floor. The detector is a hard
+pre-filter ahead of the classifier — the scoring asset only triages the rows
+the detector flags — so a detector with poor recall can silently starve the
+classifier of real anomalies while triage metrics still look healthy. Both
+gates must pass for the build to succeed; a regression on either cannot reach
+`main` unnoticed.

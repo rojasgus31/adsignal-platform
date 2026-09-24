@@ -1,0 +1,55 @@
+name: Model quality gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: adsignal
+          POSTGRES_PASSWORD: adsignal
+          POSTGRES_DB: adsignal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Install dbt packages
+        run: uv run dbt deps --project-dir dbt --profiles-dir dbt
+
+      - name: Build the mart
+        env:
+          ADSIGNAL_TARGET_EVENTS: 200000
+          ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal
+        run: uv run dagster job execute -m adsignal.pipeline.definitions -j adsignal_daily
+
+      - name: Evaluate and gate
+        env:
+          ADSIGNAL_TARGET_EVENTS: 200000
+          ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal
+        run: uv run python -m adsignal.ml.gate
