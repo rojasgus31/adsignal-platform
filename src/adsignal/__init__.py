@@ -1,2 +1,1 @@
-def hello() -> str:
-    return "Hello from adsignal!"
+"""AdSignal data platform."""
