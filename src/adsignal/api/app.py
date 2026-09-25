@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from adsignal.api.cache import TtlCache
 from adsignal.api.cors import cors_kwargs
 from adsignal.api.ratelimit import TokenBucket
-from adsignal.api.routes import anomalies, ask, campaigns, health, models, search
+from adsignal.api.routes import anomalies, ask, campaigns, evidence, health, models, search
 from adsignal.api.routes.ask import (
     ASK_CACHE_CAPACITY,
     ASK_CACHE_TTL_SECONDS,
@@ -110,6 +110,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(campaigns.router)
     app.include_router(anomalies.router)
     app.include_router(models.router)
+    app.include_router(evidence.router)
     app.include_router(search.router)
     app.include_router(ask.router)
 

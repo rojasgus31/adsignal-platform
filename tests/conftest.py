@@ -330,7 +330,7 @@ def _api_seed(tmp_path_factory) -> str:
         accuracy=0.8,
         macro_f1=0.75,
         per_class_f1={"budget_pacing": 0.8},
-        confusion={"budget_pacing": {"budget_pacing": 4}},
+        confusion={"budget_pacing": {"budget_pacing": 5}},
         n_samples=5,
     )
     detector = DetectorMetrics(

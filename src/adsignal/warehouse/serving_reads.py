@@ -38,6 +38,20 @@ class ModelMetricsRow:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelEvidence:
+    """Everything `model_metrics` stores about one training run."""
+
+    run_id: str
+    trained_at: datetime
+    holdout_samples: int
+    per_class_f1: dict[str, float]
+    confusion: dict[str, dict[str, int]]
+    detector_roc_auc: float
+    detector_f1: float
+    triage_macro_f1: float
+
+
+@dataclass(frozen=True, slots=True)
 class AnomalyPredictionRow:
     """One `anomaly_predictions` row, as read back for the API."""
 
@@ -76,6 +90,29 @@ def read_model_metrics(
             (limit, offset),
         ).fetchall()
     return [ModelMetricsRow(*row) for row in rows]
+
+
+def read_model_evidence(dsn: str, run_id: str) -> ModelEvidence | None:
+    """Return everything stored about one training run, or None if it is unknown.
+
+    `run_id` reaches this query bound as a parameter, never interpolated into
+    SQL, so a path segment crafted to look like SQL is just a string that
+    matches no row - see `test_a_run_id_that_looks_like_sql_is_rejected_safely`.
+    """
+    ensure_ml_schema(dsn)
+    with connection(dsn) as conn:
+        row = conn.execute(
+            """
+            SELECT run_id, trained_at, triage_n_samples, per_class_f1, confusion,
+                   detector_roc_auc, detector_f1, triage_macro_f1
+            FROM model_metrics
+            WHERE run_id = %s
+            ORDER BY trained_at DESC, id DESC
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+    return ModelEvidence(*row) if row is not None else None
 
 
 def read_anomaly_predictions(

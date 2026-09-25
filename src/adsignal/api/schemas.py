@@ -62,6 +62,19 @@ class ModelMetricsOut(BaseModel):
     detector_roc_auc: float
 
 
+class EvidenceOut(BaseModel):
+    """`GET /models/{run_id}/evidence`: everything stored about one training run."""
+
+    run_id: str
+    trained_at: datetime
+    holdout_samples: int
+    per_class_f1: dict[str, float]
+    confusion: dict[str, dict[str, int]]
+    detector_roc_auc: float
+    detector_f1: float
+    triage_macro_f1: float
+
+
 class BenchmarkRun(BaseModel):
     """One run's summary for the dashboard's comparison view."""
 
