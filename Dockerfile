@@ -26,9 +26,24 @@ RUN uv run dbt deps --project-dir dbt --profiles-dir dbt
 ENV PATH="/app/.venv/bin:$PATH" \
     DAGSTER_HOME=/app/.dagster
 
+# Bake the embedding weights (BAAI/bge-small-en-v1.5, ~90 MB) into the image.
+# Nothing else fetches them at build time, so without this the first /search
+# on a fresh deployment downloads them inside the request - a long hang, or a
+# 500 on a host with restricted egress - and every container restart repeats
+# it. Both cache variables are set because fastembed resolves its ONNX cache
+# from FASTEMBED_CACHE_PATH (defaulting to a temp directory that does not
+# survive a restart) and huggingface_hub resolves its own from HF_HOME. Both
+# live under /app so the chown below covers them for the non-root user.
+ENV HF_HOME=/app/.cache/huggingface \
+    FASTEMBED_CACHE_PATH=/app/.cache/fastembed
+
+# Driven through EmbeddingModel rather than a hardcoded repo id, so the image
+# can never cache a different model than the code loads.
+RUN uv run python -c "from adsignal.ml.embeddings import EmbeddingModel; EmbeddingModel().embed_one('warm the model cache')"
+
 RUN groupadd --gid 1000 adsignal \
     && useradd --uid 1000 --gid adsignal --create-home --shell /bin/bash adsignal \
-    && mkdir -p /app/.dagster /app/data \
+    && mkdir -p /app/.dagster /app/data /app/.cache \
     && chown -R adsignal:adsignal /app
 
 USER adsignal
