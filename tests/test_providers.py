@@ -293,7 +293,18 @@ def test_build_chain_includes_a_configured_provider_first() -> None:
 def test_build_chain_always_ends_with_the_stub() -> None:
     """The chain must never be empty, so a keyless deployment still renders."""
     chain = build_chain(Settings())
-    assert chain.generate(REQUEST).provider == "stub"
+    result = chain.generate(REQUEST)
+    assert result.provider == "stub"
+
+    # Regression guard: `build_chain` once constructed the terminal provider
+    # with a literal placeholder string, which permanently overrides the
+    # provider's own summarizing default. A test that only checks `.provider`
+    # would keep passing even if that literal came back — so assert on the
+    # text itself, that it is a real summary of `REQUEST` rather than a stock
+    # string.
+    assert str(REQUEST.campaign_count) in result.text
+    assert "placeholder" not in result.text.lower()
+    assert "not configured" not in result.text.lower()
 
 
 def test_build_chain_has_no_duplicate_provider_names() -> None:

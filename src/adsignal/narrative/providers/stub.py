@@ -13,8 +13,6 @@ text.
 from adsignal.narrative.summary import summarize
 from adsignal.narrative.types import NarrativeRequest
 
-_USE_SUMMARY = object()
-
 
 class StubProvider:
     """Returns fixed text, a computed summary, or a fixed exception.
@@ -24,7 +22,7 @@ class StubProvider:
 
     def __init__(
         self,
-        text: object = _USE_SUMMARY,
+        text: str | None = None,
         fail_with: Exception | None = None,
         name: str = "stub",
     ) -> None:
@@ -38,7 +36,6 @@ class StubProvider:
         self.call_count += 1
         if self._fail_with is not None:
             raise self._fail_with
-        if self._text is _USE_SUMMARY:
+        if self._text is None:
             return summarize(request)
-        assert isinstance(self._text, str)
         return self._text
