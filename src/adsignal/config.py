@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # Not used in this task; consumed by a later task.
     dbt_dir: Path | None = None
     mlflow_dir: Path = Path("mlruns")
+    gemini_api_key: str = ""
+    groq_api_key: str = ""
+    jev_api_key: str = ""
+    anthropic_api_key: str = ""
+    narrative_timeout_seconds: float = 20.0
 
     @property
     def raw_events_path(self) -> Path:

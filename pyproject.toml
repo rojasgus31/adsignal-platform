@@ -19,6 +19,7 @@ dependencies = [
     "mlflow>=2.17",
     "pgvector>=0.3",
     "fastembed>=0.4",
+    "httpx>=0.27",
 ]
 
 [dependency-groups]
