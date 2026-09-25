@@ -66,6 +66,17 @@ def test_endpoints_return_empty_not_error_with_no_tables_at_all(dropped_tables_c
     unknown_anomaly = dropped_tables_client.get("/anomalies/does-not-exist/2024-01-01")
     assert unknown_anomaly.status_code == 404
 
+    # `/ask` is the first thing a visitor hits on a freshly deployed demo, so
+    # it must answer rather than 500 on a database with no tables at all.
+    # This runs last in the test because answering creates the empty tables.
+    ask = dropped_tables_client.post("/ask", json={"question": "how many anomalies?"})
+    assert ask.status_code == 200, ask.text
+    assert ask.json()["rows"] == [{"count": 0}]
+
+    ask_spend = dropped_tables_client.post("/ask", json={"question": "spend by channel?"})
+    assert ask_spend.status_code == 200, ask_spend.text
+    assert ask_spend.json()["rows"] == []
+
 
 def test_campaigns_lists_known_campaigns(client) -> None:
     body = client.get("/campaigns").json()

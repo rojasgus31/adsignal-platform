@@ -54,3 +54,9 @@ def test_refill_does_not_exceed_capacity() -> None:
 def test_rejects_a_nonsense_capacity() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         TokenBucket(capacity=0, refill_per_second=1.0)
+
+
+def test_a_negative_refill_rate_is_rejected() -> None:
+    """A negative rate would drive tokens below zero and deny the key forever."""
+    with pytest.raises(ValueError, match="refill_per_second"):
+        TokenBucket(capacity=1, refill_per_second=-1.0)

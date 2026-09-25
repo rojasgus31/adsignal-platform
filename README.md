@@ -163,3 +163,88 @@ statistically indistinguishable on the real mart, so 5 is kept.
 (`HistGradientBoostingClassifier`/`Regressor` support `categorical_features`
 directly), delivering the categorical feature named in the spec rather than
 leaving it declared but unused.
+
+## Serving API
+
+`src/adsignal/api/` is a read-only FastAPI service over the tables the
+pipeline writes.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | Liveness check |
+| `GET /campaigns` | Every known campaign |
+| `GET /campaigns/{id}/metrics` | One campaign's full daily time series |
+| `GET /anomalies` | Every current anomaly prediction |
+| `GET /anomalies/{campaign_id}/{event_date}` | One campaign-day's prediction |
+| `GET /models` | Every training run's evaluation, newest first |
+| `GET /benchmark` | Every run plus which narrative provider answered most recently |
+| `POST /search` | Semantic search over stored entity embeddings |
+| `POST /ask` | A natural-language question, answered from precomputed data |
+
+Run it with `docker compose up -d api`, or locally with
+`uv run uvicorn adsignal.api.app:create_app --factory --port 8000`. The
+router layer issues no SQL of its own: every endpoint reads through a
+`warehouse/` reader, and each of those creates its tables if they do not
+exist yet, so a deployment where the pipeline has never run answers with
+empty results rather than an error.
+
+### Precomputation rule
+
+Every endpoint except `/ask` reads rows the pipeline already computed and
+stored — visitor traffic against them triggers no inference and no
+external call, regardless of load. `/ask` is the sole exception: it is
+the only path that does live work per request, which is exactly why it
+is the only one that is rate-limited and cached (below).
+
+### The narrative provider chain
+
+`narrative/build.py` assembles a chain of providers in a fixed order:
+Gemini, then Groq, then Jev, then Anthropic — each included only if its
+API key is configured — with a `StubProvider` always last. Free tiers
+are tried first, the paid provider last, and the stub guarantees a
+deployment with no keys at all still renders a narrative (placeholder
+text) rather than erroring. Each provider sits behind its own circuit
+breaker in `NarrativeChain`; a provider that has failed enough times in
+a row is skipped without being called until its cooldown elapses, so
+one dead backend costs nothing on later requests.
+
+### `/ask`: named templates, not generated SQL
+
+The spec describes `/ask` as "natural language to SQL". This
+implementation deliberately does **not** generate SQL. A keyword
+matcher (or, in principle, a model) resolves the question to the
+*name* of one of a fixed, closed set of query templates declared in
+`adsignal/api/queries.py` — never to a query string. That name is
+validated against the known template set before anything runs, and
+rejected with a 400 if it does not match one exactly. Each template's
+own parameters (for example, a result `limit`) are validated and bound
+with `%s` placeholders; nothing a request supplies — not the template
+name, not a parameter, not a column, not an ORDER BY direction — is
+ever interpolated into SQL. A component that can only ever choose among
+a handful of known names cannot emit an injection: this is not
+SQL-injection sanitisation applied after the fact, it is a data path
+where no such string can exist in the first place.
+
+Because `/ask` is the one endpoint that does live work per request, it
+is guarded by a per-IP `TokenBucket` (`adsignal/api/ratelimit.py`) — a
+token bucket refilled gradually over time, returning 429 once a
+caller's budget is exhausted — and identical questions are cached for a
+short TTL so a repeated question is answered once, not recomputed on
+every call. The rate limiter is checked on every request regardless of
+a cache hit, so a burst of one repeated question still trips the
+limiter; the cache only saves the downstream template resolution and
+database round-trip. Both are per-app collaborators built in
+`create_app` and injected through `api/deps.py`, and the cache is
+bounded (LRU, hard capacity) as well as TTL'd, because its key is
+caller-supplied free text.
+
+**Known gap:** the plan describes resolving a question to a template
+*via the narrative chain* when a provider key is configured. The
+existing `NarrativeProvider` contract is
+`generate(request: NarrativeRequest) -> str`, where `NarrativeRequest`
+is a closed dataclass of precomputed statistics (campaign/anomaly
+counts, top causes) — it has no field for an arbitrary question, and
+extending it would mean changing a contract several earlier tasks
+already depend on. `/ask` therefore resolves every question through the
+keyword matcher only, in every configuration; no provider is called
+from this endpoint today.

@@ -1,13 +1,12 @@
 """`POST /ask` — natural-language questions answered from named query templates.
 
 **Design decision:** the spec calls this "NL→SQL". This implementation does
-not generate SQL. A model — or, with no provider key configured, a keyword
-matcher — selects among the fixed set of templates in `adsignal.api.queries`
-by *name*, and that name is validated against `QUERY_TEMPLATES` before
-anything runs. A request supplying an unrecognised name is rejected with a
-400, never executed. Because a model here can only ever emit one of a
-handful of known strings, never a query, injection is not a risk that has
-been defended against — it structurally cannot occur.
+not generate SQL. A keyword matcher selects among the fixed set of templates
+in `adsignal.api.queries` by *name*, and that name is validated against
+`QUERY_TEMPLATES` before anything runs. A request supplying an unrecognised
+name is rejected with a 400, never executed. Because the selector can only
+ever emit one of a handful of known strings, never a query, injection is not
+a risk that has been defended against — it structurally cannot occur.
 
 **Why there is no LLM-driven template selection yet:** the existing
 `NarrativeChain`/`NarrativeProvider` contract (`narrative/types.py`,
@@ -27,25 +26,29 @@ and database round-trip, not the rate-limit budget; otherwise a burst of one
 repeated question would never trip the limiter).
 """
 
-import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
-from adsignal.api.deps import get_settings
-from adsignal.api.queries import QUERY_TEMPLATES, run_template
+from adsignal.api.cache import TtlCache
+from adsignal.api.deps import get_ask_cache, get_ask_rate_limiter, get_settings
+from adsignal.api.queries import QUERY_TEMPLATES
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
+from adsignal.warehouse.template_reads import run_template
 
 router = APIRouter(tags=["ask"])
 
-# A module-level singleton: one budget and one cache shared across every
-# request this process serves, mirroring how `create_app` shares a single
-# `EmbeddingModel` rather than building one per request.
-_BUCKET = TokenBucket(capacity=10, refill_per_second=5.0)
-_CACHE_TTL_SECONDS = 30.0
-_cache: dict[str, tuple[float, "AskResponse"]] = {}
+# `/ask`'s tuning, read by `create_app`, which builds the bucket and the cache
+# and puts them on `app.state` (they are per-app collaborators injected through
+# `deps.py`, not module-level singletons). The capacity/refill pair leaves a
+# caller a burst of ten and five per second sustained; the cache is bounded as
+# well as TTL'd because its key is caller-supplied free text.
+ASK_RATE_LIMIT_CAPACITY = 10
+ASK_RATE_LIMIT_REFILL_PER_SECOND = 5.0
+ASK_CACHE_TTL_SECONDS = 30.0
+ASK_CACHE_CAPACITY = 512
 
 # Keyword -> template name, checked in order; the first match wins. This is
 # the "otherwise a keyword matcher" branch described in the module docstring
@@ -125,35 +128,45 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client is not None else "unknown"
 
 
+def _answer(dsn: str, template_name: str, parameters: dict[str, int]) -> AskResponse:
+    """Resolve one template name to an answer, or raise the matching 4xx.
+
+    `QueryTemplate.bind` is the only place request data reaches the query, and
+    it returns already-validated values — never a string that could be
+    concatenated into SQL. Execution itself belongs to `warehouse/`.
+    """
+    if template_name == "unknown":
+        return AskResponse(template="unknown", answer=_summarize("unknown", []), rows=[])
+    if template_name not in QUERY_TEMPLATES:
+        raise HTTPException(status_code=400, detail=f"unknown template: {template_name!r}")
+
+    template = QUERY_TEMPLATES[template_name]
+    try:
+        bound = template.bind(parameters)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    rows = run_template(dsn, template.sql, template.columns, bound)
+    return AskResponse(template=template_name, answer=_summarize(template_name, rows), rows=rows)
+
+
 @router.post("/ask", response_model=AskResponse)
 def post_ask(
-    body: AskRequest, request: Request, settings: Settings = Depends(get_settings)
+    body: AskRequest,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    rate_limiter: TokenBucket = Depends(get_ask_rate_limiter),
+    cache: TtlCache[AskResponse] = Depends(get_ask_cache),
 ) -> AskResponse:
     """Answer a question by running one named, parameterized query template."""
-    if not _BUCKET.allow(_client_key(request)):
+    if not rate_limiter.allow(_client_key(request)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     cache_key = f"{body.template or ''}|{body.question.strip().lower()}"
-    now = time.monotonic()
-    cached = _cache.get(cache_key)
-    if cached is not None and now - cached[0] < _CACHE_TTL_SECONDS:
-        return cached[1]
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     template_name = body.template if body.template is not None else _match_template(body.question)
-
-    if template_name == "unknown":
-        response = AskResponse(template="unknown", answer=_summarize("unknown", []), rows=[])
-    elif template_name not in QUERY_TEMPLATES:
-        raise HTTPException(status_code=400, detail=f"unknown template: {template_name!r}")
-    else:
-        template = QUERY_TEMPLATES[template_name]
-        try:
-            rows = run_template(settings.postgres_dsn, template, body.parameters)
-        except ValueError as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        response = AskResponse(
-            template=template_name, answer=_summarize(template_name, rows), rows=rows
-        )
-
-    _cache[cache_key] = (now, response)
+    response = _answer(settings.postgres_dsn, template_name, body.parameters)
+    cache.put(cache_key, response)
     return response

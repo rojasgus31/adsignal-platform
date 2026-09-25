@@ -28,8 +28,12 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Optional for the same reason as `api` below: compose refuses to parse
+    # the whole file when a required env_file is missing, and `.env` is
+    # gitignored.
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@postgres:5432/adsignal
       ADSIGNAL_DUCKDB_PATH: /app/data/adsignal.duckdb
@@ -64,13 +68,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Optional: `.env` is gitignored and only `.env.example` is tracked, so a
+    # required entry would make compose refuse to parse this whole file on a
+    # clean clone - breaking even `docker compose up -d postgres`. The API
+    # runs fine without it; the provider keys it carries are optional.
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@postgres:5432/adsignal
       ADSIGNAL_DUCKDB_PATH: /app/data/adsignal.duckdb
       ADSIGNAL_DATA_DIR: /app/data
-      ADSIGNAL_TARGET_EVENTS: ${ADSIGNAL_TARGET_EVENTS:-10000000}
       ADSIGNAL_DBT_DIR: /app/dbt
     ports:
       - "8000:8000"

@@ -9,7 +9,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from adsignal.api.app import create_app
+from adsignal.api.app import create_app, install_ask_runtime
 from adsignal.config import Settings
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
@@ -411,3 +411,24 @@ def dropped_tables_client():
     app = create_app(Settings(postgres_dsn=DROPPED_TEST_DSN))
     with TestClient(app) as test_client:
         yield test_client
+
+
+# Every fixture that hands a test a `TestClient`. `reset_ask_state` below
+# only materializes the ones the test already asked for.
+_CLIENT_FIXTURES = ("client", "empty_client", "dropped_tables_client")
+
+
+@pytest.fixture(autouse=True)
+def reset_ask_state(request):
+    """Give every test a fresh `/ask` rate-limit budget and an empty cache.
+
+    The client fixtures are module-scoped, so without this the `/ask` tests
+    are order-coupled: `test_ask_is_rate_limited_per_ip` drains the bucket to
+    zero and nothing refills it deterministically, so any `/ask` test that
+    happens to run after it would see a 429 instead of its own answer. This
+    resets both collaborators on `app.state` before each test, which is only
+    possible because they are injected rather than module-level globals.
+    """
+    for name in _CLIENT_FIXTURES:
+        if name in request.fixturenames:
+            install_ask_runtime(request.getfixturevalue(name).app)

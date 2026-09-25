@@ -1,20 +1,23 @@
 """Named, parameterized query templates for `POST /ask`.
 
 The spec calls `/ask` "natural language to SQL". This module deliberately
-does **not** generate SQL: a model — or, with no key configured, a keyword
-matcher in `routes/ask.py` — chooses among a fixed, closed set of templates
-declared here by name, and each template's own parameters are validated
+does **not** generate SQL, and nothing generates it on this module's behalf:
+the keyword matcher in `routes/ask.py` chooses among the fixed, closed set of
+templates declared here *by name*. No model is involved in that choice today,
+in any configuration — see `routes/ask.py` for why the narrative provider
+chain cannot serve this role. Each template's own parameters are validated
 before binding. Every `sql` string below is a fixed literal with `%s`
 placeholders; nothing in this module ever builds a query string out of
 request data — not the template name, not a parameter, not a column, not an
-ORDER BY direction. A model that cannot emit SQL cannot emit an injection.
+ORDER BY direction. A selector that can only emit a template name cannot emit
+an injection.
+
+This module is declarative only. Executing a template is
+`warehouse.template_reads.run_template`'s job, so `api/` issues no SQL.
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
-
-import psycopg
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,18 +108,3 @@ QUERY_TEMPLATES: dict[str, QueryTemplate] = {
         columns=("channel", "total_spend"),
     ),
 }
-
-
-def run_template(
-    dsn: str, template: QueryTemplate, parameters: Mapping[str, object]
-) -> list[dict[str, Any]]:
-    """Bind `parameters` against `template`, run it, and return rows as dicts.
-
-    `template.bind` is the only place request data reaches the query, and it
-    returns a tuple of already-validated values — never a string that could
-    be concatenated into `sql`.
-    """
-    bound = template.bind(parameters)
-    with psycopg.connect(dsn) as conn:
-        rows = conn.execute(template.sql, bound).fetchall()
-    return [dict(zip(template.columns, row, strict=True)) for row in rows]
