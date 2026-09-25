@@ -40,17 +40,28 @@ def test_settings_read_env_with_prefix(monkeypatch) -> None:
 
 def test_settings_repr_never_contains_a_secret() -> None:
     """An unhandled exception, debug endpoint, or reload error page can all end
-    up printing a `Settings` instance. None of its credential fields may show
-    up in that text.
+    up printing, dumping, or JSON-serialising a `Settings` instance. None of
+    its credential fields may show up on any of those four surfaces — and
+    masking must not come at the cost of `postgres_dsn` still being a usable
+    connection string for the dozens of call sites that read it directly.
     """
     sentinel = "sk-super-secret-key-do-not-leak"
+    dsn = f"postgresql://adsignal:{sentinel}@localhost:5432/adsignal"
     settings = Settings(
         _env_file=None,
-        postgres_dsn=f"postgresql://adsignal:{sentinel}@localhost:5432/adsignal",
+        postgres_dsn=dsn,
         gemini_api_key=sentinel,
         groq_api_key=sentinel,
         jev_api_key=sentinel,
         anthropic_api_key=sentinel,
     )
+
     assert sentinel not in repr(settings)
     assert sentinel not in str(settings)
+    assert sentinel not in str(settings.model_dump())
+    assert sentinel not in settings.model_dump_json()
+
+    # Masking model_dump()/model_dump_json() must not break attribute access:
+    # every call site that connects to Postgres reads settings.postgres_dsn
+    # directly, and it must still be the real, usable DSN.
+    assert settings.postgres_dsn == dsn
