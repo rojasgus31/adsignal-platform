@@ -1,10 +1,12 @@
 """Review Focus 1: a fact row whose campaign has no dimension row."""
 
 import os
+from pathlib import Path
 
 import psycopg
 
 from adsignal.warehouse.dim_reads import CampaignDimension, read_campaign_dimension
+from adsignal.warehouse.duckdb_io import open_duckdb
 
 TEST_DSN = os.environ.get(
     "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
@@ -35,6 +37,25 @@ def test_every_fact_campaign_resolves_to_a_dimension_row(loaded_dimension) -> No
             "WHERE d.campaign_id IS NULL"
         ).fetchone()[0]
     assert orphans == 0, f"{orphans} campaign ids in the fact table have no dimension row"
+
+
+def test_a_campaign_with_no_matching_advertiser_still_appears(
+    built_duckdb_with_orphan_campaign: Path,
+) -> None:
+    """Review Finding 1. An INNER JOIN here would silently drop this campaign
+    from `dim_campaign` while it kept fact rows in `fct_campaign_daily`
+    (which joins only `stg_campaigns`) — an orphan the other tests in this
+    file cannot see, because `build_catalog` never produces one on its own.
+    """
+    with open_duckdb(built_duckdb_with_orphan_campaign) as conn:
+        row = conn.execute(
+            "SELECT campaign_name, advertiser_name FROM main_marts.dim_campaign "
+            "WHERE campaign_id = 'cmp_orphan'"
+        ).fetchone()
+    assert row is not None, "the orphan campaign is missing from dim_campaign entirely"
+    campaign_name, advertiser_name = row
+    assert campaign_name == "Orphan Campaign"
+    assert advertiser_name == "Unknown advertiser"
 
 
 def test_reading_an_empty_dimension_returns_an_empty_list(empty_client) -> None:

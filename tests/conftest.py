@@ -193,6 +193,33 @@ def built_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def built_duckdb_with_orphan_campaign(tmp_path: Path) -> Path:
+    """Like `built_duckdb`, but one campaign's advertiser_id matches no row
+    in `raw_advertisers`.
+
+    `build_catalog` always creates a campaign alongside its advertiser in the
+    same loop (`generator/catalog.py`), so this case never occurs naturally
+    in a generated dataset. It is manufactured directly against the raw
+    source table here, to exercise `dim_campaign`'s left join and its
+    fallback advertiser name (Task 1 review, Finding 1).
+    """
+    catalog, events_path, labels_path = _build_small_dataset(tmp_path)
+
+    duckdb_path = tmp_path / "orphan.duckdb"
+    with open_duckdb(duckdb_path) as conn:
+        register_sources(conn, events_path=events_path, labels_path=labels_path, catalog=catalog)
+        conn.execute(
+            "INSERT INTO raw_campaigns VALUES "
+            "('cmp_orphan', 'adv_missing', 'Orphan Campaign', 'search', ?, ?, 100.0)",
+            [date(2024, 1, 1), date(2024, 6, 30)],
+        )
+
+    run_dbt(project_dir=_DBT_DIR, duckdb_path=duckdb_path, command="build")
+
+    return duckdb_path
+
+
+@pytest.fixture
 def loaded_dimension(built_duckdb):
     """Load `dim_campaign` into TEST_DSN.
 
