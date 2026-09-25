@@ -48,6 +48,12 @@ services:
       - "3000:3000"
     volumes:
       - pipeline_data:/app/data
+      # Where `registry.log_training_run` writes each run's fitted models,
+      # and the only copy of them. Shared with `api` because `POST /score`
+      # loads this run's artifacts to serve a request; without the volume the
+      # pipeline's artifacts die with its container and `/score` can only
+      # answer 503.
+      - mlflow_data:/app/mlruns
     deploy:
       resources:
         limits:
@@ -82,13 +88,20 @@ services:
       ADSIGNAL_DBT_DIR: /app/dbt
     ports:
       - "8000:8000"
+    volumes:
+      # Read-only: the API loads the newest run's models from here and never
+      # writes a run. See the `pipeline` service's mount above.
+      - mlflow_data:/app/mlruns:ro
     deploy:
       resources:
         limits:
-          # Measured: 412.0 MB peak after a cold start and one /search
-          # (scripts/measure_memory.py). Render's free tier gives 512 MB.
+          # Measured: 404.1 MB peak after a cold start, one /search and one
+          # /score, with both the embedder and the fitted detector/triage
+          # pair loaded (scripts/measure_memory.py). Scoring adds ~16 MB on
+          # top of /search's 388.0 MB. Render's free tier gives 512 MB.
           memory: 512m
 
 volumes:
   postgres_data:
   pipeline_data:
+  mlflow_data:

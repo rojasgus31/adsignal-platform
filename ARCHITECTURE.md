@@ -36,10 +36,17 @@ night's, never a blend.
 
 ## 2. Precomputed, not served live
 
-Every endpoint except `/search` and `/ask` returns rows the pipeline already
-computed and stored. Visitor traffic against `/campaigns`, `/anomalies`,
-`/models` and `/benchmark` triggers no inference, no LLM call and no external
-request, at any load.
+Every endpoint except `/search`, `/score` and `/ask` returns rows the
+pipeline already computed and stored. Visitor traffic against `/campaigns`,
+`/anomalies`, `/models` and `/benchmark` triggers no inference, no LLM call
+and no external request, at any load.
+
+`/score` is the deliberate exception to the rule this section states, and it
+earns its place by answering the objection the rule invites: a served row
+proves storage, not a working model. It runs the fitted detector and triage
+estimators in the API process against features built for the requested
+campaign-day, and it is the tightest-throttled endpoint in the API for
+exactly that reason.
 
 This is a deliberate inversion of the obvious design. The expensive work —
 generation, dbt build, training, scoring, drift, embeddings, the narrative —
@@ -47,10 +54,10 @@ happens once a night on a runner that nobody is waiting on, where a slow or
 failed step costs a retry rather than a timeout in someone's browser. What
 the API does is read.
 
-It also bounds the blast radius of a bad actor. The only two endpoints that
-do work per request are the two that are rate-limited
-(`src/adsignal/api/routes/search.py`, `src/adsignal/api/routes/ask.py`), and
-`/ask` is additionally cached. Everything else is a bounded, paginated read
+It also bounds the blast radius of a bad actor. The only three endpoints
+that do work per request are the three that are rate-limited
+(`src/adsignal/api/routes/search.py`, `src/adsignal/api/routes/score.py`,
+`src/adsignal/api/routes/ask.py`), and `/ask` is additionally cached. Everything else is a bounded, paginated read
 against an indexed table.
 
 ---
@@ -228,13 +235,26 @@ repository is scheduled by cron at the time of writing.
 
 ---
 
-## 8. Memory: 412 MB measured against a 512 MB ceiling
+## 8. Memory: 404 MB measured against a 512 MB ceiling
 
 `scripts/measure_memory.py` starts the app, issues `/health`, issues one
-`/search`, and reports peak RSS. The measured figure, recorded in the `api`
-service's `deploy.resources.limits` comment in `docker-compose.yml`, is
-**412.0 MB peak after a cold start and one `/search`, against the 512 MB the
-free tier gives.** The script exits non-zero above 85% of the budget, which
+`/search`, issues one `/score`, and reports peak RSS. The measured figure,
+recorded in the `api` service's `deploy.resources.limits` comment in
+`docker-compose.yml`, is **404.1 MB peak after a cold start, one `/search`
+and one `/score`, against the 512 MB the free tier gives.** The two fitted
+estimators `/score` unpickles cost ~16 MB on top of `/search`'s 388.0 MB —
+small next to the embedder because an `IsolationForest` of 200 shallow trees
+and two gradient-boosted ensembles are, unlike a transformer, mostly split
+thresholds. The script fails the run if `/score` answers anything but 200,
+because a peak measured without the models loaded is an understatement
+rather than a pass.
+
+What did *not* fit was MLflow. `ml/scoring.py` reaches `load_models` through
+`ml/registry.py`, which is also the module that logs training runs; a
+module-scope `import mlflow` there costs a measured ~136 MB of resident
+memory, which alone would have put the API over the ceiling. That import now
+lives inside `log_training_run`, the one function that needs it, and
+`test_loading_the_scoring_layer_does_not_import_mlflow` holds it there. The script exits non-zero above 85% of the budget, which
 makes the headroom *checkable* on demand — but nothing invokes it: `git grep
 measure_memory` over `.github/` and `tests/` returns nothing. It is a manual
 script, so this is a measurement someone has to remember to take, not an

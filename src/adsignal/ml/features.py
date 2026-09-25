@@ -70,10 +70,21 @@ FEATURE_COLUMNS: tuple[str, ...] = (
 )
 
 
+# The two rolling-window widths, named because callers outside this module
+# need them to reason about history: a caller scoring a single campaign-day
+# has to know how many prior days that day's baselines are computed from
+# (`DEFAULT_BASELINE_WINDOW`, below which every rolling column is NaN) and how
+# far back the read has to reach to reproduce them exactly
+# (`DEFAULT_ZSCORE_WINDOW`, the widest window here). See
+# `adsignal.warehouse.feature_reads`.
+DEFAULT_BASELINE_WINDOW = 7
+DEFAULT_ZSCORE_WINDOW = 28
+
+
 def build_features(
     frame: pd.DataFrame,
-    baseline_window: int = 7,
-    zscore_window: int = 28,
+    baseline_window: int = DEFAULT_BASELINE_WINDOW,
+    zscore_window: int = DEFAULT_ZSCORE_WINDOW,
 ) -> pd.DataFrame:
     """Return one feature row per input row, ordered as the input was.
 

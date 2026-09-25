@@ -9,8 +9,6 @@ import os
 import pickle
 from pathlib import Path
 
-import mlflow
-
 from adsignal.ml.detector import AnomalyDetector
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
 from adsignal.ml.triage import TriageClassifier
@@ -71,6 +69,16 @@ def log_training_run(
     # just importing `adsignal.pipeline.definitions`) must not mutate the
     # process environment for every embedding host.
     os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
+
+    # Imported here, not at module scope, for the same reason the environment
+    # variable above is set here: importing this module must stay cheap.
+    # `save_models`/`load_models` are pure `pickle` and need nothing from
+    # MLflow, and the API process imports them (via `adsignal.ml.scoring`) to
+    # serve `POST /score`. A module-scope `import mlflow` costs that process a
+    # measured ~136 MB of resident memory it never uses, inside a 512 MB
+    # container - see `scripts/measure_memory.py`. Only this function, which
+    # runs in the pipeline, actually needs MLflow.
+    import mlflow
 
     tracking_dir.mkdir(parents=True, exist_ok=True)
     mlflow.set_tracking_uri(tracking_dir.resolve().as_uri())

@@ -1,9 +1,10 @@
 """The FastAPI application factory.
 
 `create_app` is the api layer's single entry point: it wires one shared
-`Settings`, one shared `EmbeddingModel` and the shared runtime collaborators
-guarding `/search` and `/ask` into `app.state`, then mounts every router. Nothing here talks
-to Postgres directly — that stays inside `warehouse/`.
+`Settings`, one shared `EmbeddingModel`, one shared `ScoringModelHolder` and
+the shared runtime collaborators guarding `/search`, `/score` and `/ask` into
+`app.state`, then mounts every router. Nothing here talks to Postgres
+directly — that stays inside `warehouse/`.
 """
 
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from adsignal.api.cache import TtlCache
 from adsignal.api.cors import cors_kwargs
+from adsignal.api.model_loader import ScoringModelHolder
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.api.routes import (
     anomalies,
@@ -24,6 +26,7 @@ from adsignal.api.routes import (
     health,
     models,
     operations,
+    score,
     search,
 )
 from adsignal.api.routes.ask import (
@@ -31,6 +34,10 @@ from adsignal.api.routes.ask import (
     ASK_CACHE_TTL_SECONDS,
     ASK_RATE_LIMIT_CAPACITY,
     ASK_RATE_LIMIT_REFILL_PER_SECOND,
+)
+from adsignal.api.routes.score import (
+    SCORE_RATE_LIMIT_CAPACITY,
+    SCORE_RATE_LIMIT_REFILL_PER_SECOND,
 )
 from adsignal.api.routes.search import (
     SEARCH_RATE_LIMIT_CAPACITY,
@@ -56,8 +63,8 @@ def install_request_runtime(app: FastAPI) -> None:
     three live on `app.state`, reached through `deps.py`, so two apps in one
     process never share a budget or serve each other's cached answers.
 
-    `/search` and `/ask` get separate buckets: they cost very different
-    amounts per call, so they are tuned independently.
+    `/ask`, `/search` and `/score` get separate buckets: they cost very
+    different amounts per call, so they are tuned independently.
     """
     app.state.ask_rate_limiter = TokenBucket(
         capacity=ASK_RATE_LIMIT_CAPACITY,
@@ -69,6 +76,10 @@ def install_request_runtime(app: FastAPI) -> None:
     app.state.search_rate_limiter = TokenBucket(
         capacity=SEARCH_RATE_LIMIT_CAPACITY,
         refill_per_second=SEARCH_RATE_LIMIT_REFILL_PER_SECOND,
+    )
+    app.state.score_rate_limiter = TokenBucket(
+        capacity=SCORE_RATE_LIMIT_CAPACITY,
+        refill_per_second=SCORE_RATE_LIMIT_REFILL_PER_SECOND,
     )
 
 
@@ -95,11 +106,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI app.
 
-    A single `EmbeddingModel` is constructed here, once, and shared across
-    every request via `app.state` (see `adsignal.api.deps`) — constructing a
-    fresh one per request would reload its ~90 MB of weights on every
-    `/search` call. The model's own weights still load lazily on first use,
-    so building it here costs nothing at startup.
+    A single `EmbeddingModel` and a single `ScoringModelHolder` are
+    constructed here, once, and shared across every request via `app.state`
+    (see `adsignal.api.deps`) — constructing a fresh one per request would
+    reload the embedder's ~90 MB of weights on every `/search` call, and
+    unpickle both fitted estimators on every `/score`. Both load what they
+    wrap lazily on first use, so building them here costs nothing at startup
+    and, in particular, `create_app` still touches no database.
     """
     resolved_settings = settings if settings is not None else Settings()
 
@@ -111,6 +124,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = resolved_settings
     app.state.embedding_model = EmbeddingModel()
+    app.state.scoring_models = ScoringModelHolder(resolved_settings)
     install_request_runtime(app)
 
     app.add_middleware(CORSMiddleware, **cors_kwargs(resolved_settings))  # type: ignore[arg-type]
@@ -122,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(evidence.router)
     app.include_router(operations.router)
     app.include_router(search.router)
+    app.include_router(score.router)
     app.include_router(ask.router)
 
     return app

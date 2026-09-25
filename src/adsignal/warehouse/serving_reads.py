@@ -10,6 +10,7 @@ modifying `metrics_store.py`.
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 from adsignal.warehouse.pool import connection
@@ -154,3 +155,28 @@ def read_anomaly_prediction(
             (campaign_id, event_date),
         ).fetchone()
     return AnomalyPredictionRow(*row) if row is not None else None
+
+
+def read_latest_artifact_dir(dsn: str) -> Path | None:
+    """Return the newest training run's artifact directory, or None if none exists.
+
+    The same row-and-ordering `adsignal.pipeline.assets._latest_run` uses, and
+    for the same reason it reads `artifact_uri` from the run's own row rather
+    than reconstructing it from a per-process `Settings.mlflow_dir`: the run
+    registry and the artifact store are independent sources of truth, and
+    guessing where a run's models live lets them disagree silently.
+
+    None when no run has ever been recorded, or when the recorded directory
+    does not exist under this process's filesystem - a serving container that
+    never received the pipeline's artifacts. Both are "there is nothing to
+    serve", which a caller turns into a refusal; neither is an error here.
+    """
+    ensure_ml_schema(dsn)
+    with connection(dsn) as conn:
+        row = conn.execute(
+            "SELECT artifact_uri FROM model_metrics ORDER BY trained_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    directory = Path(str(row[0]))
+    return directory if directory.is_dir() else None

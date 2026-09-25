@@ -211,6 +211,7 @@ pipeline writes.
 | `GET /models` | One bounded page of training-run evaluations, newest first (`limit`, `offset`) |
 | `GET /benchmark` | Recent runs plus which narrative provider answered most recently |
 | `POST /search` | Semantic search over stored entity embeddings |
+| `POST /score` | Score one campaign-day on demand, with the loaded models |
 | `POST /ask` | A natural-language question, answered from precomputed data |
 
 Run it with `docker compose up -d api`, or locally with
@@ -225,14 +226,24 @@ response grows with the size of a table.
 
 ### Precomputation rule
 
-Every endpoint except `/search` and `/ask` reads rows the pipeline
-already computed and stored — visitor traffic against them triggers no
-inference and no external call, regardless of load. Those two are the
-exceptions: `/search` runs an ONNX embedding pass over the caller's text,
-and `/ask` resolves a template and runs one indexed query. Both are
-therefore rate-limited per caller IP, with separate budgets (`/search`
-tighter, since its call costs an inference), and `/ask` is additionally
-cached (below).
+Every endpoint except `/search`, `/score` and `/ask` reads rows the
+pipeline already computed and stored — visitor traffic against them
+triggers no inference and no external call, regardless of load. Those
+three are the exceptions: `/search` runs an ONNX embedding pass over the
+caller's text, `/score` builds one campaign-day's features and runs the
+fitted detector and triage models against them, and `/ask` resolves a
+template and runs one indexed query. All three are therefore rate-limited
+per caller IP, with separate budgets (`/score` tightest, then `/search`,
+since their calls cost inference), and `/ask` is additionally cached
+(below).
+
+`/score` exists to make the claim falsifiable: `GET /anomalies` returns
+what last night's batch decided, and a stored row proves only that a row
+was stored. `/score` runs the same two estimators in the API process,
+now. It refuses rather than guesses in two cases — a campaign-day with
+fewer than seven prior days has NaN rolling baselines and is a 404 naming
+the shortfall, and a deployment with no trained artifacts is a 503 —
+because a confidently wrong score is worse than a refusal.
 
 ### The narrative provider chain
 

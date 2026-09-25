@@ -17,6 +17,8 @@ from adsignal.generator.events import generate_events
 from adsignal.generator.models import ANOMALY_CAUSES, Catalog
 from adsignal.ml.embeddings import EmbeddingModel
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
+from adsignal.ml.registry import save_models
+from adsignal.ml.training import train_and_evaluate
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.loader import load_mart_to_postgres
@@ -26,6 +28,7 @@ from adsignal.warehouse.metrics_store import (
     write_predictions,
 )
 from adsignal.warehouse.narrative_store import ensure_narrative_schema
+from adsignal.warehouse.reader import read_campaign_daily
 from adsignal.warehouse.schema import reset_schema_memo
 from adsignal.warehouse.vector_store import EmbeddingRow, ensure_vector_schema, upsert_embeddings
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
@@ -234,66 +237,92 @@ def loaded_dimension(built_duckdb):
     return TEST_DSN
 
 
+def _flat_series(days: int = 40, spend: float = 100.0) -> pd.DataFrame:
+    """A flat, well-behaved single-campaign series, mart-shaped."""
+    dates = pd.date_range("2024-01-01", periods=days, freq="D")
+    return pd.DataFrame(
+        {
+            "event_date": dates,
+            "campaign_id": ["cmp_a"] * days,
+            "advertiser_id": ["adv_a"] * days,
+            "channel": ["search"] * days,
+            "impressions": [1000] * days,
+            "clicks": [20] * days,
+            "conversions": [2] * days,
+            "spend": [spend] * days,
+            "revenue": [200.0] * days,
+            "ctr": [0.02] * days,
+            "cpc": [spend / 20] * days,
+            "cpm": [spend] * days,
+            "cpa": [spend / 2] * days,
+            "roas": [200.0 / spend] * days,
+            "anomaly_cause": [None] * days,
+            "anomaly_severity": [np.nan] * days,
+            "is_anomaly": [False] * days,
+        }
+    )
+
+
+def _labelled_series(days: int = 120) -> pd.DataFrame:
+    """A `_flat_series` where every 6th day is an anomaly, cycling all 5 causes."""
+    frame = _flat_series(days)
+    rng = np.random.default_rng(0)
+    for index in range(5, days, 6):
+        cause = ANOMALY_CAUSES[(index // 6) % len(ANOMALY_CAUSES)]
+        frame.loc[index, "anomaly_cause"] = cause
+        frame.loc[index, "anomaly_severity"] = 1 + (index // 6) % 5
+        frame.loc[index, "is_anomaly"] = True
+        multiplier = {
+            "budget_pacing": 2.5,
+            "creative_fatigue": 1.0,
+            "audience_saturation": 1.3,
+            "tracking_error": 1.0,
+            "competitive_pressure": 1.6,
+        }[cause]
+        frame.loc[index, "spend"] = frame.loc[index, "spend"] * multiplier
+        frame.loc[index, "clicks"] = int(
+            frame.loc[index, "clicks"] * (0.45 if cause == "creative_fatigue" else 1.0)
+        )
+        frame.loc[index, "conversions"] = 0 if cause == "tracking_error" else 2
+        frame.loc[index, "ctr"] = frame.loc[index, "clicks"] / frame.loc[index, "impressions"]
+        frame.loc[index, "spend"] += rng.normal(0, 0.5)
+    return frame
+
+
 @pytest.fixture
 def flat_series():
-    """Build a flat, well-behaved single-campaign series."""
-
-    def _build(days: int = 40, spend: float = 100.0) -> pd.DataFrame:
-        dates = pd.date_range("2024-01-01", periods=days, freq="D")
-        return pd.DataFrame(
-            {
-                "event_date": dates,
-                "campaign_id": ["cmp_a"] * days,
-                "advertiser_id": ["adv_a"] * days,
-                "channel": ["search"] * days,
-                "impressions": [1000] * days,
-                "clicks": [20] * days,
-                "conversions": [2] * days,
-                "spend": [spend] * days,
-                "revenue": [200.0] * days,
-                "ctr": [0.02] * days,
-                "cpc": [spend / 20] * days,
-                "cpm": [spend] * days,
-                "cpa": [spend / 2] * days,
-                "roas": [200.0 / spend] * days,
-                "anomaly_cause": [None] * days,
-                "anomaly_severity": [np.nan] * days,
-                "is_anomaly": [False] * days,
-            }
-        )
-
-    return _build
+    """The `_flat_series` builder, for tests that vary its length or spend."""
+    return _flat_series
 
 
 @pytest.fixture
-def labelled_series(flat_series):
-    """A `flat_series` where every 6th day is an anomaly, cycling all 5 causes."""
+def labelled_series():
+    """The `_labelled_series` builder, for tests that vary its length."""
+    return _labelled_series
 
-    def _build(days: int = 120) -> pd.DataFrame:
-        frame = flat_series(days)
-        rng = np.random.default_rng(0)
-        for index in range(5, days, 6):
-            cause = ANOMALY_CAUSES[(index // 6) % len(ANOMALY_CAUSES)]
-            frame.loc[index, "anomaly_cause"] = cause
-            frame.loc[index, "anomaly_severity"] = 1 + (index // 6) % 5
-            frame.loc[index, "is_anomaly"] = True
-            multiplier = {
-                "budget_pacing": 2.5,
-                "creative_fatigue": 1.0,
-                "audience_saturation": 1.3,
-                "tracking_error": 1.0,
-                "competitive_pressure": 1.6,
-            }[cause]
-            frame.loc[index, "spend"] = frame.loc[index, "spend"] * multiplier
-            frame.loc[index, "clicks"] = int(
-                frame.loc[index, "clicks"] * (0.45 if cause == "creative_fatigue" else 1.0)
-            )
-            frame.loc[index, "conversions"] = 0 if cause == "tracking_error" else 2
-            frame.loc[index, "ctr"] = frame.loc[index, "clicks"] / frame.loc[index, "impressions"]
-            frame.loc[index, "spend"] += rng.normal(0, 0.5)
-        return frame
 
-    return _build
+def _train_artifacts(mart: pd.DataFrame, directory: Path) -> Path:
+    """Fit both models on `mart` and persist them, returning `directory`.
+
+    One recipe (`train_and_evaluate`, the same one the pipeline asset and the
+    CI gate use) over two different inputs: a synthetic series for the model
+    layer's own tests, and the seeded mart for the API's.
+    """
+    result = train_and_evaluate(mart, seed=0)
+    save_models(directory, result.detector, result.classifier)
+    return directory
+
+
+@pytest.fixture(scope="session")
+def trained_artifacts(tmp_path_factory) -> Path:
+    """A registry-shaped artifact directory holding a fitted detector and triage pair.
+
+    Built from a synthetic labelled series rather than from Postgres: what
+    `adsignal.ml.scoring` needs is two fitted estimators on disk, and making
+    the ML layer's tests wait on a database would contradict the layering the
+    same tests assert.
+    """
+    return _train_artifacts(_labelled_series(180), tmp_path_factory.mktemp("trained_artifacts"))
 
 
 @pytest.fixture(scope="module")
@@ -339,8 +368,13 @@ def _api_seed(tmp_path_factory) -> str:
     write_model_metrics(
         TEST_DSN, "run_1", datetime(2024, 1, 1, tzinfo=UTC), triage, detector, "/mlruns/run_1"
     )
+    # The newest run gets real artifacts, trained on the mart just loaded, so
+    # `POST /score` can actually run a model here instead of answering 503.
+    # `read_latest_artifact_dir` resolves this exact path, which is why it is
+    # this row - the newest by `trained_at` - that has to carry it.
+    artifacts = _train_artifacts(read_campaign_daily(TEST_DSN), tmp_path / "artifacts")
     write_model_metrics(
-        TEST_DSN, "run_2", datetime(2024, 6, 1, tzinfo=UTC), triage, detector, "/mlruns/run_2"
+        TEST_DSN, "run_2", datetime(2024, 6, 1, tzinfo=UTC), triage, detector, str(artifacts)
     )
 
     with psycopg.connect(TEST_DSN) as conn:

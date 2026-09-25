@@ -137,3 +137,40 @@ class SearchResponse(BaseModel):
     """`POST /search` response."""
 
     hits: list[SearchHitOut]
+
+
+class ScoreRequest(BaseModel):
+    """`POST /score` body: the one campaign-day to score."""
+
+    campaign_id: str = Field(min_length=1)
+    event_date: date
+
+    @field_validator("campaign_id")
+    @classmethod
+    def _reject_blank_campaign_id(cls, value: str) -> str:
+        """A whitespace-only id is a malformed request, not a 404."""
+        if not value.strip():
+            raise ValueError("campaign_id must not be blank")
+        return value
+
+
+class ScoreOut(BaseModel):
+    """`POST /score` response: one campaign-day's verdict, computed on demand.
+
+    The campaign-day is echoed back so a caller can tell this apart from a
+    cached or stored answer about some other day.
+
+    `cause`, `confidence`, `severity` and `escalate` are null unless the
+    detector flagged the row: the triage classifier is fitted only on
+    labelled anomalies, so its opinion about an unremarkable day is its class
+    prior, not a finding.
+    """
+
+    campaign_id: str
+    event_date: date
+    anomaly_score: float
+    is_anomaly: bool
+    cause: str | None = None
+    confidence: float | None = None
+    severity: int | None = None
+    escalate: bool | None = None

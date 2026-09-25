@@ -76,13 +76,50 @@ def read_campaign_daily(
     with connection(dsn) as conn:
         rows = conn.execute(query, params).fetchall()
 
-    frame = pd.DataFrame(rows, columns=list(MART_COLUMNS))
+    return _frame_from_rows(rows)
 
-    # Dtypes are made explicit rather than left to inference, so the empty-result path
-    # (no rows to infer from) and the populated path always agree. Without the trailing
-    # astype, an empty object column infers as int64/datetime64[s] regardless of the
-    # column's real, populated dtype - silently breaking both the `datetime64[ns]`
-    # contract and NaN-fidelity for the rate columns.
+
+# The last `days` rows of one campaign, most recent first. `ORDER BY ... DESC
+# LIMIT` is what keeps an on-demand read bounded: a caller wanting one day's
+# rolling baselines needs that day plus a fixed window of prior days, not the
+# campaign's whole history. The caller re-sorts ascending; see
+# `warehouse.feature_reads`.
+_CAMPAIGN_WINDOW_SQL = f"""
+SELECT {", ".join(MART_COLUMNS)} FROM fct_campaign_daily
+WHERE campaign_id = %s AND event_date <= %s
+ORDER BY event_date DESC
+LIMIT %s
+"""  # noqa: S608
+
+
+def read_campaign_window(dsn: str, campaign_id: str, end: date, days: int) -> pd.DataFrame:
+    """Read at most `days` of one campaign's mart rows ending at `end`, inclusive.
+
+    Ordered by `event_date` ascending, like `read_campaign_daily`, so
+    `adsignal.ml.features.build_features` sees the same row order either way.
+    Empty (not an error) when the campaign is unknown or has no row on or
+    before `end`.
+    """
+    if days < 1:
+        raise ValueError(f"days must be at least 1, got {days}")
+
+    with connection(dsn) as conn:
+        rows = conn.execute(_CAMPAIGN_WINDOW_SQL, (campaign_id, end, days)).fetchall()
+
+    frame = _frame_from_rows(list(reversed(rows)))
+    return frame.reset_index(drop=True)
+
+
+def _frame_from_rows(rows: list[tuple[object, ...]]) -> pd.DataFrame:
+    """Assemble `MART_COLUMNS` rows into a frame with this module's pinned dtypes.
+
+    Dtypes are made explicit rather than left to inference, so the empty-result path
+    (no rows to infer from) and the populated path always agree. Without the trailing
+    astype, an empty object column infers as int64/datetime64[s] regardless of the
+    column's real, populated dtype - silently breaking both the `datetime64[ns]`
+    contract and NaN-fidelity for the rate columns.
+    """
+    frame = pd.DataFrame(rows, columns=list(MART_COLUMNS))
     frame["event_date"] = pd.to_datetime(frame["event_date"]).astype("datetime64[ns]")
     for column in _INT_COLUMNS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("int64")

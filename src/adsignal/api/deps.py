@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import Request
 
 from adsignal.api.cache import TtlCache
+from adsignal.api.model_loader import ScoringModelHolder
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
@@ -51,3 +52,22 @@ def get_search_rate_limiter(request: Request) -> TokenBucket:
     """
     bucket: TokenBucket = request.app.state.search_rate_limiter
     return bucket
+
+
+def get_score_rate_limiter(request: Request) -> TokenBucket:
+    """Return the `TokenBucket` bounding `/score` for this app instance.
+
+    Its own bucket, for the same reason `/search` has one separate from
+    `/ask`: a `/score` call is a warehouse read plus a forward pass through
+    an isolation forest and two gradient-boosted ensembles, and the endpoint
+    that does the most work per request must not be the cheapest one to
+    exhaust.
+    """
+    bucket: TokenBucket = request.app.state.score_rate_limiter
+    return bucket
+
+
+def get_scoring_models(request: Request) -> ScoringModelHolder:
+    """Return the holder for this app's one shared detector/triage pair."""
+    holder: ScoringModelHolder = request.app.state.scoring_models
+    return holder
