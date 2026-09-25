@@ -9,7 +9,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
-from adsignal.api.app import create_app, install_ask_runtime
+from adsignal.api.app import create_app, install_request_runtime
 from adsignal.config import Settings
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
@@ -429,8 +429,8 @@ _CLIENT_FIXTURES = ("client", "empty_client", "dropped_tables_client")
 
 
 @pytest.fixture(autouse=True)
-def reset_ask_state(request):
-    """Give every test a fresh `/ask` rate-limit budget and an empty cache.
+def reset_request_runtime(request):
+    """Give every test fresh rate-limit budgets and an empty `/ask` cache.
 
     The client fixtures are module-scoped, so without this the `/ask` tests
     are order-coupled: `test_ask_is_rate_limited_per_ip` drains the bucket to
@@ -441,4 +441,4 @@ def reset_ask_state(request):
     """
     for name in _CLIENT_FIXTURES:
         if name in request.fixturenames:
-            install_ask_runtime(request.getfixturevalue(name).app)
+            install_request_runtime(request.getfixturevalue(name).app)

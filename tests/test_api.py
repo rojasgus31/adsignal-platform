@@ -158,7 +158,7 @@ def test_ask_rejects_a_template_it_does_not_know(client) -> None:
 
 
 def test_ask_is_rate_limited_per_ip(client) -> None:
-    """Review Focus 5: the only live path must be bounded."""
+    """One of the two live paths must be bounded; `/search` is the other."""
     statuses = [
         client.post("/ask", json={"question": "how many anomalies?"}).status_code for _ in range(30)
     ]
@@ -177,3 +177,27 @@ def test_ask_does_not_serve_one_parameter_set_from_anothers_cache(client) -> Non
 
 def test_ask_rejects_a_blank_question(client) -> None:
     assert client.post("/ask", json={"question": "   "}).status_code == 422
+
+
+def test_search_is_rate_limited_per_ip(client) -> None:
+    """Finding 6: `/search` runs ONNX inference on caller text per request.
+
+    It was the one endpoint left unguarded while `/ask`, which only runs a
+    bounded indexed query, was throttled - so the cheapest denial-of-service
+    lever against the demo was the endpoint that does the most work.
+    """
+    statuses = [
+        client.post("/search", json={"query": "winter coat", "limit": 3}).status_code
+        for _ in range(30)
+    ]
+    assert 429 in statuses, "no request was ever rate-limited"
+    assert statuses[0] == 200, "the first request should have been served"
+
+
+def test_search_and_ask_do_not_share_a_rate_limit_budget(client) -> None:
+    """Separate buckets: draining one endpoint must not lock out the other."""
+    for _ in range(30):
+        client.post("/search", json={"query": "winter coat", "limit": 3})
+
+    answered = client.post("/ask", json={"question": "how many anomalies?"})
+    assert answered.status_code == 200, answered.text

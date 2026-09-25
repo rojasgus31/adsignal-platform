@@ -18,12 +18,13 @@ template *selection*, as the plan's prose describes, is not expressible
 without changing that contract, so this module resolves every question
 through the keyword matcher below. See the task report for detail.
 
-This is the only endpoint in the API that does live work per request, so it
-is the only one rate-limited (`TokenBucket`, keyed per client IP, 429 when
-refused) and the only one with a response cache (identical questions, cache
-hit or miss, still cost one token — the cache saves the template resolution
-and database round-trip, not the rate-limit budget; otherwise a burst of one
-repeated question would never trip the limiter).
+`/search` and this endpoint are the two that do live work per request, so
+both are rate-limited (`TokenBucket`, keyed per client IP, 429 when refused)
+with their own budgets. This one is additionally the only one with a response
+cache (identical questions, cache hit or miss, still cost one token — the
+cache saves the template resolution and database round-trip, not the
+rate-limit budget; otherwise a burst of one repeated question would never
+trip the limiter).
 """
 
 from typing import Any
@@ -32,7 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from adsignal.api.cache import TtlCache
-from adsignal.api.deps import get_ask_cache, get_ask_rate_limiter, get_settings
+from adsignal.api.deps import client_key, get_ask_cache, get_ask_rate_limiter, get_settings
 from adsignal.api.queries import QUERY_TEMPLATES
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
@@ -123,11 +124,6 @@ def _summarize(name: str, rows: list[dict[str, Any]]) -> str:
     return "Done."  # pragma: no cover - unreachable while every branch above is exhaustive
 
 
-def _client_key(request: Request) -> str:
-    """The rate-limit and cache key: the caller's IP, or a fixed fallback."""
-    return request.client.host if request.client is not None else "unknown"
-
-
 def _answer(dsn: str, template_name: str, parameters: dict[str, int]) -> AskResponse:
     """Resolve one template name to an answer, or raise the matching 4xx.
 
@@ -158,7 +154,7 @@ def post_ask(
     cache: TtlCache[AskResponse] = Depends(get_ask_cache),
 ) -> AskResponse:
     """Answer a question by running one named, parameterized query template."""
-    if not rate_limiter.allow(_client_key(request)):
+    if not rate_limiter.allow(client_key(request)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     # `parameters` is part of the key: two questions identical but for their
