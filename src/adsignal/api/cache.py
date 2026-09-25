@@ -39,7 +39,8 @@ class TtlCache[CachedValue]:
 
     def __len__(self) -> int:
         """The number of entries held, expired ones included until swept."""
-        return len(self._entries)
+        with self._lock:
+            return len(self._entries)
 
     def get(self, key: str) -> CachedValue | None:
         """Return the live value for `key`, or None if it is absent or expired.

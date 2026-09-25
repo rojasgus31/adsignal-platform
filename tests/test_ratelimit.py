@@ -60,3 +60,36 @@ def test_a_negative_refill_rate_is_rejected() -> None:
     """A negative rate would drive tokens below zero and deny the key forever."""
     with pytest.raises(ValueError, match="refill_per_second"):
         TokenBucket(capacity=1, refill_per_second=-1.0)
+
+
+def test_the_bucket_map_is_bounded() -> None:
+    """Finding 5: one permanent entry per distinct client key is a memory
+    exhaustion vector on a public endpoint, exactly the one `TtlCache` was
+    given a hard capacity to prevent."""
+    limiter = TokenBucket(capacity=1, refill_per_second=0.0, max_keys=8)
+
+    for index in range(200):
+        limiter.allow(f"10.0.0.{index}")
+
+    assert len(limiter) == 8
+
+
+def test_eviction_keeps_the_most_recently_seen_keys() -> None:
+    """A throttled key stays tracked while other keys come and go."""
+    clock = FakeClock()
+    limiter = TokenBucket(capacity=1, refill_per_second=0.0, clock=clock, max_keys=3)
+
+    # `noisy` spends its only token, so it is now being refused.
+    assert limiter.allow("noisy") is True
+    assert limiter.allow("noisy") is False
+
+    for index in range(2):
+        limiter.allow(f"other-{index}")
+        limiter.allow("noisy")
+
+    assert limiter.allow("noisy") is False
+
+
+def test_a_non_positive_max_keys_is_rejected() -> None:
+    with pytest.raises(ValueError, match="max_keys"):
+        TokenBucket(capacity=1, refill_per_second=1.0, max_keys=0)

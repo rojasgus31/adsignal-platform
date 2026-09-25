@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from adsignal.api.cache import TtlCache
@@ -72,3 +74,29 @@ def test_a_capacity_below_one_is_rejected() -> None:
 def test_a_non_positive_ttl_is_rejected() -> None:
     with pytest.raises(ValueError, match="ttl_seconds"):
         TtlCache(capacity=1, ttl_seconds=0.0)
+
+
+def test_len_is_taken_under_the_lock() -> None:
+    """Finding 13: every other accessor takes `self._lock`, so a length read
+    concurrent with an eviction could raise or report a torn count."""
+    cache = TtlCache[str](capacity=4, ttl_seconds=60.0)
+    barrier = threading.Barrier(2)
+    lengths: list[int] = []
+
+    def _fill() -> None:
+        barrier.wait()
+        for index in range(2_000):
+            cache.put(f"key-{index}", "value")
+
+    def _measure() -> None:
+        barrier.wait()
+        for _ in range(2_000):
+            lengths.append(len(cache))
+
+    threads = [threading.Thread(target=_fill), threading.Thread(target=_measure)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(0 <= length <= 4 for length in lengths)
