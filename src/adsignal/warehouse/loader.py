@@ -62,7 +62,23 @@ CREATE TABLE IF NOT EXISTS fct_campaign_daily (
 );
 CREATE INDEX IF NOT EXISTS idx_fcd_campaign ON fct_campaign_daily (campaign_id, event_date);
 CREATE INDEX IF NOT EXISTS idx_fcd_anomaly ON fct_campaign_daily (event_date) WHERE is_anomaly;
+
+CREATE TABLE IF NOT EXISTS dim_campaign (
+    campaign_id     TEXT NOT NULL PRIMARY KEY,
+    campaign_name   TEXT NOT NULL,
+    advertiser_id   TEXT NOT NULL,
+    advertiser_name TEXT NOT NULL,
+    channel         TEXT NOT NULL
+);
 """
+
+_DIM_CAMPAIGN_COLUMNS = (
+    "campaign_id",
+    "campaign_name",
+    "advertiser_id",
+    "advertiser_name",
+    "channel",
+)
 
 
 def ensure_schema(dsn: str) -> None:
@@ -98,6 +114,39 @@ def load_mart_to_postgres(duckdb_path: Path, dsn: str, batch_size: int = 10_000)
         cursor = duck.execute(select)
         with pg.cursor() as pg_cursor:
             pg_cursor.execute("TRUNCATE TABLE fct_campaign_daily")
+            while True:
+                batch = cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                pg_cursor.executemany(statement, batch)
+                total += len(batch)
+        pg.commit()
+
+    return total
+
+
+def load_dim_campaign(duckdb_path: Path, dsn: str, batch_size: int = 10_000) -> int:
+    """Full-refresh `dim_campaign` into Postgres. Returns the number of rows loaded.
+
+    Mirrors `load_mart_to_postgres` exactly: truncate then batched insert
+    inside one transaction, committed once, so a cancelled run never leaves a
+    half-truncated table for a reader to see.
+    """
+    ensure_schema(dsn)
+
+    columns = sql.SQL(", ").join(sql.Identifier(name) for name in _DIM_CAMPAIGN_COLUMNS)
+    placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in _DIM_CAMPAIGN_COLUMNS)
+    statement = sql.SQL("INSERT INTO dim_campaign ({columns}) VALUES ({placeholders})").format(
+        columns=columns, placeholders=placeholders
+    )
+
+    total = 0
+    select = f"SELECT {', '.join(_DIM_CAMPAIGN_COLUMNS)} FROM main_marts.dim_campaign"  # noqa: S608
+
+    with open_duckdb(duckdb_path) as duck, connection(dsn) as pg:
+        cursor = duck.execute(select)
+        with pg.cursor() as pg_cursor:
+            pg_cursor.execute("TRUNCATE TABLE dim_campaign")
             while True:
                 batch = cursor.fetchmany(batch_size)
                 if not batch:

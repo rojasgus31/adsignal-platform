@@ -1,0 +1,46 @@
+"""Review Focus 1: a fact row whose campaign has no dimension row."""
+
+import os
+
+import psycopg
+
+from adsignal.warehouse.dim_reads import CampaignDimension, read_campaign_dimension
+
+TEST_DSN = os.environ.get(
+    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
+)
+
+
+def test_every_campaign_has_a_human_name(loaded_dimension) -> None:
+    rows = read_campaign_dimension(TEST_DSN)
+    assert rows, "the dimension is empty"
+    for row in rows:
+        assert isinstance(row, CampaignDimension)
+        assert row.campaign_name and not row.campaign_name.startswith("cmp_")
+        assert row.advertiser_name and not row.advertiser_name.startswith("adv_")
+
+
+def test_campaign_ids_are_unique(loaded_dimension) -> None:
+    """A duplicate would silently multiply every joined fact row."""
+    ids = [row.campaign_id for row in read_campaign_dimension(TEST_DSN)]
+    assert len(ids) == len(set(ids))
+
+
+def test_every_fact_campaign_resolves_to_a_dimension_row(loaded_dimension) -> None:
+    """Review Focus 1. An unmatched id means the dashboard drops rows or shows undefined."""
+    with psycopg.connect(TEST_DSN) as conn:
+        orphans = conn.execute(
+            "SELECT count(DISTINCT f.campaign_id) FROM fct_campaign_daily f "
+            "LEFT JOIN dim_campaign d ON d.campaign_id = f.campaign_id "
+            "WHERE d.campaign_id IS NULL"
+        ).fetchone()[0]
+    assert orphans == 0, f"{orphans} campaign ids in the fact table have no dimension row"
+
+
+def test_reading_an_empty_dimension_returns_an_empty_list(empty_client) -> None:
+    """The fresh-database contract: no tables yet is not an error."""
+    dsn = os.environ.get(
+        "ADSIGNAL_EMPTY_TEST_DSN",
+        "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_empty",
+    )
+    assert read_campaign_dimension(dsn) == []

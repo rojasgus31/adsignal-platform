@@ -29,3 +29,17 @@ models:
                 - competitive_pressure
               config:
                 where: "anomaly_cause is not null"
+
+  - name: dim_campaign
+    description: One row per campaign with advertiser and campaign display names.
+    columns:
+      - name: campaign_id
+        tests:
+          - unique
+          - not_null
+      - name: campaign_name
+        tests:
+          - not_null
+      - name: advertiser_name
+        tests:
+          - not_null

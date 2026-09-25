@@ -193,6 +193,21 @@ def built_duckdb(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def loaded_dimension(built_duckdb):
+    """Load `dim_campaign` into TEST_DSN.
+
+    Function-scoped to match `built_duckdb`'s own scope — a module-scoped
+    fixture cannot depend on a function-scoped one.
+    """
+    from adsignal.warehouse.loader import load_dim_campaign
+
+    if not _postgres_available(TEST_DSN):
+        pytest.skip("postgres unavailable")
+    load_dim_campaign(built_duckdb, TEST_DSN)
+    return TEST_DSN
+
+
+@pytest.fixture
 def flat_series():
     """Build a flat, well-behaved single-campaign series."""
 
