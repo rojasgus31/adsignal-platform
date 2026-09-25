@@ -26,6 +26,7 @@ from adsignal.warehouse.metrics_store import (
     write_predictions,
 )
 from adsignal.warehouse.narrative_store import ensure_narrative_schema
+from adsignal.warehouse.schema import reset_schema_memo
 from adsignal.warehouse.vector_store import EmbeddingRow, ensure_vector_schema, upsert_embeddings
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
@@ -405,6 +406,12 @@ def dropped_tables_client():
     """
     if not _postgres_available(DROPPED_TEST_DSN):
         pytest.skip("Postgres not reachable")
+
+    # `apply_schema` now memoizes "already ensured" per (dsn, statements) in
+    # this process (see `warehouse/schema.py`), so dropping tables below must
+    # be paired with forgetting the memo - otherwise the read path's
+    # `ensure_*_schema` calls would skip DDL they need to actually rerun.
+    reset_schema_memo(DROPPED_TEST_DSN)
 
     with psycopg.connect(DROPPED_TEST_DSN) as conn:
         for table in (

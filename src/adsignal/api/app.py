@@ -29,7 +29,7 @@ from adsignal.api.routes.search import (
 )
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
-from adsignal.warehouse.pool import close_all_pools
+from adsignal.warehouse.pool import acquire_pool, release_pool
 
 API_TITLE = "AdSignal Serving API"
 API_DESCRIPTION = (
@@ -65,16 +65,22 @@ def install_request_runtime(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Close every warehouse connection pool once the app stops serving requests.
+    """Release this app's claim on its warehouse connection pool at shutdown.
 
     The pools in `adsignal.warehouse.pool` are process-wide, keyed by DSN, not
-    per-`app` — but closing them here, rather than leaving them for process
-    exit, releases their connections back to Postgres (or Neon) as soon as
-    this app instance is done, which matters for the test suite building many
-    short-lived apps in one process.
+    per-`app`: two apps (or an API and a pipeline task) can share one DSN in
+    the same process. `acquire_pool`/`release_pool` are refcounted per DSN so
+    this app's shutdown only closes the pool once every other owner of the
+    same DSN has also released it - closing every pool in the process
+    regardless of ownership (the previous behaviour) would tear down a
+    pool a sibling app, or a pipeline running in the same process, is still
+    using. This still matters for the test suite building many short-lived
+    apps in one process: each release now only affects its own DSN.
     """
+    dsn = app.state.settings.postgres_dsn
+    acquire_pool(dsn)
     yield
-    close_all_pools()
+    release_pool(dsn)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

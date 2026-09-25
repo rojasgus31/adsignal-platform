@@ -24,6 +24,7 @@ from adsignal.config import Settings
 from adsignal.warehouse.loader import ensure_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 from adsignal.warehouse.narrative_store import ensure_narrative_schema
+from adsignal.warehouse.schema import reset_schema_memo
 from adsignal.warehouse.vector_store import ensure_vector_schema
 
 # Its own database: these tests drop every serving table, so sharing one with
@@ -66,9 +67,17 @@ def _drop_serving_tables(dsn: str) -> None:
 
 @pytest.fixture
 def fresh_database() -> str:
-    """A DSN pointing at a database with none of the serving tables."""
+    """A DSN pointing at a database with none of the serving tables.
+
+    `reset_schema_memo` clears `apply_schema`'s per-process memo (added to
+    stop every warehouse call from paying for an unpooled DDL connect on
+    every request - see `warehouse/schema.py`), so dropping the tables here
+    actually forces the next `ensure_*_schema` call to reapply the DDL rather
+    than trusting a memo an earlier test left behind for this DSN.
+    """
     if not _postgres_available(CONCURRENCY_TEST_DSN):
         pytest.skip("Postgres not reachable")
+    reset_schema_memo(CONCURRENCY_TEST_DSN)
     _drop_serving_tables(CONCURRENCY_TEST_DSN)
     return CONCURRENCY_TEST_DSN
 

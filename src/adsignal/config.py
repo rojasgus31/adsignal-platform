@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     postgres_dsn: str = Field(
         default="postgresql://adsignal:adsignal@localhost:5432/adsignal", repr=False
     )
+    # `adsignal.warehouse.pool` reads these once, when it opens the first pool
+    # for a DSN. Every API route is a sync `def`, so Starlette runs it in its
+    # request threadpool (anyio's default capacity is 40); `pool_max_size=4`
+    # against that meant a burst of concurrent requests queued behind a
+    # handful of connections for up to the pool's 30s default timeout before
+    # failing. `pool_max_waiting` bounds how many callers may queue at all -
+    # past it, a new caller fails immediately instead of piling on to an
+    # already-saturated queue - and `pool_timeout_seconds` shortens the wait
+    # so an overloaded pool fails fast rather than slowly.
+    pool_min_size: int = 1
+    pool_max_size: int = 10
+    pool_timeout_seconds: float = 5.0
+    pool_max_waiting: int = 64
     # Override for the dbt project location when running inside a container.
     # Not used in this task; consumed by a later task.
     dbt_dir: Path | None = None
