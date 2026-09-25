@@ -20,6 +20,9 @@ from adsignal.ml.features import build_features
 from adsignal.ml.registry import load_models, log_training_run
 from adsignal.ml.splits import temporal_split
 from adsignal.ml.training import BASELINE_WINDOW, HOLDOUT_FRACTION, train_and_evaluate
+from adsignal.narrative.build import build_chain
+from adsignal.narrative.chain import AllProvidersFailed
+from adsignal.narrative.types import NarrativeRequest
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import load_mart_to_postgres
 from adsignal.warehouse.metrics_store import (
@@ -27,6 +30,7 @@ from adsignal.warehouse.metrics_store import (
     write_model_metrics,
     write_predictions,
 )
+from adsignal.warehouse.narrative_store import write_narrative
 from adsignal.warehouse.reader import read_campaign_daily
 from adsignal.warehouse.text_source import read_entity_text
 from adsignal.warehouse.vector_store import EmbeddingRow, upsert_embeddings
@@ -281,4 +285,89 @@ def campaign_embeddings(context: AssetExecutionContext) -> None:
             "campaigns": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "campaign")),
             "creatives": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "creative")),
         }
+    )
+
+
+@asset(
+    deps=[anomaly_scores],
+    required_resource_keys={"settings"},
+    description="A generated prose narrative summarizing the most recent day's anomalies",
+)
+def daily_narrative(context: AssetExecutionContext) -> None:
+    """Generate and store a narrative for the most recently scored day.
+
+    A missing narrative is a degraded dashboard, not a failed pipeline: every
+    provider failing (`AllProvidersFailed`, raised by `NarrativeChain.generate`
+    only once even the stub has been tried and failed) is caught here, logged,
+    and this asset returns without raising, so a narrative outage never blocks
+    the nightly job or any other downstream asset.
+    """
+    settings: Settings = context.resources.settings
+    request = _build_narrative_request(settings.postgres_dsn)
+    if request is None:
+        context.log.warning("no campaign-daily rows found; skipping narrative generation")
+        return
+
+    try:
+        result = build_chain(settings).generate(request)
+    except AllProvidersFailed as error:
+        # Only the provider names and exception *type* are logged, never the
+        # exception object itself: `NarrativeChain` composes its failure
+        # message the same way precisely so a provider's error detail (which
+        # could echo back an API key) never reaches a log line or a stored
+        # row, and logging `error` directly here would undo that.
+        context.log.warning(f"narrative generation failed: {type(error).__name__}: {error}")
+        return
+
+    write_narrative(settings.postgres_dsn, request.as_of, result)
+    context.add_output_metadata(
+        {
+            "provider": MetadataValue.text(result.provider),
+            "latency_ms": MetadataValue.float(result.latency_ms),
+        }
+    )
+
+
+def _build_narrative_request(dsn: str) -> NarrativeRequest | None:
+    """Summarize the most recently scored day into a `NarrativeRequest`.
+
+    `as_of` is anchored on the campaign-daily mart rather than on
+    `anomaly_predictions`: the mart always has rows once the pipeline has
+    run, while a quiet day can legitimately leave `anomaly_predictions` empty
+    for that date - anchoring there would silently lose the narrative on the
+    one day it would say "all quiet".
+    """
+    with psycopg.connect(dsn) as conn:
+        max_date_row = conn.execute("SELECT max(event_date) FROM fct_campaign_daily").fetchone()
+        as_of = max_date_row[0] if max_date_row is not None else None
+        if as_of is None:
+            return None
+
+        campaign_count_row = conn.execute(
+            "SELECT count(DISTINCT campaign_id) FROM fct_campaign_daily WHERE event_date = %s",
+            (as_of,),
+        ).fetchone()
+        assert campaign_count_row is not None
+        campaign_count = campaign_count_row[0]
+
+        anomaly_row = conn.execute(
+            "SELECT count(*), count(*) FILTER (WHERE escalate) FROM anomaly_predictions "
+            "WHERE event_date = %s",
+            (as_of,),
+        ).fetchone()
+        assert anomaly_row is not None
+        anomaly_count, escalated_count = anomaly_row
+
+        cause_rows = conn.execute(
+            "SELECT cause FROM anomaly_predictions WHERE event_date = %s "
+            "GROUP BY cause ORDER BY count(*) DESC, cause",
+            (as_of,),
+        ).fetchall()
+
+    return NarrativeRequest(
+        as_of=as_of,
+        campaign_count=int(campaign_count),
+        anomaly_count=int(anomaly_count),
+        top_causes=tuple(row[0] for row in cause_rows),
+        escalated_count=int(escalated_count),
     )

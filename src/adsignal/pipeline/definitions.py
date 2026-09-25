@@ -8,6 +8,7 @@ from adsignal.pipeline.assets import (
     campaign_daily_mart,
     campaign_embeddings,
     catalog_and_raw_events,
+    daily_narrative,
     dbt_marts,
     drift_report,
     trained_models,
@@ -23,6 +24,7 @@ adsignal_daily = define_asset_job(
         anomaly_scores,
         drift_report,
         campaign_embeddings,
+        daily_narrative,
     ],
 )
 
@@ -41,6 +43,7 @@ defs = Definitions(
         anomaly_scores,
         drift_report,
         campaign_embeddings,
+        daily_narrative,
     ],
     jobs=[adsignal_daily],
     schedules=[daily_schedule],

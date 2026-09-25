@@ -11,6 +11,7 @@ from adsignal.pipeline.assets import (
     campaign_daily_mart,
     campaign_embeddings,
     catalog_and_raw_events,
+    daily_narrative,
     dbt_marts,
     drift_report,
     trained_models,
@@ -63,6 +64,7 @@ def pipeline_run(settings: Settings):
             trained_models,
             anomaly_scores,
             drift_report,
+            daily_narrative,
         ],
         resources={"settings": settings},
     )
@@ -140,7 +142,65 @@ def test_definitions_expose_the_ml_assets() -> None:
     from adsignal.pipeline.definitions import defs
 
     keys = {key.to_user_string() for key in defs.resolve_asset_graph().get_all_asset_keys()}
-    assert {"trained_models", "anomaly_scores", "drift_report"} <= keys
+    assert {"trained_models", "anomaly_scores", "drift_report", "daily_narrative"} <= keys
+
+
+def test_narrative_asset_writes_a_row_with_provider_metadata(pipeline_run) -> None:
+    from adsignal.warehouse.narrative_store import read_latest_narrative
+
+    result, settings = pipeline_run
+    metadata = result.asset_materializations_for_node("daily_narrative")[0].metadata
+    # No API keys are configured in this test's Settings, so build_chain's
+    # trailing StubProvider is the one that actually answers.
+    assert metadata["provider"].value == "stub"
+    assert metadata["latency_ms"].value >= 0.0
+
+    stored = read_latest_narrative(settings.postgres_dsn)
+    assert stored is not None
+    assert stored.provider == "stub"
+    assert stored.text
+
+
+def test_narrative_asset_does_not_fail_the_pipeline_when_every_provider_fails(
+    pipeline_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AllProvidersFailed must be caught, not propagated: a missing narrative is a
+    degraded dashboard, never a reason to fail the nightly job.
+
+    Depends on `pipeline_run` (unused directly) so `fct_campaign_daily` already
+    has rows - otherwise `_build_narrative_request` would return None before
+    `build_chain` is ever called, and this would not exercise the failure path
+    it's meant to test.
+    """
+    from dagster import build_asset_context
+
+    from adsignal.narrative.chain import AllProvidersFailed
+    from adsignal.pipeline import assets as assets_module
+    from adsignal.warehouse.narrative_store import ensure_narrative_schema
+
+    _, settings = pipeline_run
+
+    def _always_fails(_settings: Settings):
+        class _FailingChain:
+            def generate(self, request):
+                raise AllProvidersFailed("every provider failed: stub (RuntimeError)")
+
+        return _FailingChain()
+
+    monkeypatch.setattr(assets_module, "build_chain", _always_fails)
+
+    ensure_narrative_schema(settings.postgres_dsn)
+    with psycopg.connect(settings.postgres_dsn) as conn:
+        before = conn.execute("SELECT count(*) FROM narrative_runs").fetchone()[0]
+
+    context = build_asset_context(resources={"settings": settings})
+
+    # Must not raise.
+    assets_module.daily_narrative(context)
+
+    with psycopg.connect(settings.postgres_dsn) as conn:
+        after = conn.execute("SELECT count(*) FROM narrative_runs").fetchone()[0]
+    assert after == before
 
 
 def test_embedding_asset_writes_vectors(settings) -> None:
