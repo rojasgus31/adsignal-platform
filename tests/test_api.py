@@ -262,4 +262,4 @@ def test_two_forwarded_callers_do_not_share_a_rate_limit_budget(monkeypatch) -> 
             json={"question": "how many anomalies?"},
             headers={"X-Forwarded-For": "198.51.100.2"},
         )
-        assert second.status_code != 429, "a second caller inherited the first's budget"
+        assert second.status_code == 200, "a second caller inherited the first's budget"
