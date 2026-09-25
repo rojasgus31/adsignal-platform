@@ -174,10 +174,10 @@ pipeline writes.
 | `GET /health` | Liveness check |
 | `GET /campaigns` | Every known campaign |
 | `GET /campaigns/{id}/metrics` | One campaign's full daily time series |
-| `GET /anomalies` | Every current anomaly prediction |
+| `GET /anomalies` | One bounded page of current anomaly predictions (`limit`, `offset`) |
 | `GET /anomalies/{campaign_id}/{event_date}` | One campaign-day's prediction |
-| `GET /models` | Every training run's evaluation, newest first |
-| `GET /benchmark` | Every run plus which narrative provider answered most recently |
+| `GET /models` | One bounded page of training-run evaluations, newest first (`limit`, `offset`) |
+| `GET /benchmark` | Recent runs plus which narrative provider answered most recently |
 | `POST /search` | Semantic search over stored entity embeddings |
 | `POST /ask` | A natural-language question, answered from precomputed data |
 
@@ -186,15 +186,21 @@ Run it with `docker compose up -d api`, or locally with
 router layer issues no SQL of its own: every endpoint reads through a
 `warehouse/` reader, and each of those creates its tables if they do not
 exist yet, so a deployment where the pipeline has never run answers with
-empty results rather than an error.
+empty results rather than an error — including when several of those
+requests arrive at once, which is what the shared advisory lock in
+`warehouse/schema.py` is for. Every collection endpoint is bounded: no
+response grows with the size of a table.
 
 ### Precomputation rule
 
-Every endpoint except `/ask` reads rows the pipeline already computed and
-stored — visitor traffic against them triggers no inference and no
-external call, regardless of load. `/ask` is the sole exception: it is
-the only path that does live work per request, which is exactly why it
-is the only one that is rate-limited and cached (below).
+Every endpoint except `/search` and `/ask` reads rows the pipeline
+already computed and stored — visitor traffic against them triggers no
+inference and no external call, regardless of load. Those two are the
+exceptions: `/search` runs an ONNX embedding pass over the caller's text,
+and `/ask` resolves a template and runs one indexed query. Both are
+therefore rate-limited per caller IP, with separate budgets (`/search`
+tighter, since its call costs an inference), and `/ask` is additionally
+cached (below).
 
 ### The narrative provider chain
 
@@ -206,7 +212,14 @@ deployment with no keys at all still renders a narrative (placeholder
 text) rather than erroring. Each provider sits behind its own circuit
 breaker in `NarrativeChain`; a provider that has failed enough times in
 a row is skipped without being called until its cooldown elapses, so
-one dead backend costs nothing on later requests.
+one dead backend costs nothing on later requests. The chain is built
+once, as a Dagster resource in `pipeline/definitions.py`, rather than per
+materialisation — breaker state rebuilt every run is state that never
+fires. The chain also holds a **total budget** across every provider
+(`ADSIGNAL_NARRATIVE_BUDGET_SECONDS`, 45 s by default): a per-provider
+timeout does not bound the chain, and a provider that answers only after
+the budget has run out is recorded as a failure, so a merely-slow backend
+can open its breaker too.
 
 ### `/ask`: named templates, not generated SQL
 
@@ -225,8 +238,8 @@ a handful of known names cannot emit an injection: this is not
 SQL-injection sanitisation applied after the fact, it is a data path
 where no such string can exist in the first place.
 
-Because `/ask` is the one endpoint that does live work per request, it
-is guarded by a per-IP `TokenBucket` (`adsignal/api/ratelimit.py`) — a
+Because `/ask` is one of the two endpoints that do live work per request,
+it is guarded by a per-IP `TokenBucket` (`adsignal/api/ratelimit.py`) — a
 token bucket refilled gradually over time, returning 429 once a
 caller's budget is exhausted — and identical questions are cached for a
 short TTL so a repeated question is answered once, not recomputed on
@@ -236,7 +249,8 @@ limiter; the cache only saves the downstream template resolution and
 database round-trip. Both are per-app collaborators built in
 `create_app` and injected through `api/deps.py`, and the cache is
 bounded (LRU, hard capacity) as well as TTL'd, because its key is
-caller-supplied free text.
+caller-supplied free text. The limiter's own map of client keys is
+bounded the same way, for the same reason.
 
 **Known gap:** the plan describes resolving a question to a template
 *via the narrative chain* when a provider key is configured. The
