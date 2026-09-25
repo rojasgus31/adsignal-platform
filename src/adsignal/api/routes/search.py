@@ -14,8 +14,8 @@ the rate limit already bounds the inference cost.
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from adsignal.api.client_ip import client_key
 from adsignal.api.deps import (
-    client_key,
     get_embedding_model,
     get_search_rate_limiter,
     get_settings,
@@ -44,7 +44,7 @@ def post_search(
     rate_limiter: TokenBucket = Depends(get_search_rate_limiter),
 ) -> SearchResponse:
     """Return the entities most similar in meaning to the query, nearest first."""
-    if not rate_limiter.allow(client_key(request)):
+    if not rate_limiter.allow(client_key(request, settings.trusted_proxy_hops)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     hits = semantic_search(

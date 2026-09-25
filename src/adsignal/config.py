@@ -84,6 +84,15 @@ class Settings(BaseSettings):
     # per-provider timeout above: four providers each allowed 20 s can stall
     # the nightly job for 80 s or more without this. See `NarrativeChain`.
     narrative_budget_seconds: float = 45.0
+    trusted_proxy_hops: int = Field(default=0, ge=0, le=4)
+    """How many proxies sit in front of this API.
+
+    0 means the socket peer is the caller and `X-Forwarded-For` is ignored —
+    the correct value for local runs and for any deployment reached directly.
+    On Render, which terminates TLS at its own edge, this is 1. Setting it
+    higher than the real number lets a caller forge an address and evade the
+    rate limiter, so it is bounded and defaults to the safe end.
+    """
     cors_origins: Annotated[tuple[str, ...], NoDecode] = ()
     """Exact origins allowed to call this API from a browser.
 

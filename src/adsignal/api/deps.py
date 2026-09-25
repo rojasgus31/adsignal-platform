@@ -51,12 +51,3 @@ def get_search_rate_limiter(request: Request) -> TokenBucket:
     """
     bucket: TokenBucket = request.app.state.search_rate_limiter
     return bucket
-
-
-def client_key(request: Request) -> str:
-    """The rate-limit and cache key: the caller's IP, or a fixed fallback.
-
-    Shared by every throttled endpoint so they agree on what "one caller"
-    means.
-    """
-    return request.client.host if request.client is not None else "unknown"

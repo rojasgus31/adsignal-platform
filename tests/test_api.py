@@ -1,6 +1,7 @@
 import os
 
 import psycopg
+from fastapi.testclient import TestClient
 
 from adsignal.warehouse.serving_reads import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
 
@@ -238,3 +239,27 @@ def test_the_collections_default_to_a_bounded_page(client) -> None:
         response = client.get(path)
         assert response.status_code == 200
         assert len(response.json()) <= DEFAULT_PAGE_LIMIT
+
+
+def test_two_forwarded_callers_do_not_share_a_rate_limit_budget(monkeypatch) -> None:
+    """Review Focus 5, end to end. Behind a proxy each visitor needs its own budget."""
+    monkeypatch.setenv("ADSIGNAL_TRUSTED_PROXY_HOPS", "1")
+    from adsignal.api.app import create_app
+
+    with TestClient(create_app()) as proxied:
+        first = [
+            proxied.post(
+                "/ask",
+                json={"question": "how many anomalies?"},
+                headers={"X-Forwarded-For": "198.51.100.1"},
+            ).status_code
+            for _ in range(30)
+        ]
+        assert 429 in first, "the first caller was never limited"
+
+        second = proxied.post(
+            "/ask",
+            json={"question": "how many anomalies?"},
+            headers={"X-Forwarded-For": "198.51.100.2"},
+        )
+        assert second.status_code != 429, "a second caller inherited the first's budget"

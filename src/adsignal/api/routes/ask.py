@@ -33,7 +33,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 
 from adsignal.api.cache import TtlCache
-from adsignal.api.deps import client_key, get_ask_cache, get_ask_rate_limiter, get_settings
+from adsignal.api.client_ip import client_key
+from adsignal.api.deps import get_ask_cache, get_ask_rate_limiter, get_settings
 from adsignal.api.queries import QUERY_TEMPLATES
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
@@ -154,7 +155,7 @@ def post_ask(
     cache: TtlCache[AskResponse] = Depends(get_ask_cache),
 ) -> AskResponse:
     """Answer a question by running one named, parameterized query template."""
-    if not rate_limiter.allow(client_key(request)):
+    if not rate_limiter.allow(client_key(request, settings.trusted_proxy_hops)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     # `parameters` is part of the key: two questions identical but for their
