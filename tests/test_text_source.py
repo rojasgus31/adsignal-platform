@@ -1,3 +1,4 @@
+from adsignal.warehouse.duckdb_io import open_duckdb
 from adsignal.warehouse.text_source import EntityText, read_entity_text
 
 
@@ -20,9 +21,24 @@ def test_entity_ids_are_unique_within_a_kind(built_duckdb) -> None:
 
 
 def test_campaign_text_includes_the_campaign_name(built_duckdb) -> None:
-    campaigns = [r for r in read_entity_text(built_duckdb) if r.entity_kind == "campaign"]
-    assert campaigns
-    assert any(len(c.text) > len(c.entity_id) for c in campaigns)
+    """`len(text) > len(id)` alone would pass for any suffix — even a hardcoded
+    placeholder appended to the id. Check the actual campaign name, queried
+    from the same DuckDB file `read_entity_text` reads from, appears in it."""
+    with open_duckdb(built_duckdb) as conn:
+        expected_names = dict(
+            conn.execute(
+                "SELECT campaign_id, campaign_name FROM main_staging.stg_campaigns"
+            ).fetchall()
+        )
+
+    campaigns = {
+        row.entity_id: row
+        for row in read_entity_text(built_duckdb)
+        if row.entity_kind == "campaign"
+    }
+    assert expected_names
+    for campaign_id, name in expected_names.items():
+        assert name in campaigns[campaign_id].text
 
 
 def test_returns_entity_text_instances(built_duckdb) -> None:

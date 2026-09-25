@@ -11,7 +11,7 @@ import pytest
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
-from adsignal.generator.models import ANOMALY_CAUSES
+from adsignal.generator.models import ANOMALY_CAUSES, Catalog
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
@@ -85,9 +85,14 @@ def ensure_dbt_packages() -> None:
     )
 
 
-@pytest.fixture
-def small_dataset(tmp_path: Path):
-    """Generate a small labelled dataset on disk and return its paths."""
+def _build_small_dataset(tmp_path: Path) -> tuple[Catalog, Path, Path]:
+    """Generate a small labelled dataset on disk.
+
+    Shared by `small_dataset` and `built_duckdb` so the shape of the demo
+    dataset (seed, advertiser/campaign/creative counts, date window) is
+    defined in exactly one place - two independent copies would let the
+    fixtures silently drift apart while both kept passing.
+    """
     catalog = build_catalog(
         seed=99,
         n_advertisers=3,
@@ -107,26 +112,19 @@ def small_dataset(tmp_path: Path):
 
 
 @pytest.fixture
+def small_dataset(tmp_path: Path):
+    """Generate a small labelled dataset on disk and return its paths."""
+    return _build_small_dataset(tmp_path)
+
+
+@pytest.fixture
 def built_duckdb(tmp_path: Path) -> Path:
     """Generate a small dataset, load it into DuckDB, and run dbt on it.
 
     Returns the path to a DuckDB file whose `main_staging` models exist, for
     tests that read from the staging layer rather than from Postgres.
     """
-    catalog = build_catalog(
-        seed=99,
-        n_advertisers=3,
-        campaigns_per_advertiser=3,
-        creatives_per_campaign=2,
-        start_date=date(2024, 1, 1),
-        end_date=date(2024, 6, 30),
-    )
-    injector = AnomalyInjector(seed=99, rate=0.08)
-    events_path = tmp_path / "raw_events.parquet"
-    labels_path = tmp_path / "anomaly_labels.parquet"
-
-    write_events_parquet(injector.rows(generate_events(catalog, seed=99)), events_path)
-    write_labels_parquet(injector.labels, labels_path)
+    catalog, events_path, labels_path = _build_small_dataset(tmp_path)
 
     duckdb_path = tmp_path / "built.duckdb"
     with open_duckdb(duckdb_path) as conn:

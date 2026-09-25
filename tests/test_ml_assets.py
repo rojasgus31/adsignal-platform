@@ -154,3 +154,49 @@ def test_embedding_asset_writes_vectors(settings) -> None:
     assert metadata["rows_written"].value > 0
     assert metadata["campaigns"].value > 0
     assert metadata["creatives"].value > 0
+
+
+def test_embedding_asset_skips_the_model_on_an_empty_staging_layer(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `if not entities: ... return` guard in `campaign_embeddings` is one
+    line and trivially removable by accident; nothing else in the suite would
+    notice if it went missing. Build a DuckDB file whose staging tables exist
+    but are empty, invoke the asset directly (no need for `dbt_marts` or
+    Postgres - the guard returns before either is touched), and assert both
+    that `rows_written` is 0 and that `EmbeddingModel` is never constructed."""
+    from dagster import build_asset_context
+
+    from adsignal.pipeline import assets as assets_module
+    from adsignal.warehouse.duckdb_io import open_duckdb
+
+    duckdb_path = tmp_path / "empty.duckdb"
+    with open_duckdb(duckdb_path) as conn:
+        conn.execute("CREATE SCHEMA main_staging")
+        conn.execute(
+            "CREATE TABLE main_staging.stg_campaigns "
+            "(campaign_id VARCHAR, campaign_name VARCHAR, channel VARCHAR)"
+        )
+        conn.execute(
+            "CREATE TABLE main_staging.stg_creatives "
+            "(creative_id VARCHAR, headline VARCHAR, format VARCHAR)"
+        )
+
+    def _must_not_construct(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("EmbeddingModel must not be constructed with nothing to embed")
+
+    monkeypatch.setattr(assets_module, "EmbeddingModel", _must_not_construct)
+
+    empty_settings = Settings(
+        data_dir=tmp_path,
+        duckdb_path=duckdb_path,
+        postgres_dsn=DSN,
+        mlflow_dir=tmp_path / "mlruns",
+    )
+    context = build_asset_context(resources={"settings": empty_settings})
+
+    assets_module.campaign_embeddings(context)
+
+    metadata = context.get_output_metadata("result")
+    assert metadata is not None
+    assert metadata["rows_written"].value == 0
