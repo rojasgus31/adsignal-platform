@@ -6,6 +6,7 @@ import pytest
 from dagster import materialize
 
 from adsignal.config import Settings
+from adsignal.narrative.build import build_chain
 from adsignal.pipeline.assets import (
     anomaly_scores,
     campaign_daily_mart,
@@ -66,7 +67,7 @@ def pipeline_run(settings: Settings):
             drift_report,
             daily_narrative,
         ],
-        resources={"settings": settings},
+        resources={"settings": settings, "narrative_chain": build_chain(settings)},
     )
     assert result.success
     return result, settings
@@ -162,7 +163,7 @@ def test_narrative_asset_writes_a_row_with_provider_metadata(pipeline_run) -> No
 
 
 def test_narrative_asset_does_not_fail_the_pipeline_when_every_provider_fails(
-    pipeline_run, monkeypatch: pytest.MonkeyPatch
+    pipeline_run,
 ) -> None:
     """AllProvidersFailed must be caught, not propagated: a missing narrative is a
     degraded dashboard, never a reason to fail the nightly job.
@@ -180,20 +181,17 @@ def test_narrative_asset_does_not_fail_the_pipeline_when_every_provider_fails(
 
     _, settings = pipeline_run
 
-    def _always_fails(_settings: Settings):
-        class _FailingChain:
-            def generate(self, request):
-                raise AllProvidersFailed("every provider failed: stub (RuntimeError)")
-
-        return _FailingChain()
-
-    monkeypatch.setattr(assets_module, "build_chain", _always_fails)
+    class _FailingChain:
+        def generate(self, request):
+            raise AllProvidersFailed("every provider failed: stub (RuntimeError)")
 
     ensure_narrative_schema(settings.postgres_dsn)
     with psycopg.connect(settings.postgres_dsn) as conn:
         before = conn.execute("SELECT count(*) FROM narrative_runs").fetchone()[0]
 
-    context = build_asset_context(resources={"settings": settings})
+    context = build_asset_context(
+        resources={"settings": settings, "narrative_chain": _FailingChain()}
+    )
 
     # Must not raise.
     assets_module.daily_narrative(context)
@@ -260,3 +258,42 @@ def test_embedding_asset_skips_the_model_on_an_empty_staging_layer(
     metadata = context.get_output_metadata("result")
     assert metadata is not None
     assert metadata["rows_written"].value == 0
+
+
+def test_the_narrative_chain_outlives_a_single_materialisation(pipeline_run) -> None:
+    """Finding 3: a chain rebuilt per run has breakers that can never fire.
+
+    `daily_narrative` calls `generate` once, so within one call a provider is
+    attempted at most once and `is_open()` is always False. The breakers only
+    mean anything if the chain - and therefore its breaker state - survives
+    from one materialisation to the next, which is why the chain is a
+    resource. With a threshold of one, the second run must skip the dead
+    provider instead of calling it again.
+    """
+    from dagster import build_asset_context
+
+    from adsignal.narrative.chain import NarrativeChain
+    from adsignal.narrative.providers.stub import StubProvider
+    from adsignal.pipeline import assets as assets_module
+
+    _, settings = pipeline_run
+
+    dead = StubProvider(fail_with=RuntimeError("upstream down"), name="dead")
+    chain = NarrativeChain([dead, StubProvider("fallback", name="stub")], failure_threshold=1)
+    context = build_asset_context(resources={"settings": settings, "narrative_chain": chain})
+
+    assets_module.daily_narrative(context)
+    calls_after_first_run = dead.call_count
+
+    assets_module.daily_narrative(context)
+
+    assert calls_after_first_run == 1
+    assert dead.call_count == 1, "the breaker did not survive the first materialisation"
+
+
+def test_the_definitions_share_one_narrative_chain() -> None:
+    """The deployed system gets the long-lived chain, not just the tests."""
+    from adsignal.narrative.chain import NarrativeChain
+    from adsignal.pipeline.definitions import defs
+
+    assert isinstance(defs.resources["narrative_chain"], NarrativeChain)

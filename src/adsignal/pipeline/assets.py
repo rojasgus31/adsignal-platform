@@ -20,8 +20,7 @@ from adsignal.ml.features import build_features
 from adsignal.ml.registry import load_models, log_training_run
 from adsignal.ml.splits import temporal_split
 from adsignal.ml.training import BASELINE_WINDOW, HOLDOUT_FRACTION, train_and_evaluate
-from adsignal.narrative.build import build_chain
-from adsignal.narrative.chain import AllProvidersFailed
+from adsignal.narrative.chain import AllProvidersFailed, NarrativeChain
 from adsignal.narrative.types import NarrativeRequest
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import load_mart_to_postgres
@@ -290,7 +289,7 @@ def campaign_embeddings(context: AssetExecutionContext) -> None:
 
 @asset(
     deps=[anomaly_scores],
-    required_resource_keys={"settings"},
+    required_resource_keys={"settings", "narrative_chain"},
     description="A generated prose narrative summarizing the most recent day's anomalies",
 )
 def daily_narrative(context: AssetExecutionContext) -> None:
@@ -301,15 +300,23 @@ def daily_narrative(context: AssetExecutionContext) -> None:
     chain's total budget ran out before one answered - is caught here,
     logged, and this asset returns without raising, so a narrative outage
     never blocks the nightly job or any other downstream asset.
+
+    The chain arrives as a resource rather than being built here. A chain
+    built per materialisation carries a fresh `CircuitBreaker` per provider,
+    and this asset calls `generate` exactly once, so `is_open()` was always
+    False and the breakers had no effect on the deployed system at all: a
+    permanently dead provider was retried in full, with its timeout, on every
+    nightly run. One chain per process is what makes that state real.
     """
     settings: Settings = context.resources.settings
+    chain: NarrativeChain = context.resources.narrative_chain
     request = _build_narrative_request(settings.postgres_dsn)
     if request is None:
         context.log.warning("no campaign-daily rows found; skipping narrative generation")
         return
 
     try:
-        result = build_chain(settings).generate(request)
+        result = chain.generate(request)
     except AllProvidersFailed as error:
         # Only the provider names and exception *type* are logged, never the
         # exception object itself: `NarrativeChain` composes its failure

@@ -3,6 +3,7 @@
 from dagster import Definitions, ScheduleDefinition, define_asset_job
 
 from adsignal.config import get_settings
+from adsignal.narrative.build import build_chain
 from adsignal.pipeline.assets import (
     anomaly_scores,
     campaign_daily_mart,
@@ -34,6 +35,11 @@ daily_schedule = ScheduleDefinition(
     execution_timezone="UTC",
 )
 
+# One `Settings` and one `NarrativeChain` for the whole process. The chain is
+# deliberately longer-lived than a materialisation: its per-provider circuit
+# breakers are state, and state rebuilt per run is state that never fires.
+_settings = get_settings()
+
 defs = Definitions(
     assets=[
         catalog_and_raw_events,
@@ -47,5 +53,5 @@ defs = Definitions(
     ],
     jobs=[adsignal_daily],
     schedules=[daily_schedule],
-    resources={"settings": get_settings()},
+    resources={"settings": _settings, "narrative_chain": build_chain(_settings)},
 )
