@@ -6,6 +6,8 @@ guarding `/search` and `/ask` into `app.state`, then mounts every router. Nothin
 to Postgres directly — that stays inside `warehouse/`.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
@@ -27,6 +29,7 @@ from adsignal.api.routes.search import (
 )
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
+from adsignal.warehouse.pool import close_all_pools
 
 API_TITLE = "AdSignal Serving API"
 API_DESCRIPTION = (
@@ -60,6 +63,20 @@ def install_request_runtime(app: FastAPI) -> None:
     )
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Close every warehouse connection pool once the app stops serving requests.
+
+    The pools in `adsignal.warehouse.pool` are process-wide, keyed by DSN, not
+    per-`app` — but closing them here, rather than leaving them for process
+    exit, releases their connections back to Postgres (or Neon) as soon as
+    this app instance is done, which matters for the test suite building many
+    short-lived apps in one process.
+    """
+    yield
+    close_all_pools()
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the FastAPI app.
 
@@ -71,7 +88,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """
     resolved_settings = settings if settings is not None else Settings()
 
-    app = FastAPI(title=API_TITLE, description=API_DESCRIPTION, version=API_VERSION)
+    app = FastAPI(
+        title=API_TITLE,
+        description=API_DESCRIPTION,
+        version=API_VERSION,
+        lifespan=_lifespan,
+    )
     app.state.settings = resolved_settings
     app.state.embedding_model = EmbeddingModel()
     install_request_runtime(app)

@@ -14,10 +14,9 @@ to import from the outer `api/` one.
 from collections.abc import Sequence
 from typing import Any
 
-import psycopg
-
 from adsignal.warehouse.loader import ensure_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
+from adsignal.warehouse.pool import connection
 
 
 def run_template(
@@ -39,6 +38,6 @@ def run_template(
     """
     ensure_schema(dsn)
     ensure_ml_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(sql, tuple(parameters)).fetchall()
     return [dict(zip(columns, row, strict=True)) for row in rows]

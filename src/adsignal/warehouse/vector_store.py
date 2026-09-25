@@ -10,10 +10,10 @@ names the problem instead of surfacing as a driver-level failure.
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
+from adsignal.warehouse.pool import connection
 from adsignal.warehouse.schema import apply_schema
 
 # bge-small-en-v1.5 produces 384 dimensions. Changing the model means changing
@@ -79,7 +79,7 @@ def upsert_embeddings(dsn: str, rows: Sequence[EmbeddingRow]) -> int:
             )
 
     ensure_vector_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         register_vector(conn)
         conn.cursor().executemany(
             """
@@ -112,7 +112,7 @@ def search_similar(
         params.append(kind)
     params.append(limit)
 
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         register_vector(conn)
         rows = conn.execute(
             f"""

@@ -14,9 +14,8 @@ query in `warehouse/`.
 from dataclasses import dataclass
 from datetime import date
 
-import psycopg
-
 from adsignal.warehouse.loader import ensure_schema
+from adsignal.warehouse.pool import connection
 
 # The mart is keyed (event_date, campaign_id), so a campaign's advertiser and
 # channel are carried on every one of its rows. `DISTINCT ON` takes them from
@@ -65,7 +64,7 @@ def list_campaigns(dsn: str) -> list[CampaignInfo]:
     which `ensure_schema` guards against before the query runs.
     """
     ensure_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(_LIST_CAMPAIGNS_SQL).fetchall()
     return [
         CampaignInfo(str(campaign_id), str(advertiser_id), str(channel))
@@ -81,7 +80,7 @@ def read_campaign_metrics(dsn: str, campaign_id: str) -> list[CampaignMetricPoin
     into a 404.
     """
     ensure_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(_CAMPAIGN_METRICS_SQL, (campaign_id,)).fetchall()
     return [
         CampaignMetricPoint(

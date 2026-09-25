@@ -33,6 +33,13 @@ def apply_schema(dsn: str, *statements: str) -> None:
 
     The lock is transaction-scoped, so it is held from here until the commit
     below and no caller has to release it.
+
+    Deliberately not routed through `warehouse.pool`: pooling this connection
+    would risk the advisory lock still being held when another caller checks
+    the same physical connection back out, since the lock's scope is this one
+    transaction on this one connection, not the logical "this DSN" the pool
+    keys on. A dedicated `psycopg.connect` per call keeps the lock's lifetime
+    and the connection's lifetime identical.
     """
     with psycopg.connect(dsn) as conn:
         conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))

@@ -13,10 +13,10 @@ import json
 from datetime import datetime
 
 import pandas as pd
-import psycopg
 
 from adsignal.ml.drift import FeatureDrift
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
+from adsignal.warehouse.pool import connection
 from adsignal.warehouse.schema import apply_schema
 
 _CREATE_TABLES = """
@@ -100,7 +100,7 @@ def write_model_metrics(
     artifacts live from a separate, per-process `Settings.mlflow_dir` (I4).
     """
     ensure_ml_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         conn.execute(
             """
             INSERT INTO model_metrics (
@@ -137,7 +137,7 @@ def write_drift_report(
     ensure_ml_schema(dsn)
     if not reports:
         return
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         conn.cursor().executemany(
             """
             INSERT INTO drift_reports
@@ -194,7 +194,7 @@ def write_predictions(dsn: str, run_id: str, predictions: pd.DataFrame) -> int:
         for i in range(len(predictions))
     ]
 
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         conn.execute("DELETE FROM anomaly_predictions")
         if rows:
             conn.cursor().executemany(

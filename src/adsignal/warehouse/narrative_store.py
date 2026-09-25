@@ -9,9 +9,8 @@ orders by `as_of DESC, id DESC` so the newer row wins.
 from dataclasses import dataclass
 from datetime import date, datetime
 
-import psycopg
-
 from adsignal.narrative.types import NarrativeResult
+from adsignal.warehouse.pool import connection
 from adsignal.warehouse.schema import apply_schema
 
 _CREATE = """
@@ -51,7 +50,7 @@ def ensure_narrative_schema(dsn: str) -> None:
 def write_narrative(dsn: str, as_of: date, result: NarrativeResult) -> None:
     """Append one generated narrative. History is never overwritten."""
     ensure_narrative_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         conn.execute(
             """
             INSERT INTO narrative_runs (as_of, text, provider, latency_ms)
@@ -65,7 +64,7 @@ def write_narrative(dsn: str, as_of: date, result: NarrativeResult) -> None:
 def read_latest_narrative(dsn: str) -> StoredNarrative | None:
     """Return the most recent narrative, or None if the table is empty."""
     ensure_narrative_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         row = conn.execute(
             "SELECT as_of, text, provider, latency_ms, generated_at FROM narrative_runs "
             "ORDER BY as_of DESC, id DESC LIMIT 1"

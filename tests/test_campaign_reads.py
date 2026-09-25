@@ -66,18 +66,11 @@ def mart_with_three_campaigns() -> Iterator[str]:
 def _counting_rows_returned(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     """Record how many rows Postgres returned for each query this module ran."""
     counts: list[int] = []
-    real_connect = psycopg.connect
+    real_connection = campaign_reads.connection
 
     class _CountingConnection:
         def __init__(self, connection: Any) -> None:
             self._connection = connection
-
-        def __enter__(self) -> "_CountingConnection":
-            self._connection.__enter__()
-            return self
-
-        def __exit__(self, *exc_info: Any) -> None:
-            self._connection.__exit__(*exc_info)
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._connection, name)
@@ -87,10 +80,12 @@ def _counting_rows_returned(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[in
             counts.append(cursor.rowcount)
             return cursor
 
-    def _connect(*args: Any, **kwargs: Any) -> _CountingConnection:
-        return _CountingConnection(real_connect(*args, **kwargs))
+    @contextmanager
+    def _connection(dsn: str) -> Iterator[_CountingConnection]:
+        with real_connection(dsn) as conn:
+            yield _CountingConnection(conn)
 
-    monkeypatch.setattr(campaign_reads.psycopg, "connect", _connect)
+    monkeypatch.setattr(campaign_reads, "connection", _connection)
     yield counts
 
 

@@ -13,10 +13,10 @@ serving table.
 
 from pathlib import Path
 
-import psycopg
 from psycopg import sql
 
 from adsignal.warehouse.duckdb_io import open_duckdb
+from adsignal.warehouse.pool import connection
 from adsignal.warehouse.schema import apply_schema
 
 _MART_COLUMNS = (
@@ -94,7 +94,7 @@ def load_mart_to_postgres(duckdb_path: Path, dsn: str, batch_size: int = 10_000)
     total = 0
     select = f"SELECT {', '.join(_MART_COLUMNS)} FROM main_marts.fct_campaign_daily"  # noqa: S608
 
-    with open_duckdb(duckdb_path) as duck, psycopg.connect(dsn) as pg:
+    with open_duckdb(duckdb_path) as duck, connection(dsn) as pg:
         cursor = duck.execute(select)
         with pg.cursor() as pg_cursor:
             pg_cursor.execute("TRUNCATE TABLE fct_campaign_daily")

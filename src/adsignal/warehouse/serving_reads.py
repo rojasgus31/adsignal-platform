@@ -11,9 +11,8 @@ modifying `metrics_store.py`.
 from dataclasses import dataclass
 from datetime import date, datetime
 
-import psycopg
-
 from adsignal.warehouse.metrics_store import ensure_ml_schema
+from adsignal.warehouse.pool import connection
 
 # The bound both collection readers share, and the ceiling a caller may ask
 # for. An unbounded collection is a denial-of-service lever: one response
@@ -65,7 +64,7 @@ def read_model_metrics(
     rather than a database error.
     """
     ensure_ml_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(
             """
             SELECT run_id, trained_at, triage_accuracy, triage_macro_f1,
@@ -88,7 +87,7 @@ def read_anomaly_predictions(
     the current model flags is a row here.
     """
     ensure_ml_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(
             """
             SELECT campaign_id, event_date, run_id, cause, confidence, severity,
@@ -107,7 +106,7 @@ def read_anomaly_prediction(
 ) -> AnomalyPredictionRow | None:
     """Return the prediction for one campaign-day, or None if there is none."""
     ensure_ml_schema(dsn)
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         row = conn.execute(
             """
             SELECT campaign_id, event_date, run_id, cause, confidence, severity,

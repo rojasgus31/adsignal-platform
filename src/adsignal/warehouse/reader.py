@@ -8,7 +8,8 @@ helpers, which would pull in SQLAlchemy for no benefit.
 from datetime import date
 
 import pandas as pd
-import psycopg
+
+from adsignal.warehouse.pool import connection
 
 MART_COLUMNS: tuple[str, ...] = (
     "event_date",
@@ -72,7 +73,7 @@ def read_campaign_daily(
         "ORDER BY campaign_id, event_date"
     )
 
-    with psycopg.connect(dsn) as conn:
+    with connection(dsn) as conn:
         rows = conn.execute(query, params).fetchall()
 
     frame = pd.DataFrame(rows, columns=list(MART_COLUMNS))
