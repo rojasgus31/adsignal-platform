@@ -14,6 +14,8 @@ import psycopg
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
+from adsignal.warehouse.schema import apply_schema
+
 # bge-small-en-v1.5 produces 384 dimensions. Changing the model means changing
 # this constant AND migrating the column — the two cannot drift apart silently.
 EMBEDDING_DIM = 384
@@ -55,10 +57,13 @@ class SearchHit:
 
 
 def ensure_vector_schema(dsn: str) -> None:
-    """Create the extension, table and index if absent. Safe to call repeatedly."""
-    with psycopg.connect(dsn) as conn:
-        conn.execute(_CREATE)
-        conn.commit()
+    """Create the extension, table and index if absent. Safe to call repeatedly.
+
+    Serialised against every other `ensure_*_schema` helper by
+    `apply_schema`; see that module for why concurrent `IF NOT EXISTS` DDL
+    needs a lock.
+    """
+    apply_schema(dsn, _CREATE)
 
 
 def upsert_embeddings(dsn: str, rows: Sequence[EmbeddingRow]) -> int:

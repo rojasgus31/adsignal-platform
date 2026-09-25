@@ -17,6 +17,7 @@ import psycopg
 
 from adsignal.ml.drift import FeatureDrift
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
+from adsignal.warehouse.schema import apply_schema
 
 _CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS model_metrics (
@@ -74,11 +75,13 @@ ALTER TABLE model_metrics ADD COLUMN IF NOT EXISTS artifact_uri TEXT;
 
 
 def ensure_ml_schema(dsn: str) -> None:
-    """Create the ML output tables if they do not exist, and migrate old ones."""
-    with psycopg.connect(dsn) as conn:
-        conn.execute(_CREATE_TABLES)
-        conn.execute(_MIGRATE_MODEL_METRICS)
-        conn.commit()
+    """Create the ML output tables if they do not exist, and migrate old ones.
+
+    Serialised against every other `ensure_*_schema` helper by
+    `apply_schema`; see that module for why concurrent `IF NOT EXISTS` DDL
+    needs a lock.
+    """
+    apply_schema(dsn, _CREATE_TABLES, _MIGRATE_MODEL_METRICS)
 
 
 def write_model_metrics(

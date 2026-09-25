@@ -12,6 +12,7 @@ from datetime import date, datetime
 import psycopg
 
 from adsignal.narrative.types import NarrativeResult
+from adsignal.warehouse.schema import apply_schema
 
 _CREATE = """
 CREATE TABLE IF NOT EXISTS narrative_runs (
@@ -38,10 +39,13 @@ class StoredNarrative:
 
 
 def ensure_narrative_schema(dsn: str) -> None:
-    """Create the narrative table if it does not exist."""
-    with psycopg.connect(dsn) as conn:
-        conn.execute(_CREATE)
-        conn.commit()
+    """Create the narrative table if it does not exist.
+
+    Serialised against every other `ensure_*_schema` helper by
+    `apply_schema`; see that module for why concurrent `IF NOT EXISTS` DDL
+    needs a lock.
+    """
+    apply_schema(dsn, _CREATE)
 
 
 def write_narrative(dsn: str, as_of: date, result: NarrativeResult) -> None:

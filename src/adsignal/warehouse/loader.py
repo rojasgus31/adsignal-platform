@@ -17,6 +17,7 @@ import psycopg
 from psycopg import sql
 
 from adsignal.warehouse.duckdb_io import open_duckdb
+from adsignal.warehouse.schema import apply_schema
 
 _MART_COLUMNS = (
     "event_date",
@@ -65,10 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_fcd_anomaly ON fct_campaign_daily (event_date) WH
 
 
 def ensure_schema(dsn: str) -> None:
-    """Create the serving table and its indexes if they do not exist."""
-    with psycopg.connect(dsn) as conn:
-        conn.execute(_CREATE_TABLE)
-        conn.commit()
+    """Create the serving table and its indexes if they do not exist.
+
+    Serialised against every other `ensure_*_schema` helper by
+    `apply_schema`; see that module for why concurrent `IF NOT EXISTS` DDL
+    needs a lock.
+    """
+    apply_schema(dsn, _CREATE_TABLE)
 
 
 def load_mart_to_postgres(duckdb_path: Path, dsn: str, batch_size: int = 10_000) -> int:

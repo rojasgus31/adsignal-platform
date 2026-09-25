@@ -101,9 +101,19 @@ def _ensure_test_database(dsn: str) -> None:
         return
 
 
+# A fourth, separate database for `test_schema_lock`: those tests drop every
+# serving table and then hammer the read paths concurrently, so they cannot
+# share a database with a fixture that expects tables to stay put.
+CONCURRENCY_TEST_DSN = os.environ.get(
+    "ADSIGNAL_CONCURRENCY_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_concurrent",
+)
+
+
 _ensure_test_database(TEST_DSN)
 _ensure_test_database(EMPTY_TEST_DSN)
 _ensure_test_database(DROPPED_TEST_DSN)
+_ensure_test_database(CONCURRENCY_TEST_DSN)
 
 
 def _postgres_available(dsn: str) -> bool:
