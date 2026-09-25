@@ -29,6 +29,7 @@ class NarrativeChain:
         if not providers:
             raise ValueError("a narrative chain needs at least one provider")
         self._providers = list(providers)
+        self._raise_if_duplicate_names(self._providers)
         self._breakers = {
             provider.name: CircuitBreaker(
                 failure_threshold=failure_threshold, cooldown_seconds=cooldown_seconds
@@ -62,3 +63,22 @@ class NarrativeChain:
             )
 
         raise AllProvidersFailed(f"every provider failed: {', '.join(attempted)}")
+
+    @staticmethod
+    def _raise_if_duplicate_names(providers: list[NarrativeProvider]) -> None:
+        """Reject providers sharing a name.
+
+        The name is the breaker map's key and the provenance recorded on a
+        result, so two providers sharing one would silently share a circuit
+        breaker: a failure against one would open the breaker gating the
+        other, and a success for either would reset it for both.
+        """
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for provider in providers:
+            if provider.name in seen:
+                duplicates.add(provider.name)
+            seen.add(provider.name)
+        if duplicates:
+            names = ", ".join(sorted(duplicates))
+            raise ValueError(f"provider names must be unique, duplicated: {names}")

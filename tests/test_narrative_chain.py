@@ -1,3 +1,4 @@
+import time
 from datetime import date
 
 import pytest
@@ -5,6 +6,24 @@ import pytest
 from adsignal.narrative.chain import AllProvidersFailed, NarrativeChain
 from adsignal.narrative.providers.stub import StubProvider
 from adsignal.narrative.types import NarrativeRequest
+
+SLEEP_SECONDS = 0.02
+
+
+class _SlowStubProvider:
+    """A provider that takes a known amount of time to answer.
+
+    Used only to pin down `NarrativeResult.latency_ms` against a real,
+    known duration rather than the near-tautological `>= 0`.
+    """
+
+    def __init__(self, name: str = "slow") -> None:
+        self.name = name
+
+    def generate(self, request: NarrativeRequest) -> str:
+        time.sleep(SLEEP_SECONDS)
+        return "slow narrative"
+
 
 REQUEST = NarrativeRequest(
     as_of=date(2024, 6, 1),
@@ -64,13 +83,20 @@ def test_result_records_which_provider_answered() -> None:
 
 
 def test_result_records_a_latency() -> None:
-    chain = NarrativeChain([StubProvider("text", name="a")])
-    assert chain.generate(REQUEST).latency_ms >= 0
+    chain = NarrativeChain([_SlowStubProvider(name="a")])
+    latency_ms = chain.generate(REQUEST).latency_ms
+    assert latency_ms >= SLEEP_SECONDS * 1000
 
 
 def test_an_empty_chain_raises_rather_than_returning_nothing() -> None:
     with pytest.raises(ValueError, match="at least one provider"):
         NarrativeChain([])
+
+
+def test_duplicate_provider_names_are_rejected() -> None:
+    with pytest.raises(ValueError, match="duplicated: dupe") as excinfo:
+        NarrativeChain([StubProvider("a", name="dupe"), StubProvider("b", name="dupe")])
+    assert "dupe" in str(excinfo.value)
 
 
 def test_provider_order_is_preserved() -> None:
