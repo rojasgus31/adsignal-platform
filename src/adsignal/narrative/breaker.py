@@ -53,9 +53,15 @@ class CircuitBreaker:
         self._reset()
 
     def record_failure(self) -> None:
-        """Count a failure, opening the breaker at the threshold."""
+        """Count a failure, opening the breaker at the threshold.
+
+        The cooldown is timestamped only by the failure that crosses the
+        threshold. A failure recorded while the breaker is already open
+        leaves `_opened_at` untouched, so the cooldown still runs from the
+        original opening — it is not extended by further failures.
+        """
         self._consecutive_failures += 1
-        if self._consecutive_failures >= self._failure_threshold:
+        if self._consecutive_failures >= self._failure_threshold and self._opened_at is None:
             self._opened_at = self._clock()
 
     def _reset(self) -> None:

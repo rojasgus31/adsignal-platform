@@ -80,3 +80,28 @@ def test_failure_after_recovery_reopens_it() -> None:
 def test_rejects_a_nonsense_threshold() -> None:
     with pytest.raises(ValueError, match="at least 1"):
         CircuitBreaker(failure_threshold=0)
+
+
+def test_a_failure_while_open_does_not_extend_the_cooldown() -> None:
+    """A failure recorded while already open must not restart the cooldown clock."""
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30.0, clock=clock)
+
+    breaker.record_failure()
+    assert breaker.is_open()
+
+    clock.advance(15.0)
+    breaker.record_failure()  # still open; must not push _opened_at forward
+
+    clock.advance(16.0)  # 31s past the ORIGINAL opening, only 16s past the second failure
+    assert not breaker.is_open(), "the second failure extended the cooldown"
+
+
+def test_closes_at_exactly_the_cooldown_boundary() -> None:
+    """Pin the boundary behaviour: elapsed == cooldown_seconds closes the breaker."""
+    clock = FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_seconds=30.0, clock=clock)
+
+    breaker.record_failure()
+    clock.advance(30.0)
+    assert not breaker.is_open()
