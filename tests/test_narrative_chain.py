@@ -139,13 +139,13 @@ class _ClockBurningProvider:
 
 
 def test_a_provider_that_blows_the_total_budget_is_recorded_as_a_failure() -> None:
-    """Its answer is discarded, its breaker counts it, and the run stops.
+    """Its answer is discarded and its breaker counts it.
 
     Nothing else would ever open the breaker of a backend that is merely
     slow, so a permanently stalling provider would be retried in full, with
-    its timeout, on every nightly run. The budget is a hard stop, so the
-    providers behind it are not tried either - the caller gets
-    `AllProvidersFailed`, which `daily_narrative` already degrades on.
+    its timeout, on every nightly run. The terminal fallback is exempt from
+    the budget and still answers, so the caller gets placeholder text rather
+    than nothing.
     """
     clock = _FakeClock()
     slow = _ClockBurningProvider(clock, seconds=30.0, name="slow")
@@ -156,32 +156,33 @@ def test_a_provider_that_blows_the_total_budget_is_recorded_as_a_failure() -> No
         clock=clock,
     )
 
-    with pytest.raises(AllProvidersFailed) as excinfo:
-        chain.generate(REQUEST)
-    assert "slow (exceeded the chain budget)" in str(excinfo.value)
+    result = chain.generate(REQUEST)
+    assert result.provider == "fast", "the terminal fallback must not be skipped"
     assert slow.calls == 1
 
     # The breaker opened on that recorded failure, so the next run skips the
-    # slow provider without paying its cost again, and the fallback answers.
+    # slow provider without paying its cost again.
     result = chain.generate(REQUEST)
     assert result.provider == "fast"
     assert slow.calls == 1
 
 
 def test_the_budget_is_spent_across_providers_not_per_provider() -> None:
-    """Once the budget is gone, the providers behind it are never called."""
+    """Once the budget is gone, providers behind it are skipped.
+
+    The terminal provider is the exception: it is the local fallback, so it
+    is always entered and answers here.
+    """
     clock = _FakeClock()
     first = _ClockBurningProvider(clock, seconds=12.0, name="first")
     second = _ClockBurningProvider(clock, seconds=12.0, name="second")
     third = _ClockBurningProvider(clock, seconds=12.0, name="third")
     chain = NarrativeChain([first, second, third], total_budget_seconds=10.0, clock=clock)
 
-    with pytest.raises(AllProvidersFailed) as excinfo:
-        chain.generate(REQUEST)
+    result = chain.generate(REQUEST)
 
-    assert (first.calls, second.calls, third.calls) == (1, 0, 0)
-    assert "second (chain budget exhausted)" in str(excinfo.value)
-    assert "third (chain budget exhausted)" in str(excinfo.value)
+    assert (first.calls, second.calls, third.calls) == (1, 0, 1)
+    assert result.provider == "third"
 
 
 def test_a_provider_inside_the_budget_still_succeeds() -> None:
@@ -198,3 +199,24 @@ def test_a_provider_inside_the_budget_still_succeeds() -> None:
 def test_a_non_positive_budget_is_rejected() -> None:
     with pytest.raises(ValueError, match="total_budget_seconds"):
         NarrativeChain([StubProvider("x", name="a")], total_budget_seconds=0.0)
+
+
+def test_every_http_provider_failing_still_yields_the_stub_narrative() -> None:
+    """The reason the stub exists: no keys, or every backend down, still renders.
+
+    Regression test. The budget guard was once applied to the terminal
+    provider too, so a chain slow enough to exhaust it skipped the free local
+    fallback and raised instead of answering.
+    """
+    clock = _FakeClock()
+    chain = NarrativeChain(
+        [
+            _ClockBurningProvider(clock, seconds=60.0, name="gemini"),
+            StubProvider("placeholder narrative", name="stub"),
+        ],
+        total_budget_seconds=45.0,
+        clock=clock,
+    )
+    result = chain.generate(REQUEST)
+    assert result.provider == "stub"
+    assert result.text == "placeholder narrative"

@@ -24,20 +24,54 @@ FORBIDDEN_IMPORTS = {
 
 
 def _all_imports(source: Path) -> set[str]:
-    """Every module name this file imports, by either import form."""
+    """Every module name this file imports, by either import form.
+
+    Relative imports are resolved to their absolute name first. `from
+    ..config import get_settings` names the same module as `from
+    adsignal.config import ...` and is exactly the violation this test
+    exists to catch, so it must not slip through as the bare name "config".
+    """
     tree = ast.parse(source.read_text())
+    package = _package_of(source)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imported.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(_resolve(node, package))
     return imported
+
+
+def _package_of(source: Path) -> list[str]:
+    """The dotted package parts containing `source`, rooted at `adsignal`."""
+    relative = source.relative_to(_SOURCE_ROOT.parent)
+    parts = list(relative.parts[:-1])
+    if relative.stem != "__init__":
+        return parts
+    return parts
+
+
+def _resolve(node: ast.ImportFrom, package: list[str]) -> str:
+    """The absolute module name `node` refers to, resolving any relative form."""
+    if not node.level:
+        return node.module or ""
+    base = package[: len(package) - node.level + 1]
+    return ".".join([*base, node.module] if node.module else base)
 
 
 def _adsignal_imports(source: Path) -> set[str]:
     """Only the project's own modules, which are the ones layering constrains."""
     return {name for name in _all_imports(source) if name.startswith("adsignal.")}
+
+
+def _layer_of(module: str) -> str:
+    """The layer a dotted `adsignal.<layer>...` name belongs to, or "" for none.
+
+    Returns "" rather than raising on a bare `import adsignal`, which has no
+    layer to constrain.
+    """
+    parts = module.split(".")
+    return parts[1] if len(parts) > 1 else ""
 
 
 def _modules_under(package: str) -> list[Path]:
@@ -51,7 +85,7 @@ def test_a_package_never_imports_the_layers_below_it(package: str) -> None:
         f"{source.relative_to(_SOURCE_ROOT)} imports {name}"
         for source in _modules_under(package)
         for name in _adsignal_imports(source)
-        if name.split(".")[1] in forbidden
+        if _layer_of(name) in forbidden
     ]
     assert violations == []
 

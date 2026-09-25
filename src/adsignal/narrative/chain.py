@@ -5,15 +5,22 @@ without being called, so one dead backend costs nothing on later requests. If
 every provider fails, the caller gets one exception naming all of them — a
 caller that cannot tell which backends it tried cannot diagnose anything.
 
-The chain also imposes a **total budget** across every provider, not just the
-per-provider timeout each one carries. A per-provider timeout does not bound
-the chain: httpx applies its value per phase (connect/read/write/pool), and
-four configured providers each allowed 20 s can stall the caller for 80 s or
-more before the stub is reached. A provider that answers only after the
-budget has run out is recorded as a *failure*, not a success, so its breaker
-opens and later runs skip it — a backend slow enough to blow the whole
-budget is as unusable as one that raises, and nothing else would ever open
-its breaker.
+The chain also carries a budget that gates which providers are *entered*.
+It is not a total wall-clock bound: `provider.generate` is a blocking call
+that is never cancelled, so a provider entered just under the deadline still
+runs to its own completion. The bound is the budget plus the last-started
+provider's stall — a large improvement on the alternative, since a
+per-provider timeout bounds nothing at the chain level (httpx applies its
+value per phase: connect/read/write/pool, so four providers each allowed
+20 s can stall the caller far past 80 s), but not the same thing as a total
+deadline. A provider that answers only after the budget has run out is
+recorded as a *failure*, so its breaker opens and later runs skip it.
+
+The **terminal provider is exempt from the budget**. The last entry in the
+chain is the local stub: instant, free, and the reason a deployment with no
+keys still renders a dashboard instead of an error. Skipping it to save time
+saves nothing and costs the caller its only answer, so it is always entered
+and its lateness is never held against it.
 """
 
 import time
@@ -63,8 +70,12 @@ class NarrativeChain:
         deadline = self._clock() + self._total_budget_seconds
         attempted: list[str] = []
 
-        for provider in self._providers:
-            result, reason = self._attempt(provider, request, deadline)
+        last_index = len(self._providers) - 1
+        for index, provider in enumerate(self._providers):
+            # The terminal provider is the local fallback; see the module
+            # docstring for why the budget never applies to it.
+            provider_deadline = None if index == last_index else deadline
+            result, reason = self._attempt(provider, request, provider_deadline)
             if result is not None:
                 return result
             attempted.append(reason)
@@ -72,13 +83,13 @@ class NarrativeChain:
         raise AllProvidersFailed(f"every provider failed: {', '.join(attempted)}")
 
     def _attempt(
-        self, provider: NarrativeProvider, request: NarrativeRequest, deadline: float
+        self, provider: NarrativeProvider, request: NarrativeRequest, deadline: float | None
     ) -> tuple[NarrativeResult | None, str]:
         """Try one provider, returning its result or why it did not produce one."""
         breaker = self._breakers[provider.name]
         if breaker.is_open():
             return None, f"{provider.name} (breaker open)"
-        if self._clock() >= deadline:
+        if deadline is not None and self._clock() >= deadline:
             return None, f"{provider.name} (chain budget exhausted)"
 
         started = self._clock()
@@ -89,7 +100,7 @@ class NarrativeChain:
             return None, f"{provider.name} ({type(error).__name__})"
 
         finished = self._clock()
-        if finished > deadline:
+        if deadline is not None and finished > deadline:
             # A late answer is a failed one: recording it as a success would
             # leave the breaker of a permanently slow backend closed forever.
             breaker.record_failure()

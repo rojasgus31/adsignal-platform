@@ -1,6 +1,6 @@
 """A bounded, TTL'd response cache.
 
-`/ask` is the one endpoint that does live work per request, so caching its
+`/ask` and `/search` both do live work per request, so caching its
 answers is worthwhile — but its cache key is derived from caller-supplied
 free text, so an unbounded dict is a memory-exhaustion vector: a TTL alone
 only causes a *miss*, it never evicts, and the stale entry stays resident
