@@ -3,6 +3,10 @@
 Each asset is idempotent: re-materializing it produces the same end state.
 """
 
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,9 +35,59 @@ from adsignal.warehouse.metrics_store import (
 )
 from adsignal.warehouse.narrative_store import write_narrative
 from adsignal.warehouse.reader import read_campaign_daily
+from adsignal.warehouse.run_log import RunEntry, record_run
 from adsignal.warehouse.text_source import read_entity_text
 from adsignal.warehouse.vector_store import EmbeddingRow, upsert_embeddings
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
+
+
+@dataclass(slots=True)
+class _RunCounter:
+    """A mutable holder an asset can set `rows` on before returning.
+
+    `_record` needs a value to log after the asset body finishes (or raises),
+    so the count has to live somewhere the asset can write to as it runs
+    rather than as a return value the wrapper never sees.
+    """
+
+    rows: int = field(default=0)
+
+
+@contextmanager
+def _record(context: AssetExecutionContext, settings: Settings) -> Iterator[_RunCounter]:
+    """Record this asset's execution to `pipeline_runs`, whether it succeeds or raises.
+
+    Dagster's own run history lives in storage `dagster dev` discards when an
+    ephemeral CI runner's job ends; this table is written by the asset itself
+    so it survives that runner (see `adsignal.warehouse.run_log`).
+
+    `detail` gets the exception's TYPE name only, never `str(error)`: a
+    message can carry a DSN, and this row is served by a public endpoint
+    later in this plan.
+    """
+    counter = _RunCounter()
+    started = datetime.now(UTC)
+    clock = time.monotonic()
+    status, detail = "succeeded", ""
+    try:
+        yield counter
+    except Exception as error:
+        status, detail = "failed", type(error).__name__
+        raise
+    finally:
+        record_run(
+            settings.postgres_dsn,
+            RunEntry(
+                run_id=context.run_id,
+                asset=context.asset_key.to_user_string(),
+                started_at=started,
+                duration_seconds=time.monotonic() - clock,
+                rows_written=counter.rows,
+                status=status,
+                detail=detail,
+            ),
+        )
+
 
 _DEFAULT_DBT_DIR = Path(__file__).resolve().parents[3] / "dbt"
 
@@ -61,36 +115,38 @@ def catalog_and_raw_events(context: AssetExecutionContext) -> None:
     """Generate the catalog, stream events to Parquet, and record anomaly labels."""
     settings: Settings = context.resources.settings
 
-    catalog = build_catalog(
-        seed=settings.seed,
-        start_date=settings.start_date,
-        end_date=settings.end_date,
-        n_advertisers=_advertisers_for(settings.target_events),
-    )
-    injector = AnomalyInjector(seed=settings.seed, rate=0.01)
-
-    row_count = write_events_parquet(
-        injector.rows(generate_events(catalog, seed=settings.seed)),
-        settings.raw_events_path,
-    )
-    label_count = write_labels_parquet(injector.labels, settings.anomaly_labels_path)
-
-    with open_duckdb(settings.duckdb_path) as conn:
-        register_sources(
-            conn,
-            events_path=settings.raw_events_path,
-            labels_path=settings.anomaly_labels_path,
-            catalog=catalog,
+    with _record(context, settings) as counter:
+        catalog = build_catalog(
+            seed=settings.seed,
+            start_date=settings.start_date,
+            end_date=settings.end_date,
+            n_advertisers=_advertisers_for(settings.target_events),
         )
+        injector = AnomalyInjector(seed=settings.seed, rate=0.01)
 
-    context.add_output_metadata(
-        {
-            "row_count": MetadataValue.int(row_count),
-            "label_count": MetadataValue.int(label_count),
-            "campaigns": MetadataValue.int(len(catalog.campaigns)),
-            "events_path": MetadataValue.path(str(settings.raw_events_path)),
-        }
-    )
+        row_count = write_events_parquet(
+            injector.rows(generate_events(catalog, seed=settings.seed)),
+            settings.raw_events_path,
+        )
+        label_count = write_labels_parquet(injector.labels, settings.anomaly_labels_path)
+
+        with open_duckdb(settings.duckdb_path) as conn:
+            register_sources(
+                conn,
+                events_path=settings.raw_events_path,
+                labels_path=settings.anomaly_labels_path,
+                catalog=catalog,
+            )
+
+        counter.rows = row_count
+        context.add_output_metadata(
+            {
+                "row_count": MetadataValue.int(row_count),
+                "label_count": MetadataValue.int(label_count),
+                "campaigns": MetadataValue.int(len(catalog.campaigns)),
+                "events_path": MetadataValue.path(str(settings.raw_events_path)),
+            }
+        )
 
 
 @asset(
@@ -101,9 +157,10 @@ def catalog_and_raw_events(context: AssetExecutionContext) -> None:
 def dbt_marts(context: AssetExecutionContext) -> None:
     """Run `dbt build`, which materializes the models and runs the data tests."""
     settings: Settings = context.resources.settings
-    project_dir = _dbt_project_dir(settings)
-    run_dbt(project_dir=project_dir, duckdb_path=settings.duckdb_path, command="build")
-    context.add_output_metadata({"dbt_project": MetadataValue.path(str(project_dir))})
+    with _record(context, settings):
+        project_dir = _dbt_project_dir(settings)
+        run_dbt(project_dir=project_dir, duckdb_path=settings.duckdb_path, command="build")
+        context.add_output_metadata({"dbt_project": MetadataValue.path(str(project_dir))})
 
 
 @asset(
@@ -114,8 +171,10 @@ def dbt_marts(context: AssetExecutionContext) -> None:
 def campaign_daily_mart(context: AssetExecutionContext) -> None:
     """Upsert the DuckDB fact table into Postgres."""
     settings: Settings = context.resources.settings
-    loaded = load_mart_to_postgres(settings.duckdb_path, settings.postgres_dsn)
-    context.add_output_metadata({"rows_upserted": MetadataValue.int(loaded)})
+    with _record(context, settings) as counter:
+        loaded = load_mart_to_postgres(settings.duckdb_path, settings.postgres_dsn)
+        counter.rows = loaded
+        context.add_output_metadata({"rows_upserted": MetadataValue.int(loaded)})
 
 
 @asset(
@@ -133,39 +192,41 @@ def trained_models(context: AssetExecutionContext) -> None:
     """
     settings: Settings = context.resources.settings
 
-    result = train_and_evaluate(read_campaign_daily(settings.postgres_dsn), seed=settings.seed)
+    with _record(context, settings) as counter:
+        result = train_and_evaluate(read_campaign_daily(settings.postgres_dsn), seed=settings.seed)
 
-    run_id, artifact_dir = log_training_run(
-        tracking_dir=settings.mlflow_dir,
-        detector=result.detector,
-        classifier=result.classifier,
-        triage_metrics=result.triage_metrics,
-        detector_metrics=result.detector_metrics,
-        params={
-            "baseline_window": BASELINE_WINDOW,
-            "holdout_fraction": HOLDOUT_FRACTION,
-            "seed": settings.seed,
-        },
-    )
-    write_model_metrics(
-        settings.postgres_dsn,
-        run_id,
-        datetime.now(UTC),
-        result.triage_metrics,
-        result.detector_metrics,
-        str(artifact_dir),
-    )
+        run_id, artifact_dir = log_training_run(
+            tracking_dir=settings.mlflow_dir,
+            detector=result.detector,
+            classifier=result.classifier,
+            triage_metrics=result.triage_metrics,
+            detector_metrics=result.detector_metrics,
+            params={
+                "baseline_window": BASELINE_WINDOW,
+                "holdout_fraction": HOLDOUT_FRACTION,
+                "seed": settings.seed,
+            },
+        )
+        write_model_metrics(
+            settings.postgres_dsn,
+            run_id,
+            datetime.now(UTC),
+            result.triage_metrics,
+            result.detector_metrics,
+            str(artifact_dir),
+        )
 
-    context.add_output_metadata(
-        {
-            "run_id": MetadataValue.text(run_id),
-            "triage_macro_f1": MetadataValue.float(result.triage_metrics.macro_f1),
-            "triage_accuracy": MetadataValue.float(result.triage_metrics.accuracy),
-            "detector_roc_auc": MetadataValue.float(result.detector_metrics.roc_auc),
-            "train_rows": MetadataValue.int(len(result.train)),
-            "holdout_rows": MetadataValue.int(len(result.holdout)),
-        }
-    )
+        counter.rows = len(result.train) + len(result.holdout)
+        context.add_output_metadata(
+            {
+                "run_id": MetadataValue.text(run_id),
+                "triage_macro_f1": MetadataValue.float(result.triage_metrics.macro_f1),
+                "triage_accuracy": MetadataValue.float(result.triage_metrics.accuracy),
+                "detector_roc_auc": MetadataValue.float(result.detector_metrics.roc_auc),
+                "train_rows": MetadataValue.int(len(result.train)),
+                "holdout_rows": MetadataValue.int(len(result.holdout)),
+            }
+        )
 
 
 @asset(
@@ -176,25 +237,27 @@ def trained_models(context: AssetExecutionContext) -> None:
 def anomaly_scores(context: AssetExecutionContext) -> None:
     """Score every campaign-day and upsert the predictions."""
     settings: Settings = context.resources.settings
-    run_id, artifact_dir = _latest_run(settings)
+    with _record(context, settings) as counter:
+        run_id, artifact_dir = _latest_run(settings)
 
-    features = build_features(
-        read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
-    )
-    detector, classifier = load_models(artifact_dir)
+        features = build_features(
+            read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
+        )
+        detector, classifier = load_models(artifact_dir)
 
-    flagged = features[detector.predict(features)]
-    if flagged.empty:
-        context.add_output_metadata({"rows_written": MetadataValue.int(0)})
-        return
+        flagged = features[detector.predict(features)]
+        if flagged.empty:
+            context.add_output_metadata({"rows_written": MetadataValue.int(0)})
+            return
 
-    predictions = classifier.predict(flagged)
-    predictions["event_date"] = flagged["event_date"].to_numpy()
-    predictions["campaign_id"] = flagged["campaign_id"].to_numpy()
-    predictions["anomaly_score"] = detector.score(flagged)
+        predictions = classifier.predict(flagged)
+        predictions["event_date"] = flagged["event_date"].to_numpy()
+        predictions["campaign_id"] = flagged["campaign_id"].to_numpy()
+        predictions["anomaly_score"] = detector.score(flagged)
 
-    written = write_predictions(settings.postgres_dsn, run_id, predictions)
-    context.add_output_metadata({"rows_written": MetadataValue.int(written)})
+        written = write_predictions(settings.postgres_dsn, run_id, predictions)
+        counter.rows = written
+        context.add_output_metadata({"rows_written": MetadataValue.int(written)})
 
 
 @asset(
@@ -205,22 +268,24 @@ def anomaly_scores(context: AssetExecutionContext) -> None:
 def drift_report(context: AssetExecutionContext) -> None:
     """Compare the holdout window's feature distributions against the training window."""
     settings: Settings = context.resources.settings
-    run_id, _ = _latest_run(settings)
+    with _record(context, settings) as counter:
+        run_id, _ = _latest_run(settings)
 
-    features = build_features(
-        read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
-    )
-    reference, current = temporal_split(features, holdout_fraction=HOLDOUT_FRACTION)
+        features = build_features(
+            read_campaign_daily(settings.postgres_dsn), baseline_window=BASELINE_WINDOW
+        )
+        reference, current = temporal_split(features, holdout_fraction=HOLDOUT_FRACTION)
 
-    reports = feature_drift(reference, current, list(DETECTOR_FEATURES))
-    write_drift_report(settings.postgres_dsn, run_id, datetime.now(UTC), reports)
+        reports = feature_drift(reference, current, list(DETECTOR_FEATURES))
+        write_drift_report(settings.postgres_dsn, run_id, datetime.now(UTC), reports)
 
-    context.add_output_metadata(
-        {
-            "features_measured": MetadataValue.int(len(reports)),
-            "features_drifted": MetadataValue.int(sum(r.drifted for r in reports)),
-        }
-    )
+        counter.rows = len(reports)
+        context.add_output_metadata(
+            {
+                "features_measured": MetadataValue.int(len(reports)),
+                "features_drifted": MetadataValue.int(sum(r.drifted for r in reports)),
+            }
+        )
 
 
 def _latest_run(settings: Settings) -> tuple[str, Path]:
@@ -263,28 +328,34 @@ def campaign_embeddings(context: AssetExecutionContext) -> None:
     """Embed staging text and upsert the vectors into Postgres."""
     settings: Settings = context.resources.settings
 
-    entities = read_entity_text(settings.duckdb_path)
-    if not entities:
-        context.add_output_metadata({"rows_written": MetadataValue.int(0)})
-        return
+    with _record(context, settings) as counter:
+        entities = read_entity_text(settings.duckdb_path)
+        if not entities:
+            context.add_output_metadata({"rows_written": MetadataValue.int(0)})
+            return
 
-    model = EmbeddingModel()
-    vectors = model.embed([entity.text for entity in entities])
+        model = EmbeddingModel()
+        vectors = model.embed([entity.text for entity in entities])
 
-    written = upsert_embeddings(
-        settings.postgres_dsn,
-        [
-            EmbeddingRow(entity.entity_kind, entity.entity_id, entity.text, vector)
-            for entity, vector in zip(entities, vectors, strict=True)
-        ],
-    )
-    context.add_output_metadata(
-        {
-            "rows_written": MetadataValue.int(written),
-            "campaigns": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "campaign")),
-            "creatives": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "creative")),
-        }
-    )
+        written = upsert_embeddings(
+            settings.postgres_dsn,
+            [
+                EmbeddingRow(entity.entity_kind, entity.entity_id, entity.text, vector)
+                for entity, vector in zip(entities, vectors, strict=True)
+            ],
+        )
+        counter.rows = written
+        context.add_output_metadata(
+            {
+                "rows_written": MetadataValue.int(written),
+                "campaigns": MetadataValue.int(
+                    sum(1 for e in entities if e.entity_kind == "campaign")
+                ),
+                "creatives": MetadataValue.int(
+                    sum(1 for e in entities if e.entity_kind == "creative")
+                ),
+            }
+        )
 
 
 @asset(
@@ -310,29 +381,32 @@ def daily_narrative(context: AssetExecutionContext) -> None:
     """
     settings: Settings = context.resources.settings
     chain: NarrativeChain = context.resources.narrative_chain
-    request = _build_narrative_request(settings.postgres_dsn)
-    if request is None:
-        context.log.warning("no campaign-daily rows found; skipping narrative generation")
-        return
 
-    try:
-        result = chain.generate(request)
-    except AllProvidersFailed as error:
-        # Only the provider names and exception *type* are logged, never the
-        # exception object itself: `NarrativeChain` composes its failure
-        # message the same way precisely so a provider's error detail (which
-        # could echo back an API key) never reaches a log line or a stored
-        # row, and logging `error` directly here would undo that.
-        context.log.warning(f"narrative generation failed: {type(error).__name__}: {error}")
-        return
+    with _record(context, settings) as counter:
+        request = _build_narrative_request(settings.postgres_dsn)
+        if request is None:
+            context.log.warning("no campaign-daily rows found; skipping narrative generation")
+            return
 
-    write_narrative(settings.postgres_dsn, request.as_of, result)
-    context.add_output_metadata(
-        {
-            "provider": MetadataValue.text(result.provider),
-            "latency_ms": MetadataValue.float(result.latency_ms),
-        }
-    )
+        try:
+            result = chain.generate(request)
+        except AllProvidersFailed as error:
+            # Only the provider names and exception *type* are logged, never the
+            # exception object itself: `NarrativeChain` composes its failure
+            # message the same way precisely so a provider's error detail (which
+            # could echo back an API key) never reaches a log line or a stored
+            # row, and logging `error` directly here would undo that.
+            context.log.warning(f"narrative generation failed: {type(error).__name__}: {error}")
+            return
+
+        write_narrative(settings.postgres_dsn, request.as_of, result)
+        counter.rows = 1
+        context.add_output_metadata(
+            {
+                "provider": MetadataValue.text(result.provider),
+                "latency_ms": MetadataValue.float(result.latency_ms),
+            }
+        )
 
 
 def _build_narrative_request(dsn: str) -> NarrativeRequest | None:

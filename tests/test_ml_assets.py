@@ -296,6 +296,33 @@ def test_the_narrative_chain_outlives_a_single_materialisation(pipeline_run) -> 
     assert dead.call_count == 1, "the breaker did not survive the first materialisation"
 
 
+def test_a_failing_asset_still_records_a_failed_run(
+    pipeline_run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review Focus 2, end to end: the log must not go quiet when the pipeline breaks."""
+    from dagster import build_asset_context
+
+    from adsignal.pipeline import assets as assets_module
+    from adsignal.warehouse.run_log import read_runs
+
+    _, settings = pipeline_run
+
+    before = len(read_runs(settings.postgres_dsn, limit=100))
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("induced failure")
+
+    monkeypatch.setattr(assets_module, "train_and_evaluate", _boom)
+
+    context = build_asset_context(resources={"settings": settings})
+    with pytest.raises(RuntimeError):
+        assets_module.trained_models(context)
+
+    after = read_runs(settings.postgres_dsn, limit=100)
+    assert len(after) > before
+    assert any(r.status == "failed" and r.detail == "RuntimeError" for r in after)
+
+
 def test_the_definitions_share_one_narrative_chain() -> None:
     """The deployed system gets the long-lived chain, not just the tests.
 
