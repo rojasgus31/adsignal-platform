@@ -1,0 +1,114 @@
+"""Pydantic response and request models for the API.
+
+These are the API's own DTOs, distinct from the warehouse's dataclasses
+(`SearchHit`, `StoredNarrative`, ...) and the pandas frames `reader.py`
+returns — the routers translate between the two.
+"""
+
+from datetime import date, datetime
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class CampaignSummary(BaseModel):
+    """One row of `GET /campaigns`."""
+
+    campaign_id: str
+    advertiser_id: str
+    channel: str
+
+
+class MetricPoint(BaseModel):
+    """One day of a campaign's metric time series."""
+
+    event_date: date
+    impressions: int
+    clicks: int
+    conversions: int
+    spend: float
+    revenue: float
+    is_anomaly: bool
+
+
+class CampaignMetrics(BaseModel):
+    """The full time series for one campaign, as returned by `GET /campaigns/{id}/metrics`."""
+
+    campaign_id: str
+    points: list[MetricPoint]
+
+
+class AnomalyOut(BaseModel):
+    """One row of `GET /anomalies`."""
+
+    campaign_id: str
+    event_date: date
+    cause: str
+    confidence: float
+    severity: int
+    escalate: bool
+    anomaly_score: float
+
+
+class ModelMetricsOut(BaseModel):
+    """One row of `GET /models`: a single training run's evaluation."""
+
+    run_id: str
+    trained_at: datetime
+    triage_accuracy: float
+    triage_macro_f1: float
+    detector_precision: float
+    detector_recall: float
+    detector_f1: float
+    detector_roc_auc: float
+
+
+class BenchmarkRun(BaseModel):
+    """One run's summary for the dashboard's comparison view."""
+
+    run_id: str
+    trained_at: datetime
+    triage_macro_f1: float
+    detector_roc_auc: float
+
+
+class BenchmarkOut(BaseModel):
+    """`GET /benchmark`: every run, plus which narrative provider answered most recently."""
+
+    runs: list[BenchmarkRun]
+    latest_narrative_provider: str | None = None
+
+
+class SearchRequest(BaseModel):
+    """`POST /search` body.
+
+    `limit` is bounded: an unbounded limit on a public demo is a
+    denial-of-service lever.
+    """
+
+    query: str = Field(min_length=1)
+    limit: int = Field(10, ge=1, le=50)
+    kind: str | None = None
+
+    @field_validator("query")
+    @classmethod
+    def _reject_blank_query(cls, value: str) -> str:
+        """A whitespace-only query is not a valid search, so it is a 422, not a
+        zero-hit 200 or an embedding-side `ValueError`."""
+        if not value.strip():
+            raise ValueError("query must not be blank")
+        return value
+
+
+class SearchHitOut(BaseModel):
+    """One nearest-neighbour hit."""
+
+    entity_kind: str
+    entity_id: str
+    text: str
+    distance: float
+
+
+class SearchResponse(BaseModel):
+    """`POST /search` response."""
+
+    hits: list[SearchHitOut]
