@@ -34,8 +34,11 @@ float64 is the standard representation for spend in analytics warehouses.
 this repository — they exist for the planned dashboard's vertical filtering,
 so their absence of a consumer today is intentional, not dead code.
 
-A full architecture decision record (`ARCHITECTURE.md`) is planned but not
-yet written.
+The full architecture decision record — why two stores, why the pipeline is
+precomputed, why the release gate is AUC and not recall, why `/ask` selects
+templates rather than generating SQL, and what the circuit breakers do and do
+not protect in the deployed topology — is in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Running the stack
 
@@ -54,6 +57,35 @@ local loop, set a smaller target:
 ```bash
 ADSIGNAL_TARGET_EVENTS=100000 docker compose up -d
 ```
+
+## Deployment
+
+The repository is not published and the service is not deployed yet, so there
+are no live links here. The intended topology is three free tiers:
+
+| Piece | Where | Why |
+|---|---|---|
+| Serving API | Render free web service | 512 MB container; 412 MB measured peak (see `ARCHITECTURE.md` §8) |
+| Serving Postgres | Neon free tier | 0.5 GB, serverless, which is why `warehouse/pool.py` validates connections before handing them out |
+| Nightly pipeline | GitHub Actions cron | No always-on daemon is available on a free tier; the job is a once-nightly batch with no latency requirement |
+
+The Actions runner is ephemeral, so the DuckDB file the pipeline builds
+vanishes with the job. `python -m adsignal.cli.load_marts` is the step that
+copies the built marts into hosted Postgres, which is what makes the result
+outlive the runner.
+
+Set `ADSIGNAL_TRUSTED_PROXY_HOPS=1` behind Render's edge (it terminates TLS
+and appends the peer it saw to `X-Forwarded-For`). Leave it at `0` anywhere
+the API is reached directly — too high lets a caller forge an address and
+evade the rate limiter.
+
+Set `ADSIGNAL_CORS_ORIGINS` to the exact dashboard origin. Wildcards are
+rejected by `Settings`, and empty means no browser may call the API at all.
+
+The API sleeps after 15 minutes idle on the free tier, so the first request
+after a quiet period waits out a cold start of roughly a minute. The nightly
+cron workflow itself is not committed yet; `ci.yml` and `eval.yml` are
+triggered by push and pull request.
 
 ## Pipeline stages
 
@@ -262,3 +294,44 @@ extending it would mean changing a contract several earlier tasks
 already depend on. `/ask` therefore resolves every question through the
 keyword matcher only, in every configuration; no provider is called
 from this endpoint today.
+
+## Deliberate cuts
+
+Things this project knowingly does not do, gathered in one place. Each is
+explained where it is implemented and, for the larger ones, in
+`ARCHITECTURE.md`.
+
+- **`/ask` does not generate SQL.** A keyword matcher picks among four named
+  templates; an unrecognised name is rejected before execution. Structural,
+  not sanitised.
+- **No LLM is involved in `/ask`'s template selection, in any
+  configuration.** `NarrativeProvider.generate(request: NarrativeRequest)`
+  takes a closed dataclass of precomputed statistics with no field for free
+  text, and that contract predates this endpoint.
+- **The release gate is triage macro F1 and detector ROC AUC — not recall.**
+  Recall on this detector moves with the dataset's anomaly rate, so it is
+  reported but never gated on.
+- **The detector is an F1-optimal pre-filter, not a recall-oriented one.**
+  Most real anomalies never reach the classifier. A lower-precision
+  pre-filter would make the triage output unusable.
+- **The end-to-end pipeline metrics are reported but not gated on.**
+- **Circuit breaker state does not survive a nightly run.** The chain is
+  built at module import, `dagster dev` runs each job in a fresh subprocess,
+  so the breakers reset every night and never skip anything in production.
+  The chain's total time budget is the real protection.
+- **The nightly cron workflow is not committed yet.** The Dagster
+  `ScheduleDefinition` and the `load_marts` entry point exist; the Actions
+  workflow that would drive them does not.
+- **Connection pooling is per-process only.** Two workers do not share
+  connections and their pool budgets add up against the database's ceiling.
+- **No authentication and no cookies.** The API is read-only and public;
+  `allow_credentials` is off and origins are named exactly.
+- **No keep-alive ping.** The free tier sleeps after 15 minutes idle and the
+  first visitor pays the cold start.
+- **`stg_creatives` and the advertiser dimension have no consumer here.**
+  They exist for the dashboard's planned vertical filtering.
+- **Drift monitoring is forty hand-written lines, not a library.** PSI and a
+  two-sample KS test, so every number is explainable.
+- **`scripts/measure_memory.py` is only correct inside the container.**
+  `ru_maxrss` is kilobytes on Linux and bytes on macOS; run on a macOS host
+  it reports a figure 1024x too small.

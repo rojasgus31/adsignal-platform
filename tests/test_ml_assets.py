@@ -269,6 +269,11 @@ def test_the_narrative_chain_outlives_a_single_materialisation(pipeline_run) -> 
     from one materialisation to the next, which is why the chain is a
     resource. With a threshold of one, the second run must skip the dead
     provider instead of calling it again.
+
+    This pins in-process sharing only. `dagster dev` launches each run in a
+    fresh subprocess, so breaker state does not survive between nightly runs
+    in the deployed topology; the chain-wide time budget is what caps a dead
+    provider's cost there. See ARCHITECTURE.md, "Circuit breakers".
     """
     from dagster import build_asset_context
 
@@ -292,7 +297,13 @@ def test_the_narrative_chain_outlives_a_single_materialisation(pipeline_run) -> 
 
 
 def test_the_definitions_share_one_narrative_chain() -> None:
-    """The deployed system gets the long-lived chain, not just the tests."""
+    """The deployed system gets the long-lived chain, not just the tests.
+
+    This pins in-process sharing only. `dagster dev` launches each run in a
+    fresh subprocess, so breaker state does not survive between nightly runs
+    in the deployed topology; the chain-wide time budget is what caps a dead
+    provider's cost there. See ARCHITECTURE.md, "Circuit breakers".
+    """
     from adsignal.narrative.chain import NarrativeChain
     from adsignal.pipeline.definitions import defs
 
