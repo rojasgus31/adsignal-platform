@@ -1,3 +1,14 @@
+import os
+
+import psycopg
+
+# Same pattern as every other DSN-driven test module: the env var is an
+# override, not a requirement.
+TEST_DSN = os.environ.get(
+    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
+)
+
+
 def test_health_reports_ok(client) -> None:
     response = client.get("/health")
     assert response.status_code == 200
@@ -113,3 +124,35 @@ def test_no_endpoint_response_contains_a_secret(client) -> None:
     """Keys must never reach a response body."""
     for path in ("/health", "/models", "/benchmark"):
         assert "api_key" not in client.get(path).text.lower()
+
+
+def test_ask_answers_a_known_question(client) -> None:
+    response = client.post("/ask", json={"question": "how many anomalies were there?"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["template"] in ("anomaly_count", "unknown")
+    assert "answer" in body
+
+
+def test_ask_rejects_a_template_it_does_not_know(client) -> None:
+    """Review Focus 5: only named templates may run. No free-form SQL exists."""
+    response = client.post(
+        "/ask", json={"question": "x", "template": "'; DROP TABLE fct_campaign_daily; --"}
+    )
+    assert response.status_code in (400, 422)
+
+    with psycopg.connect(TEST_DSN) as conn:
+        still_there = conn.execute("SELECT to_regclass('fct_campaign_daily')").fetchone()[0]
+    assert still_there is not None, "the table was dropped"
+
+
+def test_ask_is_rate_limited_per_ip(client) -> None:
+    """Review Focus 5: the only live path must be bounded."""
+    statuses = [
+        client.post("/ask", json={"question": "how many anomalies?"}).status_code for _ in range(30)
+    ]
+    assert 429 in statuses, "no request was ever rate-limited"
+
+
+def test_ask_rejects_a_blank_question(client) -> None:
+    assert client.post("/ask", json={"question": "   "}).status_code == 422

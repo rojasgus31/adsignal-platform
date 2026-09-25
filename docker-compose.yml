@@ -49,6 +49,40 @@ services:
         limits:
           memory: 2g
 
+  api:
+    build: .
+    command:
+      [
+        "uvicorn",
+        "adsignal.api.app:create_app",
+        "--factory",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@postgres:5432/adsignal
+      ADSIGNAL_DUCKDB_PATH: /app/data/adsignal.duckdb
+      ADSIGNAL_DATA_DIR: /app/data
+      ADSIGNAL_TARGET_EVENTS: ${ADSIGNAL_TARGET_EVENTS:-10000000}
+      ADSIGNAL_DBT_DIR: /app/dbt
+    ports:
+      - "8000:8000"
+    # Same order of magnitude as `pipeline`: the API loads one shared
+    # ~90 MB embedding model at startup (see `api/app.py`) plus FastAPI/
+    # uvicorn overhead, but does no dbt/DuckDB work, so it needs less
+    # headroom than the pipeline's 2g.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
 volumes:
   postgres_data:
   pipeline_data:

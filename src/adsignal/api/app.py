@@ -8,7 +8,7 @@ every router. Nothing here talks to Postgres directly — that stays inside
 
 from fastapi import FastAPI
 
-from adsignal.api.routes import anomalies, campaigns, health, models, search
+from adsignal.api.routes import anomalies, ask, campaigns, health, models, search
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
 
@@ -40,5 +40,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(anomalies.router)
     app.include_router(models.router)
     app.include_router(search.router)
+    app.include_router(ask.router)
 
     return app
