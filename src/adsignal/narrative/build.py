@@ -37,10 +37,5 @@ def build_chain(settings: Settings) -> NarrativeChain:
     if anthropic_key:
         providers.append(AnthropicProvider(anthropic_key, timeout=timeout))
 
-    providers.append(
-        StubProvider(
-            "Narrative generation is not configured; this is placeholder text.",
-            name="stub",
-        )
-    )
+    providers.append(StubProvider(name="stub"))
     return NarrativeChain(providers, total_budget_seconds=settings.narrative_budget_seconds)
