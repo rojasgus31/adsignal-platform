@@ -296,11 +296,11 @@ def campaign_embeddings(context: AssetExecutionContext) -> None:
 def daily_narrative(context: AssetExecutionContext) -> None:
     """Generate and store a narrative for the most recently scored day.
 
-    A missing narrative is a degraded dashboard, not a failed pipeline: every
-    provider failing (`AllProvidersFailed`, raised by `NarrativeChain.generate`
-    only once even the stub has been tried and failed) is caught here, logged,
-    and this asset returns without raising, so a narrative outage never blocks
-    the nightly job or any other downstream asset.
+    A missing narrative is a degraded dashboard, not a failed pipeline:
+    `AllProvidersFailed` - raised when every provider has failed, or when the
+    chain's total budget ran out before one answered - is caught here,
+    logged, and this asset returns without raising, so a narrative outage
+    never blocks the nightly job or any other downstream asset.
     """
     settings: Settings = context.resources.settings
     request = _build_narrative_request(settings.postgres_dsn)

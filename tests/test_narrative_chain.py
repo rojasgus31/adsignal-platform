@@ -108,3 +108,93 @@ def test_provider_order_is_preserved() -> None:
         ]
     )
     assert chain.generate(REQUEST).provider == "third"
+
+
+class _FakeClock:
+    """A monotonic clock the test advances by hand."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _ClockBurningProvider:
+    """A provider that succeeds, but only after consuming `seconds` of budget."""
+
+    def __init__(self, clock: _FakeClock, seconds: float, name: str) -> None:
+        self._clock = clock
+        self._seconds = seconds
+        self.name = name
+        self.calls = 0
+
+    def generate(self, request: NarrativeRequest) -> str:
+        self.calls += 1
+        self._clock.advance(self._seconds)
+        return f"{self.name} narrative"
+
+
+def test_a_provider_that_blows_the_total_budget_is_recorded_as_a_failure() -> None:
+    """Its answer is discarded, its breaker counts it, and the run stops.
+
+    Nothing else would ever open the breaker of a backend that is merely
+    slow, so a permanently stalling provider would be retried in full, with
+    its timeout, on every nightly run. The budget is a hard stop, so the
+    providers behind it are not tried either - the caller gets
+    `AllProvidersFailed`, which `daily_narrative` already degrades on.
+    """
+    clock = _FakeClock()
+    slow = _ClockBurningProvider(clock, seconds=30.0, name="slow")
+    chain = NarrativeChain(
+        [slow, StubProvider("fallback", name="fast")],
+        failure_threshold=1,
+        total_budget_seconds=10.0,
+        clock=clock,
+    )
+
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        chain.generate(REQUEST)
+    assert "slow (exceeded the chain budget)" in str(excinfo.value)
+    assert slow.calls == 1
+
+    # The breaker opened on that recorded failure, so the next run skips the
+    # slow provider without paying its cost again, and the fallback answers.
+    result = chain.generate(REQUEST)
+    assert result.provider == "fast"
+    assert slow.calls == 1
+
+
+def test_the_budget_is_spent_across_providers_not_per_provider() -> None:
+    """Once the budget is gone, the providers behind it are never called."""
+    clock = _FakeClock()
+    first = _ClockBurningProvider(clock, seconds=12.0, name="first")
+    second = _ClockBurningProvider(clock, seconds=12.0, name="second")
+    third = _ClockBurningProvider(clock, seconds=12.0, name="third")
+    chain = NarrativeChain([first, second, third], total_budget_seconds=10.0, clock=clock)
+
+    with pytest.raises(AllProvidersFailed) as excinfo:
+        chain.generate(REQUEST)
+
+    assert (first.calls, second.calls, third.calls) == (1, 0, 0)
+    assert "second (chain budget exhausted)" in str(excinfo.value)
+    assert "third (chain budget exhausted)" in str(excinfo.value)
+
+
+def test_a_provider_inside_the_budget_still_succeeds() -> None:
+    clock = _FakeClock()
+    quick = _ClockBurningProvider(clock, seconds=1.0, name="quick")
+    chain = NarrativeChain([quick], total_budget_seconds=10.0, clock=clock)
+
+    result = chain.generate(REQUEST)
+
+    assert result.provider == "quick"
+    assert result.latency_ms == pytest.approx(1000.0)
+
+
+def test_a_non_positive_budget_is_rejected() -> None:
+    with pytest.raises(ValueError, match="total_budget_seconds"):
+        NarrativeChain([StubProvider("x", name="a")], total_budget_seconds=0.0)

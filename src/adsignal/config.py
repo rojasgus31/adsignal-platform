@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     jev_api_key: SecretStr = SecretStr("")
     anthropic_api_key: SecretStr = SecretStr("")
     narrative_timeout_seconds: float = 20.0
+    # The chain's total deadline across every provider, distinct from the
+    # per-provider timeout above: four providers each allowed 20 s can stall
+    # the nightly job for 80 s or more without this. See `NarrativeChain`.
+    narrative_budget_seconds: float = 45.0
 
     @field_serializer("postgres_dsn", when_used="always")
     def _serialize_postgres_dsn(self, value: str) -> str:

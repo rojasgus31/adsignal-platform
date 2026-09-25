@@ -43,4 +43,4 @@ def build_chain(settings: Settings) -> NarrativeChain:
             name="stub",
         )
     )
-    return NarrativeChain(providers)
+    return NarrativeChain(providers, total_budget_seconds=settings.narrative_budget_seconds)
