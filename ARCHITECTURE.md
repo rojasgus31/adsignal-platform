@@ -234,8 +234,12 @@ repository is scheduled by cron at the time of writing.
 `/search`, and reports peak RSS. The measured figure, recorded in the `api`
 service's `deploy.resources.limits` comment in `docker-compose.yml`, is
 **412.0 MB peak after a cold start and one `/search`, against the 512 MB the
-free tier gives.** The script exits non-zero above 85% of the budget, so the
-headroom is a checked invariant rather than a note.
+free tier gives.** The script exits non-zero above 85% of the budget, which
+makes the headroom *checkable* on demand — but nothing invokes it: `git grep
+measure_memory` over `.github/` and `tests/` returns nothing. It is a manual
+script, so this is a measurement someone has to remember to take, not an
+invariant CI enforces. Wiring it in would need a container step in CI and is
+deliberately left out of this task.
 
 Almost all of that is the embedder: ~90 MB of int8 ONNX weights plus
 onnxruntime's arenas plus the interpreter. It is loaded **lazily** —
@@ -279,12 +283,32 @@ the API process entirely and serve `/search` from precomputed vectors only.
 
 ### A measurement trap
 
-`scripts/measure_memory.py` must be run **inside the container**. `ru_maxrss`
-is reported in kilobytes on Linux and in *bytes* on macOS, and the script
-divides by 1024 unconditionally. Run on a macOS host it reports a figure
-1024× too small, and it also misses the container's interpreter, onnxruntime
-arenas and loaded model. The docstring says "run inside the container"; this
-is why.
+`scripts/measure_memory.py` must be run **inside the container**, for two
+independent reasons.
+
+The first is a unit bug waiting to happen. `ru_maxrss` is reported in
+kilobytes on Linux and in *bytes* on macOS, and `peak_rss_mb()` divides by
+1024 unconditionally. On Linux that is kilobytes → MB, which is right. On a
+macOS host it is bytes → kilobytes printed under an MB label, so the figure
+comes out **1024× too large**:
+
+```
+true peak                412.0 MB
+macOS ru_maxrss      432013312 bytes
+printed by the script   421888.0 "MB"
+```
+
+Too large, not too small — worth being precise about, because the failure is
+loud rather than quiet. Nobody believes a 421,888 MB process, so the mistake
+announces itself. A reader who expected an implausibly *small* number would be
+hunting for the wrong symptom, and might accept a plausible-looking wrong
+figure instead.
+
+The second reason is that a host-side measurement misses the container's
+interpreter, onnxruntime's arenas and the loaded model, so even on Linux it
+answers a different question than the one the 512 MB limit asks. The script's
+docstring originally gave only this second reason; it now states both, so a
+reader who follows the citation finds the unit trap there too.
 
 ---
 

@@ -67,7 +67,7 @@ are no live links here. The intended topology is three free tiers:
 |---|---|---|
 | Serving API | Render free web service | 512 MB container; 412 MB measured peak (see `ARCHITECTURE.md` §8) |
 | Serving Postgres | Neon free tier | 0.5 GB, serverless, which is why `warehouse/pool.py` validates connections before handing them out |
-| Nightly pipeline | GitHub Actions cron | No always-on daemon is available on a free tier; the job is a once-nightly batch with no latency requirement |
+| Nightly pipeline | GitHub Actions cron — **planned, not committed** | No always-on daemon is available on a free tier; the job is a once-nightly batch with no latency requirement. No `schedule:` workflow exists yet (see below) |
 
 The Actions runner is ephemeral, so the DuckDB file the pipeline builds
 vanishes with the job. `python -m adsignal.cli.load_marts` is the step that
@@ -333,5 +333,9 @@ explained where it is implemented and, for the larger ones, in
 - **Drift monitoring is forty hand-written lines, not a library.** PSI and a
   two-sample KS test, so every number is explainable.
 - **`scripts/measure_memory.py` is only correct inside the container.**
-  `ru_maxrss` is kilobytes on Linux and bytes on macOS; run on a macOS host
-  it reports a figure 1024x too small.
+  `ru_maxrss` is kilobytes on Linux and bytes on macOS, and the script divides
+  by 1024 either way; run on a macOS host it reports a figure 1024x too
+  **large** (412 MB reads as 421,888 "MB"). It also misses the container's
+  interpreter, onnxruntime arenas and loaded model.
+- **Nothing runs that script automatically.** The 512 MB headroom is
+  checkable on demand, not enforced by CI.

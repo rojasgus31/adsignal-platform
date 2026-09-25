@@ -28,7 +28,7 @@ class EmbeddingModel:
     dispatches it to the anyio worker threadpool where several requests run
     genuinely concurrently; an unsynchronised lazy attribute would let each
     of the first concurrent requests construct its own `TextEmbedding`,
-    transiently holding several ~90 MB models inside a 1 GB container. The
+    transiently holding several ~90 MB models inside a 512 MB container. The
     double-checked read means the lock is taken once, on the cold path, and
     never on the hot one.
     """

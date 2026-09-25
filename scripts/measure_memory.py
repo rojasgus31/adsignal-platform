@@ -1,7 +1,16 @@
 """Report the API's resident memory after a cold start and one /search.
 
-Run inside the container so the figure includes the interpreter, onnxruntime's
-arenas and the loaded model — a host-side measurement misses all three.
+Run inside the container, for two independent reasons.
+
+First, the figure is only meaningful there: it needs to include the
+interpreter, onnxruntime's arenas and the loaded model, and a host-side
+measurement misses all three.
+
+Second, `peak_rss_mb` below is only correct on Linux. `ru_maxrss` is
+kilobytes on Linux and *bytes* on macOS, and the conversion divides by 1024
+either way. Run on a macOS host this over-reports by 1024x — a 412 MB peak
+prints as 421888.0 "MB" — which is loud enough to notice, but only if you
+know to look.
 """
 
 import os
@@ -12,7 +21,12 @@ from fastapi.testclient import TestClient
 
 
 def peak_rss_mb() -> float:
-    """Peak resident set size in MB. On Linux ru_maxrss is in kilobytes."""
+    """Peak resident set size in MB, assuming Linux.
+
+    `ru_maxrss` is kilobytes on Linux, so dividing by 1024 gives MB. On macOS
+    it is bytes and this returns kilobytes mislabelled as MB — see the module
+    docstring. Run this inside the container.
+    """
     kilobytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return kilobytes / 1024
 
