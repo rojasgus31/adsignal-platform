@@ -47,6 +47,10 @@ class GeminiProvider:
             raise RuntimeError(
                 f"gemini returned {error.response.status_code} (url REDACTED, key REDACTED)"
             ) from None
+        except httpx.TimeoutException:
+            raise RuntimeError("gemini request timed out (url REDACTED, key REDACTED)") from None
+        except httpx.ConnectError:
+            raise RuntimeError("gemini connection failed (url REDACTED, key REDACTED)") from None
         except httpx.HTTPError:
             raise RuntimeError("gemini request failed (url REDACTED, key REDACTED)") from None
         finally:

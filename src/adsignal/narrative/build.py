@@ -20,14 +20,22 @@ def build_chain(settings: Settings) -> NarrativeChain:
     providers: list[NarrativeProvider] = []
     timeout = settings.narrative_timeout_seconds
 
-    if settings.gemini_api_key:
-        providers.append(GeminiProvider(settings.gemini_api_key, timeout=timeout))
-    if settings.groq_api_key:
-        providers.append(GroqProvider(settings.groq_api_key, timeout=timeout))
-    if settings.jev_api_key:
-        providers.append(JevProvider(settings.jev_api_key, timeout=timeout))
-    if settings.anthropic_api_key:
-        providers.append(AnthropicProvider(settings.anthropic_api_key, timeout=timeout))
+    # Extract each secret exactly once and check the plain string it unwraps
+    # to, not the SecretStr wrapper: this is the one call site allowed to see
+    # the raw key.
+    gemini_key = settings.gemini_api_key.get_secret_value()
+    groq_key = settings.groq_api_key.get_secret_value()
+    jev_key = settings.jev_api_key.get_secret_value()
+    anthropic_key = settings.anthropic_api_key.get_secret_value()
+
+    if gemini_key:
+        providers.append(GeminiProvider(gemini_key, timeout=timeout))
+    if groq_key:
+        providers.append(GroqProvider(groq_key, timeout=timeout))
+    if jev_key:
+        providers.append(JevProvider(jev_key, timeout=timeout))
+    if anthropic_key:
+        providers.append(AnthropicProvider(anthropic_key, timeout=timeout))
 
     providers.append(
         StubProvider(

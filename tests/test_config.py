@@ -36,3 +36,21 @@ def test_settings_read_env_with_prefix(monkeypatch) -> None:
     settings = Settings()
     assert settings.target_events == 5000
     assert settings.seed == 7
+
+
+def test_settings_repr_never_contains_a_secret() -> None:
+    """An unhandled exception, debug endpoint, or reload error page can all end
+    up printing a `Settings` instance. None of its credential fields may show
+    up in that text.
+    """
+    sentinel = "sk-super-secret-key-do-not-leak"
+    settings = Settings(
+        _env_file=None,
+        postgres_dsn=f"postgresql://adsignal:{sentinel}@localhost:5432/adsignal",
+        gemini_api_key=sentinel,
+        groq_api_key=sentinel,
+        jev_api_key=sentinel,
+        anthropic_api_key=sentinel,
+    )
+    assert sentinel not in repr(settings)
+    assert sentinel not in str(settings)

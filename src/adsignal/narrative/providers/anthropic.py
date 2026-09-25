@@ -53,6 +53,14 @@ class AnthropicProvider:
             raise RuntimeError(
                 f"anthropic returned {error.response.status_code} (headers REDACTED, key REDACTED)"
             ) from None
+        except httpx.TimeoutException:
+            raise RuntimeError(
+                "anthropic request timed out (headers REDACTED, key REDACTED)"
+            ) from None
+        except httpx.ConnectError:
+            raise RuntimeError(
+                "anthropic connection failed (headers REDACTED, key REDACTED)"
+            ) from None
         except httpx.HTTPError:
             raise RuntimeError(
                 "anthropic request failed (headers REDACTED, key REDACTED)"

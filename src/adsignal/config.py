@@ -9,6 +9,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,15 +24,23 @@ class Settings(BaseSettings):
     end_date: date = date(2025, 12, 31)
     data_dir: Path = Path("data")
     duckdb_path: Path = Path("data/adsignal.duckdb")
-    postgres_dsn: str = "postgresql://adsignal:adsignal@localhost:5432/adsignal"
+    # repr=False: this DSN carries a live credential. str stays (dozens of call
+    # sites across warehouse/ and pipeline/ read it as a plain string), but it
+    # must never be printed by a default dataclass-style repr or str.
+    postgres_dsn: str = Field(
+        default="postgresql://adsignal:adsignal@localhost:5432/adsignal", repr=False
+    )
     # Override for the dbt project location when running inside a container.
     # Not used in this task; consumed by a later task.
     dbt_dir: Path | None = None
     mlflow_dir: Path = Path("mlruns")
-    gemini_api_key: str = ""
-    groq_api_key: str = ""
-    jev_api_key: str = ""
-    anthropic_api_key: str = ""
+    # SecretStr: only build_chain() reads these, and .get_secret_value() there
+    # is the one place the raw key is ever extracted. SecretStr also blocks
+    # accidental f-string interpolation, not just repr/str.
+    gemini_api_key: SecretStr = SecretStr("")
+    groq_api_key: SecretStr = SecretStr("")
+    jev_api_key: SecretStr = SecretStr("")
+    anthropic_api_key: SecretStr = SecretStr("")
     narrative_timeout_seconds: float = 20.0
 
     @property

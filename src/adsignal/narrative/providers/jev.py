@@ -63,6 +63,10 @@ class JevProvider:
             raise RuntimeError(
                 f"jev returned {error.response.status_code} (headers REDACTED, key REDACTED)"
             ) from None
+        except httpx.TimeoutException:
+            raise RuntimeError("jev request timed out (headers REDACTED, key REDACTED)") from None
+        except httpx.ConnectError:
+            raise RuntimeError("jev connection failed (headers REDACTED, key REDACTED)") from None
         except httpx.HTTPError:
             raise RuntimeError("jev request failed (headers REDACTED, key REDACTED)") from None
         finally:

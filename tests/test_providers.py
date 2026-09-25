@@ -36,6 +36,15 @@ def _failing_client() -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
+def _timing_out_client() -> httpx.Client:
+    """A client whose transport raises a timeout carrying the URL."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"timed out: {request.url}", request=request)
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
 def test_prompt_contains_the_facts_and_no_raw_rows() -> None:
     prompt = build_prompt(REQUEST)
     assert "2024-06-01" in prompt
@@ -81,6 +90,18 @@ def test_gemini_connection_error_never_contains_the_api_key() -> None:
 
     message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
     assert SECRET not in message, "the API key leaked into the error message"
+    assert "connection" in message.lower()
+
+
+def test_gemini_timeout_never_contains_the_api_key() -> None:
+    """A timeout is a distinct failure category from a refused connection."""
+    provider = GeminiProvider(api_key=SECRET, client=_timing_out_client())
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011
+        provider.generate(REQUEST)
+
+    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    assert SECRET not in message, "the API key leaked into the error message"
+    assert "timed out" in message.lower()
 
 
 def test_gemini_raises_on_an_unexpected_payload_shape() -> None:
@@ -125,6 +146,17 @@ def test_groq_connection_error_never_contains_the_api_key() -> None:
 
     message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
     assert SECRET not in message, "the API key leaked into the error message"
+    assert "connection" in message.lower()
+
+
+def test_groq_timeout_never_contains_the_api_key() -> None:
+    provider = GroqProvider(api_key=SECRET, client=_timing_out_client())
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011
+        provider.generate(REQUEST)
+
+    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    assert SECRET not in message, "the API key leaked into the error message"
+    assert "timed out" in message.lower()
 
 
 def test_groq_raises_on_an_unexpected_payload_shape() -> None:
@@ -167,6 +199,17 @@ def test_jev_connection_error_never_contains_the_api_key() -> None:
 
     message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
     assert SECRET not in message, "the API key leaked into the error message"
+    assert "connection" in message.lower()
+
+
+def test_jev_timeout_never_contains_the_api_key() -> None:
+    provider = JevProvider(api_key=SECRET, client=_timing_out_client())
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011
+        provider.generate(REQUEST)
+
+    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    assert SECRET not in message, "the API key leaked into the error message"
+    assert "timed out" in message.lower()
 
 
 def test_jev_raises_on_an_unexpected_payload_shape() -> None:
@@ -211,6 +254,17 @@ def test_anthropic_connection_error_never_contains_the_api_key() -> None:
 
     message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
     assert SECRET not in message, "the API key leaked into the error message"
+    assert "connection" in message.lower()
+
+
+def test_anthropic_timeout_never_contains_the_api_key() -> None:
+    provider = AnthropicProvider(api_key=SECRET, client=_timing_out_client())
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011
+        provider.generate(REQUEST)
+
+    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    assert SECRET not in message, "the API key leaked into the error message"
+    assert "timed out" in message.lower()
 
 
 def test_anthropic_raises_on_an_unexpected_payload_shape() -> None:

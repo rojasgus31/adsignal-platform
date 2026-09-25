@@ -48,6 +48,10 @@ class GroqProvider:
             raise RuntimeError(
                 f"groq returned {error.response.status_code} (headers REDACTED, key REDACTED)"
             ) from None
+        except httpx.TimeoutException:
+            raise RuntimeError("groq request timed out (headers REDACTED, key REDACTED)") from None
+        except httpx.ConnectError:
+            raise RuntimeError("groq connection failed (headers REDACTED, key REDACTED)") from None
         except httpx.HTTPError:
             raise RuntimeError("groq request failed (headers REDACTED, key REDACTED)") from None
         finally:
