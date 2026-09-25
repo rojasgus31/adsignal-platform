@@ -1,7 +1,7 @@
 """The one training recipe: build features, split, fit both models, evaluate.
 
 `adsignal.pipeline.assets.trained_models` (the Dagster asset) and
-`adsignal.ml.gate` (the CI entry point) both need to do exactly this - and
+`adsignal.cli.quality_gate` (the CI entry point) both need to do exactly this - and
 before this module existed, they each did it independently, in eleven
 near-identical lines. That let them silently diverge: `assets.py` passed
 `baseline_window=7` explicitly while `gate.py` relied on `build_features`'s

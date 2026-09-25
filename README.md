@@ -145,7 +145,7 @@ alarms. The headline triage macro F1 (0.8118) is measured on the
 classifier's best case (true anomalies only) — the end-to-end numbers are
 the honest picture of what the pipeline pages a human about. Exact figures
 move slightly run to run as the models retrain; run `uv run python -m
-adsignal.ml.gate` for the current ones.
+adsignal.cli.quality_gate` for the current ones.
 
 ### Model features
 

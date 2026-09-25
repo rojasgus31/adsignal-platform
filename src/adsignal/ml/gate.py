@@ -1,8 +1,15 @@
-"""CI entry point: train, evaluate, and fail the build on a quality regression.
+"""The model quality gate: does a training run clear both committed floors?
 
-Run as `python -m adsignal.ml.gate`. Exits non-zero when triage macro F1 falls
-below the committed floor, or when the detector's ROC AUC falls below its own
-floor, so a model regression cannot reach main unnoticed.
+Pure policy over a `TrainingResult`. It reads no configuration and touches no
+database — `ml/` must not import `config`, `warehouse`, `pipeline` or `api`,
+and this module previously broke that rule twice, which made the quality gate
+untestable without an environment and a populated mart. The composition root
+that supplies the mart and turns this into an exit code lives in
+`adsignal.cli.quality_gate` (`python -m adsignal.cli.quality_gate`).
+
+The gate fails when triage macro F1 falls below the committed floor, or when
+the detector's ROC AUC falls below its own floor, so a model regression
+cannot reach main unnoticed.
 
 The detector is gated separately from the classifier because it is a hard
 pre-filter: the scoring asset only triages the rows the detector flags. A
@@ -32,70 +39,69 @@ holdout's true anomalies directly, which is what `evaluate_triage` alone
 would show. See `adsignal.ml.evaluation.evaluate_pipeline`.
 """
 
-import sys
+from adsignal.ml.evaluation import (
+    MINIMUM_DETECTOR_AUC,
+    MINIMUM_MACRO_F1,
+    DetectorMetrics,
+    PipelineMetrics,
+    TriageMetrics,
+)
+from adsignal.ml.training import TrainingResult
 
-from adsignal.config import get_settings
-from adsignal.ml.evaluation import MINIMUM_DETECTOR_AUC, MINIMUM_MACRO_F1
-from adsignal.ml.training import train_and_evaluate
-from adsignal.warehouse.reader import read_campaign_daily
+
+def report_lines(result: TrainingResult) -> list[str]:
+    """Render the full human-readable report for one training run."""
+    return [
+        *_triage_lines(result.triage_metrics),
+        *_detector_lines(result.detector_metrics),
+        "",
+        "--- end-to-end (detector -> classifier, as production runs it) ---",
+        *_pipeline_lines(result.pipeline_metrics),
+    ]
 
 
-def main() -> int:
-    """Train on the mart, evaluate on the holdout, and gate on both models."""
-    settings = get_settings()
-    result = train_and_evaluate(read_campaign_daily(settings.postgres_dsn), seed=settings.seed)
-    triage_metrics = result.triage_metrics
-    detector_metrics = result.detector_metrics
-    pipeline_metrics = result.pipeline_metrics
-
-    print(f"triage macro F1: {triage_metrics.macro_f1:.4f} (floor {MINIMUM_MACRO_F1})")
-    print(f"triage accuracy: {triage_metrics.accuracy:.4f} over {triage_metrics.n_samples} samples")
-    for cause, score in sorted(triage_metrics.per_class_f1.items()):
-        print(f"  {cause}: {score:.4f}")
-
-    print(f"detector ROC AUC: {detector_metrics.roc_auc:.4f} (floor {MINIMUM_DETECTOR_AUC})")
-    print(
-        f"detector precision: {detector_metrics.precision:.4f}, "
-        f"recall: {detector_metrics.recall:.4f}, "
-        f"F1: {detector_metrics.f1:.4f}, "
-        f"flagged {detector_metrics.n_flagged} of {detector_metrics.n_samples} samples"
-    )
-
-    print("\n--- end-to-end (detector -> classifier, as production runs it) ---")
-    print(
-        f"flagged {pipeline_metrics.n_flagged} rows, "
-        f"{pipeline_metrics.n_true_anomalies_flagged} of them true anomalies "
-        f"(flagged precision {pipeline_metrics.flagged_precision:.4f})"
-    )
-    print(
-        f"cause accuracy on flagged true anomalies: "
-        f"{pipeline_metrics.cause_accuracy_on_true_positives:.4f}"
-    )
-    print(
-        f"escalated {pipeline_metrics.n_escalated} rows, "
-        f"false-alarm rate among them: {pipeline_metrics.false_alarm_rate_among_escalations:.4f}"
-    )
-
-    triage_ok = triage_metrics.meets_gate()
-    detector_ok = detector_metrics.meets_gate()
-
-    if not triage_ok:
-        print(
-            f"FAIL: triage macro F1 {triage_metrics.macro_f1:.4f} "
-            f"is below the floor {MINIMUM_MACRO_F1}"
+def gate_failures(result: TrainingResult) -> list[str]:
+    """Return one line per breached floor. Empty means the run passes."""
+    failures: list[str] = []
+    triage = result.triage_metrics
+    detector = result.detector_metrics
+    if not triage.meets_gate():
+        failures.append(
+            f"FAIL: triage macro F1 {triage.macro_f1:.4f} is below the floor {MINIMUM_MACRO_F1}"
         )
-    if not detector_ok:
-        print(
-            f"FAIL: detector ROC AUC {detector_metrics.roc_auc:.4f} "
+    if not detector.meets_gate():
+        failures.append(
+            f"FAIL: detector ROC AUC {detector.roc_auc:.4f} "
             f"is below the floor {MINIMUM_DETECTOR_AUC}"
         )
-
-    if not (triage_ok and detector_ok):
-        return 1
-
-    print("PASS")
-    return 0
+    return failures
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+def _triage_lines(triage: TriageMetrics) -> list[str]:
+    return [
+        f"triage macro F1: {triage.macro_f1:.4f} (floor {MINIMUM_MACRO_F1})",
+        f"triage accuracy: {triage.accuracy:.4f} over {triage.n_samples} samples",
+        *(f"  {cause}: {score:.4f}" for cause, score in sorted(triage.per_class_f1.items())),
+    ]
+
+
+def _detector_lines(detector: DetectorMetrics) -> list[str]:
+    return [
+        f"detector ROC AUC: {detector.roc_auc:.4f} (floor {MINIMUM_DETECTOR_AUC})",
+        f"detector precision: {detector.precision:.4f}, "
+        f"recall: {detector.recall:.4f}, "
+        f"F1: {detector.f1:.4f}, "
+        f"flagged {detector.n_flagged} of {detector.n_samples} samples",
+    ]
+
+
+def _pipeline_lines(pipeline: PipelineMetrics) -> list[str]:
+    return [
+        f"flagged {pipeline.n_flagged} rows, "
+        f"{pipeline.n_true_anomalies_flagged} of them true anomalies "
+        f"(flagged precision {pipeline.flagged_precision:.4f})",
+        f"cause accuracy on flagged true anomalies: "
+        f"{pipeline.cause_accuracy_on_true_positives:.4f}",
+        f"escalated {pipeline.n_escalated} rows, "
+        f"false-alarm rate among them: {pipeline.false_alarm_rate_among_escalations:.4f}",
+    ]

@@ -52,4 +52,4 @@ jobs:
         env:
           ADSIGNAL_TARGET_EVENTS: 200000
           ADSIGNAL_POSTGRES_DSN: postgresql://adsignal:adsignal@localhost:5432/adsignal
-        run: uv run python -m adsignal.ml.gate
+        run: uv run python -m adsignal.cli.quality_gate

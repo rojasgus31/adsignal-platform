@@ -127,7 +127,7 @@ def trained_models(context: AssetExecutionContext) -> None:
     """Train both models on a temporal split of the mart and record the run.
 
     Feature building, the split, fitting, and evaluation all live in
-    `adsignal.ml.training.train_and_evaluate` - the same recipe `adsignal.ml.gate`
+    `adsignal.ml.training.train_and_evaluate` - the same recipe `adsignal.cli.quality_gate`
     uses, so the CI gate can never certify a model trained differently from
     the one this asset produces (I7).
     """
