@@ -64,6 +64,18 @@ def _record(context: AssetExecutionContext, settings: Settings) -> Iterator[_Run
     `detail` gets the exception's TYPE name only, never `str(error)`: a
     message can carry a DSN, and this row is served by a public endpoint
     later in this plan.
+
+    Catches `BaseException`, not `Exception`: a run killed on an ephemeral CI
+    runner (SIGTERM, a Dagster-level cancellation) unwinds as a direct
+    `BaseException` subclass, not an `Exception`, and that cancellation is
+    exactly the case this table exists to record. Letting it fall through to
+    `except Exception` would write a `"succeeded"` row for a run that was
+    killed - a lie that is worse than a missing row.
+
+    The `record_run` call itself is guarded: a logging failure (the serving
+    Postgres being unreachable) must never mask the asset's real exception by
+    replacing it in the `finally`, and must never fail an otherwise-successful
+    asset. The log degrades; the pipeline does not.
     """
     counter = _RunCounter()
     started = datetime.now(UTC)
@@ -71,22 +83,25 @@ def _record(context: AssetExecutionContext, settings: Settings) -> Iterator[_Run
     status, detail = "succeeded", ""
     try:
         yield counter
-    except Exception as error:
+    except BaseException as error:  # not Exception - see docstring
         status, detail = "failed", type(error).__name__
         raise
     finally:
-        record_run(
-            settings.postgres_dsn,
-            RunEntry(
-                run_id=context.run_id,
-                asset=context.asset_key.to_user_string(),
-                started_at=started,
-                duration_seconds=time.monotonic() - clock,
-                rows_written=counter.rows,
-                status=status,
-                detail=detail,
-            ),
-        )
+        try:
+            record_run(
+                settings.postgres_dsn,
+                RunEntry(
+                    run_id=context.run_id,
+                    asset=context.asset_key.to_user_string(),
+                    started_at=started,
+                    duration_seconds=time.monotonic() - clock,
+                    rows_written=counter.rows,
+                    status=status,
+                    detail=detail,
+                ),
+            )
+        except Exception as log_error:  # noqa: BLE001 - logging must never break the asset
+            context.log.warning(f"could not record run: {type(log_error).__name__}")
 
 
 _DEFAULT_DBT_DIR = Path(__file__).resolve().parents[3] / "dbt"
@@ -138,7 +153,7 @@ def catalog_and_raw_events(context: AssetExecutionContext) -> None:
                 catalog=catalog,
             )
 
-        counter.rows = row_count
+        counter.rows = row_count + label_count
         context.add_output_metadata(
             {
                 "row_count": MetadataValue.int(row_count),
@@ -157,9 +172,13 @@ def catalog_and_raw_events(context: AssetExecutionContext) -> None:
 def dbt_marts(context: AssetExecutionContext) -> None:
     """Run `dbt build`, which materializes the models and runs the data tests."""
     settings: Settings = context.resources.settings
-    with _record(context, settings):
+    with _record(context, settings) as counter:
         project_dir = _dbt_project_dir(settings)
         run_dbt(project_dir=project_dir, duckdb_path=settings.duckdb_path, command="build")
+        with open_duckdb(settings.duckdb_path) as conn:
+            row = conn.execute("SELECT count(*) FROM main_marts.fct_campaign_daily").fetchone()
+            assert row is not None
+            counter.rows = int(row[0])
         context.add_output_metadata({"dbt_project": MetadataValue.path(str(project_dir))})
 
 
@@ -396,7 +415,7 @@ def daily_narrative(context: AssetExecutionContext) -> None:
             # message the same way precisely so a provider's error detail (which
             # could echo back an API key) never reaches a log line or a stored
             # row, and logging `error` directly here would undo that.
-            context.log.warning(f"narrative generation failed: {type(error).__name__}: {error}")
+            context.log.warning(f"narrative generation failed: {type(error).__name__}")
             return
 
         write_narrative(settings.postgres_dsn, request.as_of, result)

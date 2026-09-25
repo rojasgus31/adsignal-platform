@@ -299,7 +299,17 @@ def test_the_narrative_chain_outlives_a_single_materialisation(pipeline_run) -> 
 def test_a_failing_asset_still_records_a_failed_run(
     pipeline_run, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Review Focus 2, end to end: the log must not go quiet when the pipeline breaks."""
+    """Review Focus 2, end to end: the log must not go quiet when the pipeline breaks.
+
+    `pipeline_runs` is append-only and never truncated by this module, so
+    comparing row *counts* capped at a fixed page (`limit=100`) stops being
+    meaningful once the table passes that many rows - both `before` and
+    `after` would read 100 forever. Scoping the assertion to rows for this
+    asset started at or after this test's own `datetime.now(UTC)` marker
+    finds the row this test caused, however many other rows already exist.
+    """
+    from datetime import UTC, datetime
+
     from dagster import build_asset_context
 
     from adsignal.pipeline import assets as assets_module
@@ -307,7 +317,7 @@ def test_a_failing_asset_still_records_a_failed_run(
 
     _, settings = pipeline_run
 
-    before = len(read_runs(settings.postgres_dsn, limit=100))
+    marker = datetime.now(UTC)
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("induced failure")
@@ -318,9 +328,13 @@ def test_a_failing_asset_still_records_a_failed_run(
     with pytest.raises(RuntimeError):
         assets_module.trained_models(context)
 
-    after = read_runs(settings.postgres_dsn, limit=100)
-    assert len(after) > before
-    assert any(r.status == "failed" and r.detail == "RuntimeError" for r in after)
+    recent = [
+        r
+        for r in read_runs(settings.postgres_dsn, limit=100)
+        if r.asset == "trained_models" and r.started_at >= marker
+    ]
+    assert recent, "no trained_models row was recorded for this test's run"
+    assert any(r.status == "failed" and r.detail == "RuntimeError" for r in recent)
 
 
 def test_the_definitions_share_one_narrative_chain() -> None:
