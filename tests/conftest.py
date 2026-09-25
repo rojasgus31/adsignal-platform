@@ -12,6 +12,7 @@ from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
 from adsignal.generator.models import ANOMALY_CAUSES
+from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 _DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
@@ -103,6 +104,37 @@ def small_dataset(tmp_path: Path):
     write_labels_parquet(injector.labels, labels_path)
 
     return catalog, events_path, labels_path
+
+
+@pytest.fixture
+def built_duckdb(tmp_path: Path) -> Path:
+    """Generate a small dataset, load it into DuckDB, and run dbt on it.
+
+    Returns the path to a DuckDB file whose `main_staging` models exist, for
+    tests that read from the staging layer rather than from Postgres.
+    """
+    catalog = build_catalog(
+        seed=99,
+        n_advertisers=3,
+        campaigns_per_advertiser=3,
+        creatives_per_campaign=2,
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 6, 30),
+    )
+    injector = AnomalyInjector(seed=99, rate=0.08)
+    events_path = tmp_path / "raw_events.parquet"
+    labels_path = tmp_path / "anomaly_labels.parquet"
+
+    write_events_parquet(injector.rows(generate_events(catalog, seed=99)), events_path)
+    write_labels_parquet(injector.labels, labels_path)
+
+    duckdb_path = tmp_path / "built.duckdb"
+    with open_duckdb(duckdb_path) as conn:
+        register_sources(conn, events_path=events_path, labels_path=labels_path, catalog=catalog)
+
+    run_dbt(project_dir=_DBT_DIR, duckdb_path=duckdb_path, command="build")
+
+    return duckdb_path
 
 
 @pytest.fixture

@@ -9,6 +9,7 @@ from adsignal.config import Settings
 from adsignal.pipeline.assets import (
     anomaly_scores,
     campaign_daily_mart,
+    campaign_embeddings,
     catalog_and_raw_events,
     dbt_marts,
     drift_report,
@@ -140,3 +141,16 @@ def test_definitions_expose_the_ml_assets() -> None:
 
     keys = {key.to_user_string() for key in defs.resolve_asset_graph().get_all_asset_keys()}
     assert {"trained_models", "anomaly_scores", "drift_report"} <= keys
+
+
+def test_embedding_asset_writes_vectors(settings) -> None:
+    result = materialize(
+        [catalog_and_raw_events, dbt_marts, campaign_daily_mart, campaign_embeddings],
+        resources={"settings": settings},
+    )
+    assert result.success
+
+    metadata = result.asset_materializations_for_node("campaign_embeddings")[0].metadata
+    assert metadata["rows_written"].value > 0
+    assert metadata["campaigns"].value > 0
+    assert metadata["creatives"].value > 0

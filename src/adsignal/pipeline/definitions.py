@@ -6,6 +6,7 @@ from adsignal.config import get_settings
 from adsignal.pipeline.assets import (
     anomaly_scores,
     campaign_daily_mart,
+    campaign_embeddings,
     catalog_and_raw_events,
     dbt_marts,
     drift_report,
@@ -21,6 +22,7 @@ adsignal_daily = define_asset_job(
         trained_models,
         anomaly_scores,
         drift_report,
+        campaign_embeddings,
     ],
 )
 
@@ -38,6 +40,7 @@ defs = Definitions(
         trained_models,
         anomaly_scores,
         drift_report,
+        campaign_embeddings,
     ],
     jobs=[adsignal_daily],
     schedules=[daily_schedule],

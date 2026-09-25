@@ -15,6 +15,7 @@ from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
 from adsignal.ml.detector import DETECTOR_FEATURES
 from adsignal.ml.drift import feature_drift
+from adsignal.ml.embeddings import EmbeddingModel
 from adsignal.ml.features import build_features
 from adsignal.ml.registry import load_models, log_training_run
 from adsignal.ml.splits import temporal_split
@@ -27,6 +28,8 @@ from adsignal.warehouse.metrics_store import (
     write_predictions,
 )
 from adsignal.warehouse.reader import read_campaign_daily
+from adsignal.warehouse.text_source import read_entity_text
+from adsignal.warehouse.vector_store import EmbeddingRow, upsert_embeddings
 from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 _DEFAULT_DBT_DIR = Path(__file__).resolve().parents[3] / "dbt"
@@ -246,3 +249,36 @@ def _latest_run(settings: Settings) -> tuple[str, Path]:
             "cleaned up separately from its model_metrics row"
         )
     return run_id, artifact_uri
+
+
+@asset(
+    deps=[dbt_marts],
+    required_resource_keys={"settings"},
+    description="Embeddings for campaign names and creative headlines, in pgvector",
+)
+def campaign_embeddings(context: AssetExecutionContext) -> None:
+    """Embed staging text and upsert the vectors into Postgres."""
+    settings: Settings = context.resources.settings
+
+    entities = read_entity_text(settings.duckdb_path)
+    if not entities:
+        context.add_output_metadata({"rows_written": MetadataValue.int(0)})
+        return
+
+    model = EmbeddingModel()
+    vectors = model.embed([entity.text for entity in entities])
+
+    written = upsert_embeddings(
+        settings.postgres_dsn,
+        [
+            EmbeddingRow(entity.entity_kind, entity.entity_id, entity.text, vector)
+            for entity, vector in zip(entities, vectors, strict=True)
+        ],
+    )
+    context.add_output_metadata(
+        {
+            "rows_written": MetadataValue.int(written),
+            "campaigns": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "campaign")),
+            "creatives": MetadataValue.int(sum(1 for e in entities if e.entity_kind == "creative")),
+        }
+    )
