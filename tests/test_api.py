@@ -165,5 +165,15 @@ def test_ask_is_rate_limited_per_ip(client) -> None:
     assert 429 in statuses, "no request was ever rate-limited"
 
 
+def test_ask_does_not_serve_one_parameter_set_from_anothers_cache(client) -> None:
+    """Two questions differing only in `parameters` are different questions."""
+    one = client.post("/ask", json={"question": "worst cpa", "parameters": {"limit": 1}})
+    five = client.post("/ask", json={"question": "worst cpa", "parameters": {"limit": 5}})
+    assert one.status_code == 200 and five.status_code == 200
+    assert len(five.json()["rows"]) > len(one.json()["rows"]), (
+        "the limit=5 request was served the limit=1 cached answer"
+    )
+
+
 def test_ask_rejects_a_blank_question(client) -> None:
     assert client.post("/ask", json={"question": "   "}).status_code == 422

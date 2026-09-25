@@ -161,7 +161,11 @@ def post_ask(
     if not rate_limiter.allow(_client_key(request)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
-    cache_key = f"{body.template or ''}|{body.question.strip().lower()}"
+    # `parameters` is part of the key: two questions identical but for their
+    # `limit` are different questions, and omitting it served one's answer
+    # for the other. Sorted so dict ordering cannot split one logical key.
+    bound_key = ",".join(f"{name}={value}" for name, value in sorted(body.parameters.items()))
+    cache_key = f"{body.template or ''}|{body.question.strip().lower()}|{bound_key}"
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
