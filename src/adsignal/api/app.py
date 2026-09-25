@@ -9,8 +9,10 @@ to Postgres directly — that stays inside `warehouse/`.
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from adsignal.api.cache import TtlCache
+from adsignal.api.cors import cors_kwargs
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.api.routes import anomalies, ask, campaigns, health, models, search
 from adsignal.api.routes.ask import (
@@ -73,6 +75,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = resolved_settings
     app.state.embedding_model = EmbeddingModel()
     install_request_runtime(app)
+
+    app.add_middleware(CORSMiddleware, **cors_kwargs(resolved_settings))  # type: ignore[arg-type]
 
     app.include_router(health.router)
     app.include_router(campaigns.router)

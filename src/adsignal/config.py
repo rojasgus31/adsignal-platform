@@ -8,10 +8,11 @@ subprocess's environment — it does not itself read configuration.
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import Field, SecretStr, field_serializer
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_serializer, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _mask_dsn_password(dsn: str) -> str:
@@ -70,6 +71,31 @@ class Settings(BaseSettings):
     # per-provider timeout above: four providers each allowed 20 s can stall
     # the nightly job for 80 s or more without this. See `NarrativeChain`.
     narrative_budget_seconds: float = 45.0
+    cors_origins: Annotated[tuple[str, ...], NoDecode] = ()
+    """Exact origins allowed to call this API from a browser.
+
+    Read from ADSIGNAL_CORS_ORIGINS as a comma-separated list. Empty means no
+    browser may call the API, which is the correct default for a service whose
+    only consumer is named explicitly at deploy time. `NoDecode` stops
+    pydantic-settings from trying to JSON-parse the raw env value before our
+    validator below splits it on commas.
+    """
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        """Accept "https://a,https://b" from the environment as a tuple."""
+        if isinstance(value, str):
+            return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _reject_wildcard(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """`*` on a public API is an accident. Name the origins."""
+        if "*" in value:
+            raise ValueError("cors_origins must not contain a wildcard; name each origin")
+        return value
 
     @field_serializer("postgres_dsn", when_used="always")
     def _serialize_postgres_dsn(self, value: str) -> str:
