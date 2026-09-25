@@ -82,14 +82,12 @@ services:
       ADSIGNAL_DBT_DIR: /app/dbt
     ports:
       - "8000:8000"
-    # Same order of magnitude as `pipeline`: the API loads one shared
-    # ~90 MB embedding model at startup (see `api/app.py`) plus FastAPI/
-    # uvicorn overhead, but does no dbt/DuckDB work, so it needs less
-    # headroom than the pipeline's 2g.
     deploy:
       resources:
         limits:
-          memory: 1g
+          # Measured: 412.0 MB peak after a cold start and one /search
+          # (scripts/measure_memory.py). Render's free tier gives 512 MB.
+          memory: 512m
 
 volumes:
   postgres_data:
