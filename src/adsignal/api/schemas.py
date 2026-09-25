@@ -91,6 +91,18 @@ class BenchmarkOut(BaseModel):
     latest_narrative_provider: str | None = None
 
 
+class RunOut(BaseModel):
+    """One row of `GET /operations`: one asset's execution within one pipeline run."""
+
+    run_id: str
+    asset: str
+    started_at: datetime
+    duration_seconds: float
+    rows_written: int
+    status: str
+    detail: str
+
+
 class SearchRequest(BaseModel):
     """`POST /search` body.
 
