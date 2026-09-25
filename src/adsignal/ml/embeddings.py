@@ -7,8 +7,8 @@ an 8 GB development machine.
 This module knows nothing about storage. It turns strings into vectors.
 """
 
+import threading
 from collections.abc import Sequence
-from functools import cached_property
 
 from fastembed import TextEmbedding
 
@@ -19,18 +19,33 @@ EMBEDDING_DIM = 384
 
 
 class EmbeddingModel:
-    """Lazily-loaded sentence embedder.
+    """Lazily-loaded sentence embedder, safe to share across threads.
 
     The model is loaded on first use rather than at construction, so importing
     this module — which the API does at startup — costs nothing.
+
+    That first load is serialised. `/search` is a sync `def`, so Starlette
+    dispatches it to the anyio worker threadpool where several requests run
+    genuinely concurrently; an unsynchronised lazy attribute would let each
+    of the first concurrent requests construct its own `TextEmbedding`,
+    transiently holding several ~90 MB models inside a 1 GB container. The
+    double-checked read means the lock is taken once, on the cold path, and
+    never on the hot one.
     """
 
     def __init__(self, model_name: str = MODEL_NAME) -> None:
         self._model_name = model_name
+        self._loaded: TextEmbedding | None = None
+        self._load_lock = threading.Lock()
 
-    @cached_property
+    @property
     def _model(self) -> TextEmbedding:
-        return TextEmbedding(model_name=self._model_name)
+        """The underlying embedder, constructed exactly once."""
+        if self._loaded is None:
+            with self._load_lock:
+                if self._loaded is None:
+                    self._loaded = TextEmbedding(model_name=self._model_name)
+        return self._loaded
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         """Embed a batch. Returns one vector per input, in input order."""
