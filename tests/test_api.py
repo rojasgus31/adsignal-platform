@@ -19,6 +19,43 @@ def test_endpoints_return_empty_not_error_on_a_fresh_database(empty_client) -> N
     assert benchmark.json()["runs"] == []
 
 
+def test_endpoints_return_empty_not_error_with_no_tables_at_all(dropped_tables_client) -> None:
+    """Fix-round regression test for the Critical finding on the first review.
+
+    `empty_client` only ever exercises empty-but-existing tables, because its
+    setup runs `ensure_*_schema` before truncating. A database that has never
+    had the pipeline run against it - a serving database just recreated for
+    pgvector, say - has no tables at all, which is a step further and is what
+    actually 500'd in review: `GET /campaigns` raised
+    `psycopg.errors.UndefinedTable: relation "fct_campaign_daily" does not
+    exist`. `dropped_tables_client` reproduces that by dropping every table
+    rather than truncating it.
+    """
+    for path in ("/health", "/campaigns", "/anomalies", "/models"):
+        response = dropped_tables_client.get(path)
+        assert response.status_code == 200, f"{path} returned {response.status_code}"
+
+    assert dropped_tables_client.get("/campaigns").json() == []
+    assert dropped_tables_client.get("/anomalies").json() == []
+    assert dropped_tables_client.get("/models").json() == []
+
+    benchmark = dropped_tables_client.get("/benchmark")
+    assert benchmark.status_code == 200
+    assert benchmark.json()["runs"] == []
+
+    search = dropped_tables_client.post("/search", json={"query": "anything", "limit": 3})
+    assert search.status_code == 200
+    assert search.json()["hits"] == []
+
+    # An unknown campaign/campaign-day on a table-less database is still a
+    # 404, not a 500 - the same "not found" answer as on a populated database.
+    unknown_metrics = dropped_tables_client.get("/campaigns/does-not-exist/metrics")
+    assert unknown_metrics.status_code == 404
+
+    unknown_anomaly = dropped_tables_client.get("/anomalies/does-not-exist/2024-01-01")
+    assert unknown_anomaly.status_code == 404
+
+
 def test_campaigns_lists_known_campaigns(client) -> None:
     body = client.get("/campaigns").json()
     assert body

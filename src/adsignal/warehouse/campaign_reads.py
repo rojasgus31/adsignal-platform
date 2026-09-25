@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import pandas as pd
 
+from adsignal.warehouse.loader import ensure_schema
 from adsignal.warehouse.reader import read_campaign_daily
 
 
@@ -40,8 +41,12 @@ class CampaignMetricPoint:
 def list_campaigns(dsn: str) -> list[CampaignInfo]:
     """Return one entry per distinct campaign, ordered by campaign_id.
 
-    Empty, not an error, on a mart that has never been loaded.
+    Empty, not an error, on a mart that has never been loaded — including
+    against a database where `fct_campaign_daily` does not exist at all yet,
+    which `ensure_schema` guards against before `read_campaign_daily` queries
+    it.
     """
+    ensure_schema(dsn)
     frame = read_campaign_daily(dsn)
     if frame.empty:
         return []
@@ -59,9 +64,11 @@ def list_campaigns(dsn: str) -> list[CampaignInfo]:
 def read_campaign_metrics(dsn: str, campaign_id: str) -> list[CampaignMetricPoint]:
     """Return one campaign's daily rows, ordered by date.
 
-    Empty (not an error) if the campaign is unknown; the router turns that
+    Empty (not an error) if the campaign is unknown, or if
+    `fct_campaign_daily` does not exist yet; the router turns an empty result
     into a 404.
     """
+    ensure_schema(dsn)
     frame = read_campaign_daily(dsn)
     matched = frame[frame["campaign_id"] == campaign_id].sort_values("event_date")
     return [

@@ -52,6 +52,18 @@ EMPTY_TEST_DSN = os.environ.get(
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_empty",
 )
 
+# A third, separate database for `dropped_tables_client`: a genuinely fresh
+# deployment (a serving database recreated for pgvector, say) has never had
+# any `ensure_*_schema` call run against it at all, so no table exists -
+# not "table exists, zero rows" like `EMPTY_TEST_DSN`/`empty_client`, but
+# "relation does not exist". A prior run of this suite may have left tables
+# behind here, so the fixture itself drops them every time rather than
+# relying on this database staying pristine between runs.
+DROPPED_TEST_DSN = os.environ.get(
+    "ADSIGNAL_DROPPED_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_dropped",
+)
+
 
 def _ensure_test_database(dsn: str) -> None:
     """Create the database `dsn` names if it does not already exist.
@@ -91,6 +103,7 @@ def _ensure_test_database(dsn: str) -> None:
 
 _ensure_test_database(TEST_DSN)
 _ensure_test_database(EMPTY_TEST_DSN)
+_ensure_test_database(DROPPED_TEST_DSN)
 
 
 def _postgres_available(dsn: str) -> bool:
@@ -364,5 +377,37 @@ def empty_client():
         conn.commit()
 
     app = create_app(Settings(postgres_dsn=EMPTY_TEST_DSN))
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture(scope="module")
+def dropped_tables_client():
+    """A `TestClient` against a database where none of the serving tables exist.
+
+    This is the state `empty_client` cannot cover: `empty_client` runs every
+    `ensure_*_schema` before truncating, so it only ever exercises
+    empty-but-existing tables. A genuinely fresh deployment - a serving
+    database recreated for pgvector, say, before the pipeline has ever run
+    against it - has no tables at all, and `DROP TABLE` (not `TRUNCATE`) is
+    what reproduces that. No `ensure_*_schema` call is made here; the read
+    path itself is responsible for tolerating a missing table.
+    """
+    if not _postgres_available(DROPPED_TEST_DSN):
+        pytest.skip("Postgres not reachable")
+
+    with psycopg.connect(DROPPED_TEST_DSN) as conn:
+        for table in (
+            "fct_campaign_daily",
+            "model_metrics",
+            "drift_reports",
+            "anomaly_predictions",
+            "entity_embeddings",
+            "narrative_runs",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")  # noqa: S608
+        conn.commit()
+
+    app = create_app(Settings(postgres_dsn=DROPPED_TEST_DSN))
     with TestClient(app) as test_client:
         yield test_client
