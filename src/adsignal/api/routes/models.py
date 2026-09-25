@@ -1,12 +1,17 @@
 """`GET /models`, `GET /benchmark`."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from adsignal.api.deps import get_settings
 from adsignal.api.schemas import BenchmarkOut, BenchmarkRun, ModelMetricsOut
 from adsignal.config import Settings
 from adsignal.warehouse.narrative_store import read_latest_narrative
-from adsignal.warehouse.serving_reads import ModelMetricsRow, read_model_metrics
+from adsignal.warehouse.serving_reads import (
+    DEFAULT_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+    ModelMetricsRow,
+    read_model_metrics,
+)
 
 router = APIRouter(tags=["models"])
 
@@ -25,14 +30,27 @@ def _to_model_metrics_out(row: ModelMetricsRow) -> ModelMetricsOut:
 
 
 @router.get("/models", response_model=list[ModelMetricsOut])
-def get_models(settings: Settings = Depends(get_settings)) -> list[ModelMetricsOut]:
-    """List every training run's evaluation, newest first. Empty before the first run."""
-    return [_to_model_metrics_out(row) for row in read_model_metrics(settings.postgres_dsn)]
+def get_models(
+    settings: Settings = Depends(get_settings),
+    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> list[ModelMetricsOut]:
+    """List one page of training-run evaluations, newest first.
+
+    Bounded, like `/search` and `/ask`: the history grows with every nightly
+    run. Empty before the first run.
+    """
+    rows = read_model_metrics(settings.postgres_dsn, limit=limit, offset=offset)
+    return [_to_model_metrics_out(row) for row in rows]
 
 
 @router.get("/benchmark", response_model=BenchmarkOut)
 def get_benchmark(settings: Settings = Depends(get_settings)) -> BenchmarkOut:
-    """The dashboard's comparison view: every run, plus who narrated most recently."""
+    """The dashboard's comparison view: recent runs, plus who narrated most recently.
+
+    Reads through the same bounded reader as `/models`, so one response can
+    never grow with the training history either.
+    """
     runs = [
         BenchmarkRun(
             run_id=row.run_id,

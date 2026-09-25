@@ -15,6 +15,14 @@ import psycopg
 
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 
+# The bound both collection readers share, and the ceiling a caller may ask
+# for. An unbounded collection is a denial-of-service lever: one response
+# otherwise grows with the table, and clients have no pagination contract to
+# code against. Defined here, in the layer that enforces them, rather than in
+# a router - `api/` depends on `warehouse/`, never the reverse.
+DEFAULT_PAGE_LIMIT = 100
+MAX_PAGE_LIMIT = 500
+
 
 @dataclass(frozen=True, slots=True)
 class ModelMetricsRow:
@@ -44,8 +52,13 @@ class AnomalyPredictionRow:
     anomaly_score: float
 
 
-def read_model_metrics(dsn: str) -> list[ModelMetricsRow]:
-    """Return every training run's evaluation, newest first.
+def read_model_metrics(
+    dsn: str, limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0
+) -> list[ModelMetricsRow]:
+    """Return one page of training-run evaluations, newest first.
+
+    Bounded in SQL, not in Python: the history grows with every nightly run,
+    and an unbounded read serialises all of it into one response body.
 
     `ensure_ml_schema` runs first so a database that has never had a pipeline
     run against it (the table does not exist yet) answers with an empty list
@@ -59,13 +72,21 @@ def read_model_metrics(dsn: str) -> list[ModelMetricsRow]:
                    detector_precision, detector_recall, detector_f1, detector_roc_auc
             FROM model_metrics
             ORDER BY trained_at DESC, id DESC
-            """
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
         ).fetchall()
     return [ModelMetricsRow(*row) for row in rows]
 
 
-def read_anomaly_predictions(dsn: str) -> list[AnomalyPredictionRow]:
-    """Return every current anomaly prediction, most recent day first."""
+def read_anomaly_predictions(
+    dsn: str, limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0
+) -> list[AnomalyPredictionRow]:
+    """Return one page of current anomaly predictions, most recent day first.
+
+    Bounded for the same reason as `read_model_metrics`: every campaign-day
+    the current model flags is a row here.
+    """
     ensure_ml_schema(dsn)
     with psycopg.connect(dsn) as conn:
         rows = conn.execute(
@@ -74,7 +95,9 @@ def read_anomaly_predictions(dsn: str) -> list[AnomalyPredictionRow]:
                    escalate, anomaly_score
             FROM anomaly_predictions
             ORDER BY event_date DESC, campaign_id
-            """
+            LIMIT %s OFFSET %s
+            """,
+            (limit, offset),
         ).fetchall()
     return [AnomalyPredictionRow(*row) for row in rows]
 

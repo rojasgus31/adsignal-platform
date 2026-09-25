@@ -2,6 +2,8 @@ import os
 
 import psycopg
 
+from adsignal.warehouse.serving_reads import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+
 # Same pattern as every other DSN-driven test module: the env var is an
 # override, not a requirement.
 TEST_DSN = os.environ.get(
@@ -201,3 +203,38 @@ def test_search_and_ask_do_not_share_a_rate_limit_budget(client) -> None:
 
     answered = client.post("/ask", json={"question": "how many anomalies?"})
     assert answered.status_code == 200, answered.text
+
+
+def test_models_is_bounded_and_paginates(client) -> None:
+    """Finding 10: `/anomalies` and `/models` returned every row ever written,
+    while `/search` and `/ask` bounded theirs precisely because an unbounded
+    limit is a denial-of-service lever."""
+    page = client.get("/models", params={"limit": 1})
+    assert page.status_code == 200
+    assert len(page.json()) == 1
+
+    second = client.get("/models", params={"limit": 1, "offset": 1})
+    assert second.status_code == 200
+    assert second.json() != page.json()
+
+
+def test_anomalies_is_bounded(client) -> None:
+    page = client.get("/anomalies", params={"limit": 1})
+    assert page.status_code == 200
+    assert len(page.json()) <= 1
+
+
+def test_the_collection_bounds_are_enforced(client) -> None:
+    """The contract is a 422, not a silently honoured unbounded request."""
+    for path in ("/models", "/anomalies"):
+        assert client.get(path, params={"limit": 0}).status_code == 422
+        assert client.get(path, params={"limit": MAX_PAGE_LIMIT + 1}).status_code == 422
+        assert client.get(path, params={"offset": -1}).status_code == 422
+
+
+def test_the_collections_default_to_a_bounded_page(client) -> None:
+    """A caller that asks for nothing still gets a bounded response."""
+    for path in ("/models", "/anomalies"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert len(response.json()) <= DEFAULT_PAGE_LIMIT
