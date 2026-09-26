@@ -15,6 +15,13 @@ only the layer that read the history knows the answer:
 * A campaign-day with fewer than `DEFAULT_BASELINE_WINDOW` prior days has NaN
   for every baseline and ratio. Scoring it would produce a confident,
   meaningless number, so this module refuses and names the shortfall instead.
+* Counting rows is necessary but not sufficient. A day can have its seven
+  prior days and still be NaN in every feature the detector reads — zero
+  baselines and zero-variance windows do it, and seven days of zero delivery
+  produces both. The detector neutral-fills NaN, so such a row scores as
+  exactly average no matter what it contains. `_carries_no_evidence` catches
+  it, with a reason distinct from the shortfall one so a caller can tell a
+  too-young campaign from a dead one.
 * The read is bounded to `DEFAULT_ZSCORE_WINDOW` prior days, the widest
   window `build_features` uses. That is not an approximation: the rolling
   statistics for the last row of a window are computed from exactly those
@@ -29,6 +36,7 @@ from datetime import date
 
 import pandas as pd
 
+from adsignal.ml.detector import DETECTOR_FEATURES
 from adsignal.ml.features import DEFAULT_BASELINE_WINDOW, DEFAULT_ZSCORE_WINDOW, build_features
 from adsignal.warehouse.loader import ensure_schema
 from adsignal.warehouse.reader import read_campaign_window
@@ -88,12 +96,47 @@ def read_feature_row(
             )
         )
 
-    features = build_features(history, baseline_window=baseline_window)
-    return FeatureRow(
-        campaign_id=campaign_id,
-        event_date=event_date,
-        frame=features.tail(1),
-    )
+    row = build_features(history, baseline_window=baseline_window).tail(1)
+    if _carries_no_evidence(row):
+        return NoFeatureRow(
+            reason=(
+                f"campaign {campaign_id!r} on {event_date.isoformat()} has {len(history) - 1} "
+                "day(s) of history but every feature the detector reads is undefined "
+                f"({', '.join(DETECTOR_FEATURES)}); a zero baseline, a zero-variance window "
+                "or zero delivery leaves nothing to compare this day against"
+            )
+        )
+
+    return FeatureRow(campaign_id=campaign_id, event_date=event_date, frame=row)
+
+
+def _carries_no_evidence(row: pd.DataFrame) -> bool:
+    """True when every feature the detector reads is NaN on this row.
+
+    The row-count guard above is necessary but not sufficient. A campaign-day
+    can have its seven prior days and still be undefined in every detector
+    feature: a `*_ratio` is NaN when the baseline is zero
+    (`_add_baselines_and_ratios` replaces a zero baseline with NaN rather than
+    dividing by it), and a `*_zscore` is NaN when the window's standard
+    deviation is zero. Seven days of zero delivery produces exactly that.
+
+    `AnomalyDetector._matrix` then fills each NaN with its column's neutral
+    value and subtracts that neutral, so a row that is NaN throughout reaches
+    the forest as the origin and scores as perfectly average — the same
+    confident, meaningless number the history guard exists to refuse,
+    arriving by a different door.
+
+    The threshold is *every* feature, not any. A single NaN ratio is a normal
+    and informative state — a campaign with no conversions in its baseline
+    week has a NaN `conversions_ratio` and six other features still carrying
+    real deviation — and the detector's neutral-fill policy handles that
+    correctly and identically to the batch path. Only the all-NaN row is
+    scored independently of its own data, and only it is refused; anything
+    stricter would refuse legitimate days and make `/score` disagree with the
+    stored batch verdict for no gain.
+    """
+    present = [column for column in DETECTOR_FEATURES if column in row.columns]
+    return bool(present) and bool(row.loc[:, present].isna().all(axis=None))
 
 
 def _ends_on(history: pd.DataFrame, event_date: date) -> bool:

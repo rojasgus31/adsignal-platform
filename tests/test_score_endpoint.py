@@ -150,3 +150,60 @@ def test_the_models_are_loaded_once_and_shared(client, scoreable_day) -> None:
 
     assert first is not None
     assert client.app.state.scoring_models.get() is first
+
+
+@pytest.fixture(scope="module")
+def stored_prediction(_api_seed: str) -> tuple[str, date] | None:
+    """A campaign-day the nightly batch already scored AND that `/score` can score.
+
+    Both halves matter. The batch scores every row, including a campaign's
+    first days; `/score` refuses those, so an arbitrary stored row is not
+    necessarily comparable. The prior-day count is done in SQL so the pick is
+    always a day the live path will accept.
+    """
+    with psycopg.connect(TEST_DSN) as conn:
+        row = conn.execute(
+            """
+            SELECT p.campaign_id, p.event_date
+            FROM anomaly_predictions p
+            WHERE (
+                SELECT count(*) FROM fct_campaign_daily f
+                WHERE f.campaign_id = p.campaign_id AND f.event_date < p.event_date
+            ) >= %s
+            ORDER BY p.event_date DESC, p.campaign_id
+            LIMIT 1
+            """,
+            (DEFAULT_BASELINE_WINDOW,),
+        ).fetchone()
+    return (str(row[0]), row[1]) if row is not None else None
+
+
+def test_a_scored_day_matches_the_stored_batch_row(client, stored_prediction) -> None:
+    """The claim this whole endpoint exists to support, asserted rather than demonstrated.
+
+    `GET /anomalies/...` returns what last night's batch decided and stored.
+    `POST /score` runs the same two estimators now, over features built from a
+    29-row window rather than the campaign's whole history. If the bounded
+    window, the feature build or the model boundary differed anywhere, these
+    two numbers would differ — so equality here is what makes "the model is
+    loaded and serving" a checkable statement instead of a screenshot.
+    """
+    if stored_prediction is None:
+        pytest.skip(
+            "no stored anomaly_predictions row has enough prior history to be "
+            "scoreable; nothing to compare against"
+        )
+    campaign_id, event_date = stored_prediction
+
+    live = _score(client, campaign_id, event_date)
+    if live.status_code == 503:
+        pytest.skip("no model artifacts available to this app; /score cannot run a model")
+    assert live.status_code == 200, live.text
+
+    stored = client.get(f"/anomalies/{campaign_id}/{event_date.isoformat()}")
+    assert stored.status_code == 200, stored.text
+
+    live_payload, stored_payload = live.json(), stored.json()
+    assert live_payload["is_anomaly"] is True
+    for field in ("anomaly_score", "cause", "confidence", "severity", "escalate"):
+        assert live_payload[field] == stored_payload[field], field

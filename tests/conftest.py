@@ -17,8 +17,9 @@ from adsignal.generator.events import generate_events
 from adsignal.generator.models import ANOMALY_CAUSES, Catalog
 from adsignal.ml.embeddings import EmbeddingModel
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
-from adsignal.ml.registry import save_models
-from adsignal.ml.training import train_and_evaluate
+from adsignal.ml.features import build_features
+from adsignal.ml.registry import load_models, save_models
+from adsignal.ml.training import BASELINE_WINDOW, train_and_evaluate
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.loader import load_mart_to_postgres
@@ -301,6 +302,28 @@ def labelled_series():
     return _labelled_series
 
 
+def _batch_predictions(mart: pd.DataFrame, artifacts: Path) -> pd.DataFrame:
+    """The nightly scoring recipe, as `pipeline.assets.anomaly_scores` runs it.
+
+    Deliberately a second, independent transcription of that asset rather than
+    a shared helper. The equivalence test it feeds asserts that the live
+    `POST /score` verdict matches the stored batch row; if both sides came out
+    of one function the test would be a tautology. Duplication is the point
+    here - if the two paths ever diverge, this is what fails.
+    """
+    detector, classifier = load_models(artifacts)
+    features = build_features(mart, baseline_window=BASELINE_WINDOW)
+
+    flagged = features[detector.predict(features)]
+    assert not flagged.empty, "the detector flagged nothing in the seeded mart"
+
+    predictions = classifier.predict(flagged)
+    predictions["event_date"] = flagged["event_date"].to_numpy()
+    predictions["campaign_id"] = flagged["campaign_id"].to_numpy()
+    predictions["anomaly_score"] = detector.score(flagged)
+    return predictions
+
+
 def _train_artifacts(mart: pd.DataFrame, directory: Path) -> Path:
     """Fit both models on `mart` and persist them, returning `directory`.
 
@@ -372,31 +395,17 @@ def _api_seed(tmp_path_factory) -> str:
     # `POST /score` can actually run a model here instead of answering 503.
     # `read_latest_artifact_dir` resolves this exact path, which is why it is
     # this row - the newest by `trained_at` - that has to carry it.
-    artifacts = _train_artifacts(read_campaign_daily(TEST_DSN), tmp_path / "artifacts")
+    mart = read_campaign_daily(TEST_DSN)
+    artifacts = _train_artifacts(mart, tmp_path / "artifacts")
     write_model_metrics(
         TEST_DSN, "run_2", datetime(2024, 6, 1, tzinfo=UTC), triage, detector, str(artifacts)
     )
 
-    with psycopg.connect(TEST_DSN) as conn:
-        campaign_id, event_date = conn.execute(
-            "SELECT campaign_id, event_date FROM fct_campaign_daily "
-            "ORDER BY campaign_id, event_date LIMIT 1"
-        ).fetchone()
-
-    predictions = pd.DataFrame(
-        [
-            {
-                "event_date": event_date,
-                "campaign_id": campaign_id,
-                "cause": "budget_pacing",
-                "confidence": 0.9,
-                "severity": 3,
-                "escalate": True,
-                "anomaly_score": 0.87,
-            }
-        ]
-    )
-    write_predictions(TEST_DSN, "run_2", predictions)
+    # Real batch predictions, not a fabricated row: these are what
+    # `GET /anomalies` serves, and `test_a_scored_day_matches_the_stored_batch_row`
+    # asserts that `POST /score` reproduces one of them exactly. A hand-written
+    # row would make that test unfalsifiable.
+    write_predictions(TEST_DSN, "run_2", _batch_predictions(mart, artifacts))
 
     ensure_vector_schema(TEST_DSN)
     with psycopg.connect(TEST_DSN) as conn:
@@ -417,7 +426,7 @@ def _api_seed(tmp_path_factory) -> str:
         ],
     )
 
-    return str(campaign_id)
+    return str(mart["campaign_id"].iloc[0])
 
 
 @pytest.fixture(scope="module")

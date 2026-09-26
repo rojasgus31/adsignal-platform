@@ -16,9 +16,11 @@ import pandas as pd
 import psycopg
 import pytest
 
+from adsignal.ml.detector import DETECTOR_FEATURES
 from adsignal.ml.features import DEFAULT_BASELINE_WINDOW, FEATURE_COLUMNS, build_features
+from adsignal.ml.registry import load_models
 from adsignal.warehouse.feature_reads import FeatureRow, NoFeatureRow, read_feature_row
-from adsignal.warehouse.reader import read_campaign_daily
+from adsignal.warehouse.reader import read_campaign_daily, read_campaign_window
 
 # Same default and same override as every other DSN-driven test module; see
 # `tests/conftest.py`, which `pytest` does not make importable by name.
@@ -123,3 +125,95 @@ def test_a_database_without_the_mart_is_refused_not_an_error(dropped_tables_clie
     outcome = read_feature_row(dsn, "cmp_0000_000", date(2025, 12, 31))
 
     assert isinstance(outcome, NoFeatureRow)
+
+
+_ZERO_DELIVERY_CAMPAIGN = "cmp_zero_delivery"
+_ZERO_DELIVERY_DAYS = 12
+
+
+@pytest.fixture(scope="module")
+def zero_delivery_campaign(_api_seed: str) -> tuple[str, date]:
+    """A campaign with ample history and nothing in it: every day all zeroes.
+
+    Inserted directly rather than generated: `generator/events.py` always
+    produces some delivery, so this state never occurs in a generated dataset
+    — but a real mart has it the moment a campaign is paused or its tracking
+    breaks, and it is the case where the row-count guard passes and every
+    detector feature is still undefined.
+    """
+    rows = [
+        (
+            date(2023, 6, 1) + timedelta(days=offset),
+            _ZERO_DELIVERY_CAMPAIGN,
+            "adv_zero",
+            "search",
+            0,
+            0,
+            0,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+        )
+        for offset in range(_ZERO_DELIVERY_DAYS)
+    ]
+    with psycopg.connect(TEST_DSN) as conn:
+        conn.execute(
+            "DELETE FROM fct_campaign_daily WHERE campaign_id = %s", (_ZERO_DELIVERY_CAMPAIGN,)
+        )
+        conn.cursor().executemany(
+            "INSERT INTO fct_campaign_daily VALUES "
+            "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            rows,
+        )
+        conn.commit()
+    return _ZERO_DELIVERY_CAMPAIGN, rows[-1][0]
+
+
+def test_a_day_with_history_but_no_usable_features_is_refused(zero_delivery_campaign) -> None:
+    """The floor beneath the row-count guard.
+
+    Eleven prior days clears `DEFAULT_BASELINE_WINDOW`, so the count guard
+    passes — but every baseline is zero and every window has zero variance, so
+    every detector feature is NaN. `AnomalyDetector._matrix` neutral-fills
+    those, which would deliver this row to the forest as the origin and score
+    it as perfectly average. Refusing is the only honest answer.
+    """
+    campaign_id, event_date = zero_delivery_campaign
+    outcome = read_feature_row(TEST_DSN, campaign_id, event_date)
+
+    assert isinstance(outcome, NoFeatureRow)
+    assert "every feature the detector reads is undefined" in outcome.reason
+    # Distinct from the shortfall refusal, so a caller can tell a campaign
+    # that is too young from one that is dead.
+    assert "scoring needs" not in outcome.reason
+
+
+def test_the_refused_row_would_otherwise_have_scored_as_average(
+    trained_artifacts, zero_delivery_campaign
+) -> None:
+    """Why the refusal is worth its code: this is what scoring it would return.
+
+    Built here rather than asserted from the endpoint, because the endpoint
+    now (correctly) refuses to produce it. Every detector feature is NaN, the
+    centred matrix is therefore all zeroes, and the forest returns the same
+    number it would for any other all-zero row — a verdict about the model's
+    neutral point, not about this campaign.
+    """
+    campaign_id, event_date = zero_delivery_campaign
+    history = read_campaign_window(TEST_DSN, campaign_id, event_date, days=_ZERO_DELIVERY_DAYS)
+    row = build_features(history, baseline_window=DEFAULT_BASELINE_WINDOW).tail(1)
+
+    assert row.loc[:, list(DETECTOR_FEATURES)].isna().all(axis=None)
+
+    detector, _ = load_models(trained_artifacts)
+    neutral = pd.DataFrame(
+        [dict.fromkeys(DETECTOR_FEATURES, np.nan)], columns=list(DETECTOR_FEATURES)
+    )
+    assert detector.score(row)[0] == pytest.approx(detector.score(neutral)[0])
