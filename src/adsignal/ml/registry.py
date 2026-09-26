@@ -42,6 +42,57 @@ def load_models(directory: Path) -> tuple[AnomalyDetector, TriageClassifier]:
     return detector, classifier
 
 
+def dumps_models(detector: AnomalyDetector, classifier: TriageClassifier) -> tuple[bytes, bytes]:
+    """Serialize both fitted models to bytes, in the same format `save_models` writes to disk.
+
+    The one place this project pickles a model for storage other than
+    `save_models` itself, so the two never drift into incompatible formats.
+    `warehouse.artifact_store` calls this and stores the bytes it gets back
+    without importing `pickle` itself - pickling stays owned here, not
+    scattered across every place a model gets persisted.
+    """
+    return pickle.dumps(detector), pickle.dumps(classifier)
+
+
+def loads_detector(data: bytes) -> AnomalyDetector:
+    """Deserialize one detector from bytes.
+
+    Split from the classifier's own `loads_classifier` (rather than one
+    combined call taking both blobs) so a caller holding two large pickled
+    blobs - `api.model_loader`, reading both out of one Postgres row - can
+    drop the first blob's last reference before the second is ever
+    unpickled, instead of both staying resident for the whole call. Raises
+    whatever `pickle.loads` raises for data it cannot read - most often an
+    incompatible scikit-learn version; the caller decides what that means
+    for serving.
+    """
+    detector: AnomalyDetector = pickle.loads(data)
+    return detector
+
+
+def loads_classifier(data: bytes) -> TriageClassifier:
+    """Deserialize one classifier from bytes. See `loads_detector`."""
+    classifier: TriageClassifier = pickle.loads(data)
+    return classifier
+
+
+def loads_models(
+    detector_bytes: bytes, classifier_bytes: bytes
+) -> tuple[AnomalyDetector, TriageClassifier]:
+    """Deserialize both models from bytes, the counterpart to `dumps_models`.
+
+    A convenience wrapper over `loads_detector`/`loads_classifier` for a
+    caller that already holds both blobs and has no reason to drop either
+    early (this module's own round-trip test, and anywhere else two small
+    blobs are already both in memory anyway). `api.model_loader` calls the
+    two single-model functions directly instead, precisely because it does
+    have a reason to drop the first blob early - see `loads_detector`.
+    """
+    detector = loads_detector(detector_bytes)
+    classifier = loads_classifier(classifier_bytes)
+    return detector, classifier
+
+
 def log_training_run(
     *,
     tracking_dir: Path,

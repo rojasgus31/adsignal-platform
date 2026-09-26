@@ -1,4 +1,5 @@
 import os
+import platform
 import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 import psycopg
 import pytest
+import sklearn
 from fastapi.testclient import TestClient
 
 from adsignal.api.app import create_app, install_request_runtime
@@ -18,8 +20,9 @@ from adsignal.generator.models import ANOMALY_CAUSES, Catalog
 from adsignal.ml.embeddings import EmbeddingModel
 from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
 from adsignal.ml.features import build_features
-from adsignal.ml.registry import load_models, save_models
+from adsignal.ml.registry import dumps_models, load_models, save_models
 from adsignal.ml.training import BASELINE_WINDOW, train_and_evaluate
+from adsignal.warehouse.artifact_store import ensure_artifact_schema, write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.loader import load_mart_to_postgres
@@ -114,11 +117,23 @@ CONCURRENCY_TEST_DSN = os.environ.get(
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_concurrent",
 )
 
+# A fifth, separate database for `db_only_client`: the production topology
+# Task 6b exists to make true, where the API and the training job do not
+# share a filesystem. `_db_only_seed` never calls `ml.registry.save_models`,
+# so nothing under this DSN's fixture could accidentally make `/score` pass
+# by falling back to a directory - a shared database is the only thing this
+# client is given.
+DB_ONLY_TEST_DSN = os.environ.get(
+    "ADSIGNAL_DB_ONLY_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_db_only",
+)
+
 
 _ensure_test_database(TEST_DSN)
 _ensure_test_database(EMPTY_TEST_DSN)
 _ensure_test_database(DROPPED_TEST_DSN)
 _ensure_test_database(CONCURRENCY_TEST_DSN)
+_ensure_test_database(DB_ONLY_TEST_DSN)
 
 
 def _postgres_available(dsn: str) -> bool:
@@ -393,12 +408,25 @@ def _api_seed(tmp_path_factory) -> str:
     )
     # The newest run gets real artifacts, trained on the mart just loaded, so
     # `POST /score` can actually run a model here instead of answering 503.
-    # `read_latest_artifact_dir` resolves this exact path, which is why it is
-    # this row - the newest by `trained_at` - that has to carry it.
+    # `model_metrics.artifact_uri` still gets the filesystem path (kept for
+    # `dagster dev` and the ml-layer's own disk-based fixtures), but
+    # `api.model_loader` now reads from `model_artifacts` in Postgres - see
+    # the `write_artifacts` call below - so that is the row that actually
+    # has to exist for these tests to see a 200 instead of a 503.
     mart = read_campaign_daily(TEST_DSN)
     artifacts = _train_artifacts(mart, tmp_path / "artifacts")
+    detector_model, classifier_model = load_models(artifacts)
     write_model_metrics(
         TEST_DSN, "run_2", datetime(2024, 6, 1, tzinfo=UTC), triage, detector, str(artifacts)
+    )
+    detector_bytes, triage_bytes = dumps_models(detector_model, classifier_model)
+    write_artifacts(
+        TEST_DSN,
+        "run_2",
+        detector_bytes,
+        triage_bytes,
+        sklearn_version=sklearn.__version__,
+        python_version=platform.python_version(),
     )
 
     # Real batch predictions, not a fabricated row: these are what
@@ -427,6 +455,67 @@ def _api_seed(tmp_path_factory) -> str:
     )
 
     return str(mart["campaign_id"].iloc[0])
+
+
+@pytest.fixture(scope="module")
+def _db_only_seed(tmp_path_factory) -> str:
+    """Seed `DB_ONLY_TEST_DSN` with mart rows and model artifacts, and nothing on disk.
+
+    This is the production topology Task 6b exists to make true: `POST
+    /score` served entirely from Postgres, with no artifact directory ever
+    created for this run. `ml.registry.save_models` - the function that
+    writes a directory - is never called here; the fitted models go straight
+    from `train_and_evaluate` to `dumps_models` to `write_artifacts`, so
+    there is no directory this fixture could be accidentally depending on.
+    """
+    if not _postgres_available(DB_ONLY_TEST_DSN):
+        pytest.skip("Postgres not reachable")
+
+    tmp_path = tmp_path_factory.mktemp("db_only_seed")
+    catalog, events_path, labels_path = _build_small_dataset(tmp_path)
+    duckdb_path = tmp_path / "db_only.duckdb"
+    with open_duckdb(duckdb_path) as conn:
+        register_sources(conn, events_path=events_path, labels_path=labels_path, catalog=catalog)
+    run_dbt(project_dir=_DBT_DIR, duckdb_path=duckdb_path, command="build")
+
+    ensure_mart_schema(DB_ONLY_TEST_DSN)
+    with psycopg.connect(DB_ONLY_TEST_DSN) as conn:
+        conn.execute("TRUNCATE TABLE fct_campaign_daily")
+        conn.commit()
+    load_mart_to_postgres(duckdb_path, DB_ONLY_TEST_DSN)
+
+    ensure_artifact_schema(DB_ONLY_TEST_DSN)
+    with psycopg.connect(DB_ONLY_TEST_DSN) as conn:
+        conn.execute("TRUNCATE TABLE model_artifacts")
+        conn.commit()
+
+    mart = read_campaign_daily(DB_ONLY_TEST_DSN)
+    result = train_and_evaluate(mart, seed=0)
+    detector_bytes, triage_bytes = dumps_models(result.detector, result.classifier)
+    write_artifacts(
+        DB_ONLY_TEST_DSN,
+        "db_only_run",
+        detector_bytes,
+        triage_bytes,
+        sklearn_version=sklearn.__version__,
+        python_version=platform.python_version(),
+    )
+
+    return str(mart["campaign_id"].iloc[0])
+
+
+@pytest.fixture(scope="module")
+def db_only_client(_db_only_seed: str):
+    """A `TestClient` that can only ever have scored from `model_artifacts`.
+
+    No filesystem path was written for this run at all - see `_db_only_seed`
+    - so a 200 from this client's `/score` is proof the database is a
+    sufficient serving source on its own, not just a fallback the loader
+    happens to prefer.
+    """
+    app = create_app(Settings(postgres_dsn=DB_ONLY_TEST_DSN))
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture(scope="module")
@@ -460,6 +549,7 @@ def empty_client():
     ensure_ml_schema(EMPTY_TEST_DSN)
     ensure_vector_schema(EMPTY_TEST_DSN)
     ensure_narrative_schema(EMPTY_TEST_DSN)
+    ensure_artifact_schema(EMPTY_TEST_DSN)
     with psycopg.connect(EMPTY_TEST_DSN) as conn:
         for table in (
             "fct_campaign_daily",
@@ -468,6 +558,7 @@ def empty_client():
             "anomaly_predictions",
             "entity_embeddings",
             "narrative_runs",
+            "model_artifacts",
         ):
             conn.execute(f"TRUNCATE TABLE {table}")  # noqa: S608
         conn.commit()
@@ -506,6 +597,7 @@ def dropped_tables_client():
             "anomaly_predictions",
             "entity_embeddings",
             "narrative_runs",
+            "model_artifacts",
         ):
             conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")  # noqa: S608
         conn.commit()
@@ -517,7 +609,7 @@ def dropped_tables_client():
 
 # Every fixture that hands a test a `TestClient`. `reset_ask_state` below
 # only materializes the ones the test already asked for.
-_CLIENT_FIXTURES = ("client", "empty_client", "dropped_tables_client")
+_CLIENT_FIXTURES = ("client", "empty_client", "dropped_tables_client", "db_only_client")
 
 
 @pytest.fixture(autouse=True)

@@ -3,6 +3,7 @@
 Each asset is idempotent: re-materializing it produces the same end state.
 """
 
+import platform
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -11,21 +12,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
+import sklearn
 from dagster import AssetExecutionContext, MetadataValue, asset
 
 from adsignal.config import Settings
 from adsignal.generator.anomalies import AnomalyInjector
 from adsignal.generator.catalog import build_catalog
 from adsignal.generator.events import generate_events
-from adsignal.ml.detector import DETECTOR_FEATURES
+from adsignal.ml.detector import DETECTOR_FEATURES, AnomalyDetector
 from adsignal.ml.drift import feature_drift
 from adsignal.ml.embeddings import EmbeddingModel
 from adsignal.ml.features import build_features
-from adsignal.ml.registry import load_models, log_training_run
+from adsignal.ml.registry import dumps_models, load_models, log_training_run
 from adsignal.ml.splits import temporal_split
 from adsignal.ml.training import BASELINE_WINDOW, HOLDOUT_FRACTION, train_and_evaluate
+from adsignal.ml.triage import TriageClassifier
 from adsignal.narrative.chain import AllProvidersFailed, NarrativeChain
 from adsignal.narrative.types import NarrativeRequest
+from adsignal.warehouse.artifact_store import write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import load_mart_to_postgres
 from adsignal.warehouse.metrics_store import (
@@ -234,6 +238,7 @@ def trained_models(context: AssetExecutionContext) -> None:
             result.detector_metrics,
             str(artifact_dir),
         )
+        _write_artifact_store(settings.postgres_dsn, run_id, result.detector, result.classifier)
 
         counter.rows = len(result.train) + len(result.holdout)
         context.add_output_metadata(
@@ -246,6 +251,28 @@ def trained_models(context: AssetExecutionContext) -> None:
                 "holdout_rows": MetadataValue.int(len(result.holdout)),
             }
         )
+
+
+def _write_artifact_store(
+    dsn: str, run_id: str, detector: AnomalyDetector, classifier: TriageClassifier
+) -> None:
+    """Persist this run's fitted models to Postgres, the API's serving source.
+
+    Alongside `log_training_run`'s filesystem write, not instead of it: the
+    filesystem copy keeps `dagster dev` and existing tooling working, and
+    costs nothing extra to also write. The database copy is what makes
+    `POST /score` answerable on a host where the API and this pipeline do not
+    share a disk - see `adsignal.warehouse.artifact_store`.
+    """
+    detector_bytes, triage_bytes = dumps_models(detector, classifier)
+    write_artifacts(
+        dsn,
+        run_id,
+        detector_bytes,
+        triage_bytes,
+        sklearn_version=sklearn.__version__,
+        python_version=platform.python_version(),
+    )
 
 
 @asset(

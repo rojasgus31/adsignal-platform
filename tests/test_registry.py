@@ -3,7 +3,13 @@ import pandas as pd
 from adsignal.ml.detector import AnomalyDetector
 from adsignal.ml.evaluation import evaluate_detector, evaluate_triage
 from adsignal.ml.features import build_features
-from adsignal.ml.registry import load_models, log_training_run, save_models
+from adsignal.ml.registry import (
+    dumps_models,
+    load_models,
+    loads_models,
+    log_training_run,
+    save_models,
+)
 from adsignal.ml.splits import temporal_split
 from adsignal.ml.triage import TriageClassifier
 
@@ -45,6 +51,22 @@ def test_log_training_run_returns_a_run_id_and_writes_the_store(tmp_path, labell
     assert artifact_dir == tmp_path / "mlruns" / "artifacts" / run_id
     assert (artifact_dir / "detector.pkl").exists()
     assert (artifact_dir / "triage.pkl").exists()
+
+
+def test_models_round_trip_through_bytes(labelled_series) -> None:
+    detector, classifier, holdout = _trained(labelled_series)
+    detector_bytes, triage_bytes = dumps_models(detector, classifier)
+    assert isinstance(detector_bytes, bytes) and isinstance(triage_bytes, bytes)
+
+    loaded_detector, loaded_classifier = loads_models(detector_bytes, triage_bytes)
+
+    original = classifier.predict(holdout[holdout["is_anomaly"]])["cause"].to_numpy()
+    restored = loaded_classifier.predict(holdout[holdout["is_anomaly"]])["cause"].to_numpy()
+    assert (original == restored).all()
+
+    pd.testing.assert_series_equal(
+        pd.Series(detector.predict(holdout)), pd.Series(loaded_detector.predict(holdout))
+    )
 
 
 def test_two_runs_get_distinct_ids(tmp_path, labelled_series) -> None:

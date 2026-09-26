@@ -89,16 +89,25 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Read-only: the API loads the newest run's models from here and never
-      # writes a run. See the `pipeline` service's mount above.
+      # No longer read for serving (Task 6b): `POST /score` loads models from
+      # `model_artifacts` in Postgres, the one thing this service and
+      # `pipeline` both connect to - a directory here is only ever valid on
+      # whichever container wrote it, which is exactly what broke `/score` on
+      # a host where these two services do not share a disk. Left mounted,
+      # read-only, only because removing it is a separate, unrelated change.
       - mlflow_data:/app/mlruns:ro
     deploy:
       resources:
         limits:
-          # Measured: 404.1 MB peak after a cold start, one /search and one
+          # Measured: 427.6 MB peak after a cold start, one /search and one
           # /score, with both the embedder and the fitted detector/triage
-          # pair loaded (scripts/measure_memory.py). Scoring adds ~16 MB on
-          # top of /search's 388.0 MB. Render's free tier gives 512 MB.
+          # pair loaded (scripts/measure_memory.py) - Task 6b, after models
+          # moved from a shared filesystem directory to `model_artifacts` in
+          # Postgres. Scoring adds ~32 MB on top of /search's ~395 MB; the
+          # /search baseline itself has moved since the 388.0 MB this comment
+          # used to record (unrelated to Task 6b - re-measured, unchanged, on
+          # the image immediately before this task's own code). Render's free
+          # tier gives 512 MB.
           memory: 512m
 
 volumes:

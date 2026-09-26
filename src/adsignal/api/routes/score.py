@@ -54,10 +54,7 @@ def post_score(
 
     loaded = models.get()
     if loaded is None:
-        raise HTTPException(
-            status_code=503,
-            detail="no trained model artifacts are available to this API process",
-        )
+        raise HTTPException(status_code=503, detail=models.refusal_reason())
 
     row = read_feature_row(settings.postgres_dsn, body.campaign_id, body.event_date)
     if not isinstance(row, FeatureRow):

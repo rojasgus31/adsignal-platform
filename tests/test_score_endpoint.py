@@ -129,6 +129,31 @@ def test_score_is_rate_limited(client, scoreable_day) -> None:
     assert statuses[0] != 429
 
 
+def test_score_works_from_database_artifacts_with_no_directory_on_disk(db_only_client) -> None:
+    """The production topology this task exists to make true.
+
+    `db_only_client` (see `conftest._db_only_seed`) never calls
+    `ml.registry.save_models`: no artifact directory is created for its
+    training run anywhere on this machine. On Render the API and the nightly
+    training job are separate processes with separate disks, so a 200 here -
+    sourced only from `model_artifacts` in Postgres - is what proves `/score`
+    no longer depends on a filesystem the two processes do not share.
+    """
+    campaigns = db_only_client.get("/campaigns").json()
+    assert campaigns, "the db-only seed produced no campaigns to score"
+    campaign_id = campaigns[0]["campaign_id"]
+    points = db_only_client.get(f"/campaigns/{campaign_id}/metrics").json()["points"]
+    assert len(points) > DEFAULT_BASELINE_WINDOW, "seeded series too short to be scoreable"
+    event_date = points[-1]["event_date"]
+
+    response = _score(db_only_client, campaign_id, event_date)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["campaign_id"] == campaign_id
+    assert isinstance(payload["anomaly_score"], float)
+
+
 def test_score_on_a_fresh_database_is_503_not_500(empty_client) -> None:
     """No training run has ever been recorded there, so there is nothing to score with.
 
