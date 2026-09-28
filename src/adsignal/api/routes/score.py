@@ -52,9 +52,10 @@ def post_score(
     if not rate_limiter.allow(client_key(request, settings.trusted_proxy_hops)):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
-    loaded = models.get()
-    if loaded is None:
-        raise HTTPException(status_code=503, detail=models.refusal_reason())
+    resolution = models.resolve()
+    if resolution.models is None:
+        raise HTTPException(status_code=503, detail=resolution.refusal_reason)
+    loaded = resolution.models
 
     row = read_feature_row(settings.postgres_dsn, body.campaign_id, body.event_date)
     if not isinstance(row, FeatureRow):

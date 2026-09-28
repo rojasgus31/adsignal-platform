@@ -170,11 +170,11 @@ def test_the_models_are_loaded_once_and_shared(client, scoreable_day) -> None:
     """Loading per request would unpickle 200 trees plus two ensembles per call."""
     campaign_id, event_date = scoreable_day
     _score(client, campaign_id, event_date)
-    first = client.app.state.scoring_models.get()
+    first = client.app.state.scoring_models.resolve().models
     _score(client, campaign_id, event_date)
 
     assert first is not None
-    assert client.app.state.scoring_models.get() is first
+    assert client.app.state.scoring_models.resolve().models is first
 
 
 @pytest.fixture(scope="module")
