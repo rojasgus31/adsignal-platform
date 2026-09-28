@@ -46,10 +46,14 @@ _NO_ARTIFACTS_REASON = "no trained model artifacts are available to this API pro
 # artifacts the cron writes at 03:00, which is the exact failure this whole
 # store exists to prevent.
 #
-# A minute is long enough that the promise the brief actually cares about
-# still holds - a rate-limited endpoint costs at most one round trip per
-# minute, not one per request - and short enough that a deployment picks up
-# its first trained run within a minute of it being written. The other two
+# A minute is long enough that the cost stays far below one round trip per
+# request, and short enough that a deployment picks up its first trained run
+# within a minute of it being written. Being precise about the bound, because
+# an earlier version of this file shipped a comment that promised more than
+# the code delivered: it is one round trip per minute per BURST, not per
+# minute outright. At each expiry the same unbounded fan-out described above
+# applies - every request arriving while that resolve is in flight does its
+# own round trip. The other two
 # refusals (a scikit-learn version mismatch, a pickle this process cannot
 # read) stay cached forever on purpose: only a new image or a new training run
 # clears them, and a new image restarts the process anyway.
