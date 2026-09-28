@@ -191,9 +191,15 @@ live holdout the detector flags 85 rows, of which only 30 (35%) are true
 anomalies; and 22 of the 37 rows marked `escalate=True` (60%) are false
 alarms. The headline triage macro F1 (0.8118) is measured on the
 classifier's best case (true anomalies only) — the end-to-end numbers are
-the honest picture of what the pipeline pages a human about. Exact figures
-move slightly run to run as the models retrain; run `uv run python -m
-adsignal.cli.quality_gate` for the current ones.
+the honest picture of what the pipeline pages a human about.
+
+**Every figure in this section comes from one run at one corpus size, and
+they move with both.** The numbers above are from a small local run; a
+200,000-event run scores 0.9096 macro F1 and 0.8312 detector ROC AUC, which
+is what the dashboard shows, because the dashboard reads `model_metrics`
+live rather than quoting a number from a document. If this README and the
+dashboard disagree, the dashboard is right and this paragraph is stale. Run
+`uv run python -m adsignal.cli.quality_gate` for the current ones.
 
 ### Model features
 
