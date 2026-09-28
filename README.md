@@ -11,6 +11,17 @@ or user data is used anywhere in this project. The generator injects
 anomalies with known ground-truth causes, which is what makes supervised
 training and honest evaluation possible.
 
+That same design choice means the two headline model numbers answer
+different questions. The triage classifier's macro F1 measures how well it
+recovers `anomaly_cause`, a label the generator assigns from a fixed effect
+multiplier table — a deterministically encoded signal, not a hard problem
+solved. The unsupervised detector's ROC AUC, scored with no label ever shown
+to it, is the honest benchmark of the two. Run `uv run python -m
+adsignal.cli.quality_gate` for the current figures; see
+[Models](#models) below for the full explanation and
+[`ARCHITECTURE.md`](ARCHITECTURE.md) §4 for why the release gate is AUC and
+not recall.
+
 ## Quick start
 
 ```bash
@@ -110,6 +121,11 @@ uv run ruff check . && uv run mypy && uv run pytest
 
 Tests that need Postgres skip automatically when it is not reachable. Start
 it with `docker compose up -d postgres`.
+
+The suite is **not safe to run concurrently with itself** — see
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for why and for the seam a fix would use.
+See `CONTRIBUTING.md` too for setup, the full gate list, and the campaign
+dimension bug the test fixtures once concealed.
 
 ## Models
 

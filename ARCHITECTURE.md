@@ -396,3 +396,23 @@ synthetic generator from deterministic effect multipliers, so the classifier
 is not discovering structure in the world. What this demonstrates is the
 engineering around a model — leak-free feature windows, temporal splits,
 versioned runs, a CI gate, drift monitoring — not a research result.
+
+**The test suite cannot be run concurrently with itself.** Every test DSN in
+`tests/conftest.py` is a fixed database name on a shared Postgres server, so a
+second `pytest` process truncates the first run's tables underneath it. The
+six `ADSIGNAL_*_TEST_DSN` overrides are the seam a per-worker database suffix
+would hang off — deliberately not built here; see `CONTRIBUTING.md`.
+
+**A fixture that performs production's job makes the test pass and the
+product broken.** `load_dim_campaign` was written, tested, and read by the
+API's campaign and anomaly queries, but no Dagster asset ever called it, so
+every real pipeline run left `dim_campaign` empty and the dashboard rendered
+`cmp_0058_006` where a campaign name belonged. The dimension tests passed
+throughout, because `tests/conftest.py` calls `load_dim_campaign` itself to
+build its fixtures — validating the loader in isolation from the only thing
+meant to invoke it. Fixed in commit `b35217f`: `campaign_daily_mart` now calls
+the loader, and the regression test asserts against the database after a
+materialization, never calling the loader itself, and checks that every fact
+campaign *resolves to* a dimension row rather than merely that rows exist — a
+`count > 0` check would have passed against stale fixture rows and certified
+the bug.
