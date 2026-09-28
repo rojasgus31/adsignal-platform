@@ -349,3 +349,37 @@ def test_the_definitions_share_one_narrative_chain() -> None:
     from adsignal.pipeline.definitions import defs
 
     assert isinstance(defs.resources["narrative_chain"], NarrativeChain)
+
+
+def test_the_pipeline_run_populates_the_campaign_dimension(pipeline_run) -> None:
+    """The JOB must fill `dim_campaign` — not merely the loader when a test calls it.
+
+    This is the regression this test exists for. `load_dim_campaign` was written,
+    tested, and wired into the API's readers, but no asset ever called it, so a
+    real pipeline run left `dim_campaign` empty and every campaign on the
+    dashboard rendered as an identifier. Every dimension test passed anyway,
+    because the fixtures in `conftest.py` call the loader themselves.
+
+    So this test asserts against the database AFTER a materialization, and never
+    calls `load_dim_campaign` itself. A fixture that does production's job hides
+    exactly the gap it is supposed to catch.
+    """
+    _, settings = pipeline_run
+    with psycopg.connect(settings.postgres_dsn) as conn:
+        dimension_rows = conn.execute("SELECT count(*) FROM dim_campaign").fetchone()
+        unnamed = conn.execute(
+            "SELECT count(*) FROM dim_campaign WHERE campaign_name = campaign_id"
+        ).fetchone()
+        orphans = conn.execute(
+            "SELECT count(*) FROM fct_campaign_daily f "
+            "WHERE NOT EXISTS (SELECT 1 FROM dim_campaign d "
+            "WHERE d.campaign_id = f.campaign_id)"
+        ).fetchone()
+
+    assert dimension_rows is not None and dimension_rows[0] > 0
+    assert unnamed is not None and unnamed[0] == 0, (
+        "every dimension row should carry a real name, not a fallback identifier"
+    )
+    assert orphans is not None and orphans[0] == 0, (
+        "every campaign in the facts must resolve to a dimension row"
+    )

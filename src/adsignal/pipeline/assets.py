@@ -31,7 +31,7 @@ from adsignal.narrative.chain import AllProvidersFailed, NarrativeChain
 from adsignal.narrative.types import NarrativeRequest
 from adsignal.warehouse.artifact_store import write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
-from adsignal.warehouse.loader import load_mart_to_postgres
+from adsignal.warehouse.loader import load_dim_campaign, load_mart_to_postgres
 from adsignal.warehouse.metrics_store import (
     write_drift_report,
     write_model_metrics,
@@ -192,12 +192,32 @@ def dbt_marts(context: AssetExecutionContext) -> None:
     description="Aggregated marts upserted into the Postgres serving layer",
 )
 def campaign_daily_mart(context: AssetExecutionContext) -> None:
-    """Upsert the DuckDB fact table into Postgres."""
+    """Upsert the DuckDB fact table and the campaign dimension into Postgres.
+
+    The dimension loads here rather than in an asset of its own for two
+    reasons. It is the same responsibility — both calls take this run's
+    DuckDB marts and full-refresh a Postgres serving table — and a separate
+    asset would open the DuckDB file a second time, which under Dagster's
+    multiprocess executor means a second concurrent reader of a file that
+    permits only one writer.
+
+    `load_dim_campaign` existed, was tested, and was read by the API's
+    campaign and anomaly queries, but nothing in the pipeline ever called it,
+    so every real run left `dim_campaign` empty and the dashboard rendered
+    identifiers where names belong. The dimension tests passed throughout,
+    because the fixtures that build them call the loader themselves.
+    """
     settings: Settings = context.resources.settings
     with _record(context, settings) as counter:
         loaded = load_mart_to_postgres(settings.duckdb_path, settings.postgres_dsn)
-        counter.rows = loaded
-        context.add_output_metadata({"rows_upserted": MetadataValue.int(loaded)})
+        dimension = load_dim_campaign(settings.duckdb_path, settings.postgres_dsn)
+        counter.rows = loaded + dimension
+        context.add_output_metadata(
+            {
+                "rows_upserted": MetadataValue.int(loaded),
+                "dimension_rows": MetadataValue.int(dimension),
+            }
+        )
 
 
 @asset(
