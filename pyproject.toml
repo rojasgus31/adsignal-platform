@@ -30,6 +30,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.8",
     "mypy>=1.13",
+    "pre-commit>=4.0",
     "pandas-stubs>=3.0.5.260914",
     "scipy-stubs>=1.18.1.1",
 ]
