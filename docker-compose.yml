@@ -99,15 +99,15 @@ services:
     deploy:
       resources:
         limits:
-          # Measured: 427.6 MB peak after a cold start, one /search and one
-          # /score, with both the embedder and the fitted detector/triage
-          # pair loaded (scripts/measure_memory.py) - Task 6b, after models
-          # moved from a shared filesystem directory to `model_artifacts` in
-          # Postgres. Scoring adds ~32 MB on top of /search's ~395 MB; the
-          # /search baseline itself has moved since the 388.0 MB this comment
-          # used to record (unrelated to Task 6b - re-measured, unchanged, on
-          # the image immediately before this task's own code). Render's free
-          # tier gives 512 MB.
+          # Measured: 409-440 MB peak after a cold start, one /search and
+          # one /score, with both the embedder and the fitted detector/triage
+          # pair loaded (scripts/measure_memory.py). That is a RANGE, not a
+          # tolerance: five runs of identical code at the same commit gave
+          # 408.9 / 423.6 / 427.6 / 438.7 / 440.2. create_app and /health are
+          # stable to ~1.3 MB across all five, so the spread is onnxruntime
+          # arena allocation in the embedding path, not application state.
+          # Do not replace this range with a single figure - see
+          # ARCHITECTURE.md section 8. Render's free tier gives 512 MB.
           memory: 512m
 
 volumes:

@@ -235,19 +235,45 @@ repository is scheduled by cron at the time of writing.
 
 ---
 
-## 8. Memory: 404 MB measured against a 512 MB ceiling
+## 8. Memory: 409-440 MB measured against a 512 MB ceiling
 
 `scripts/measure_memory.py` starts the app, issues `/health`, issues one
-`/search`, issues one `/score`, and reports peak RSS. The measured figure,
-recorded in the `api` service's `deploy.resources.limits` comment in
-`docker-compose.yml`, is **404.1 MB peak after a cold start, one `/search`
-and one `/score`, against the 512 MB the free tier gives.** The two fitted
-estimators `/score` unpickles cost ~16 MB on top of `/search`'s 388.0 MB —
-small next to the embedder because an `IsolationForest` of 200 shallow trees
-and two gradient-boosted ensembles are, unlike a transformer, mostly split
-thresholds. The script fails the run if `/score` answers anything but 200,
-because a peak measured without the models loaded is an understatement
-rather than a pass.
+`/search`, issues one `/score`, and reports peak RSS.
+
+**This document deliberately quotes a range rather than a figure.** Five runs
+of *identical* code at the same commit, same image, same command produced:
+
+```
+408.9   423.6   427.6   438.7   440.2      (MB peak RSS)
+```
+
+A 31.3 MB spread on code that did not change. The stages isolate where it
+comes from: `create_app` and `/health` are stable to within ~1.3 MB across all
+five runs, and the entire spread appears once `/search` and `/score` have run.
+That is onnxruntime's arena allocator, which sizes its pools from the
+allocation pattern it happens to see, not from anything the application
+controls.
+
+The honest consequence is that **any single memory number from this project is
+one sample from a ~30 MB-wide distribution.** An earlier revision of this
+document quoted 404.1 MB to four significant figures; that figure was real,
+and it was also just the low end of a band. The worst observed run leaves
+72 MB of headroom under the free tier's 512 MB.
+
+The two fitted estimators `/score` unpickles cost ~16 MB on top of `/search`
+— small next to the embedder, because an `IsolationForest` of 200 shallow
+trees and two gradient-boosted ensembles are, unlike a transformer, mostly
+split thresholds. `api/model_loader.py` unpickles them one at a time and drops
+each raw `bytea` blob's last reference before unpickling the next, so the two
+serialized blobs and the two fitted estimators are never all resident at once.
+
+The script fails the run if `/score` answers anything but 200, because a peak
+measured without the models loaded is an understatement rather than a pass.
+
+If the ceiling is ever breached in production, the first lever is to serve
+`/score` behind a feature flag — the endpoint already degrades to a named 503
+rather than crashing — and the second is the embedder fallback described
+below.
 
 What did *not* fit was MLflow. `ml/scoring.py` reaches `load_models` through
 `ml/registry.py`, which is also the module that logs training runs; a
@@ -292,11 +318,12 @@ limit would allow more concurrent inference and push peak memory toward the
 512 MB ceiling.
 
 To be precise about what is and is not known: **no controlled experiment
-comparing concurrent to serialized load exists in this repository.** The
-412 MB figure is a single-request measurement. The claim above is about
-ordering in the code — which is verifiable by reading it — not about a
-measured delta between load profiles. Nobody should quote a concurrency
-number from this document, because there isn't one.
+comparing concurrent to serialized load exists in this repository.** Every
+figure above is a single-request measurement, and as the range at the top of
+this section shows, even those vary by ~30 MB between runs. The claim about
+the limiter is about ordering in the code — which is verifiable by reading it
+— not about a measured delta between load profiles. Nobody should quote a
+concurrency number from this document, because there isn't one.
 
 If the ceiling is ever breached, the fallback is to drop the embedder from
 the API process entirely and serve `/search` from precomputed vectors only.
