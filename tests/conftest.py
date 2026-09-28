@@ -25,7 +25,7 @@ from adsignal.ml.training import BASELINE_WINDOW, train_and_evaluate
 from adsignal.warehouse.artifact_store import ensure_artifact_schema, write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
-from adsignal.warehouse.loader import load_mart_to_postgres
+from adsignal.warehouse.loader import load_dim_campaign, load_mart_to_postgres
 from adsignal.warehouse.metrics_store import (
     ensure_ml_schema,
     write_model_metrics,
@@ -245,12 +245,72 @@ def loaded_dimension(built_duckdb):
     Function-scoped to match `built_duckdb`'s own scope — a module-scoped
     fixture cannot depend on a function-scoped one.
     """
-    from adsignal.warehouse.loader import load_dim_campaign
-
     if not _postgres_available(TEST_DSN):
         pytest.skip("postgres unavailable")
     load_dim_campaign(built_duckdb, TEST_DSN)
     return TEST_DSN
+
+
+_ORPHAN_CAMPAIGN_ID = "cmp_without_a_dimension_row"
+_ORPHAN_ADVERTISER_ID = "adv_without_a_dimension_row"
+# Far enough in the future that `/anomalies` (ordered `event_date DESC`)
+# returns this row on its first page whatever else the seed wrote.
+_ORPHAN_EVENT_DATE = date(2099, 1, 1)
+
+
+@pytest.fixture
+def fact_row_without_dimension(client):
+    """Add a campaign that exists in the facts but not in `dim_campaign`.
+
+    A pipeline can load `fct_campaign_daily` and `anomaly_predictions`
+    without `dim_campaign` (nothing in the schema enforces a foreign key), so
+    the serving layer has to answer for a campaign it has no names for. The
+    rows are inserted directly rather than generated, because
+    `build_catalog` always creates a campaign alongside its advertiser and so
+    never produces this case on its own.
+
+    Function-scoped and removed again in teardown: `TEST_DSN` is shared with
+    the module-scoped `client` fixture, and
+    `test_every_fact_campaign_resolves_to_a_dimension_row` asserts that no
+    such row survives.
+    """
+    if not _postgres_available(TEST_DSN):
+        pytest.skip("Postgres not reachable")
+
+    with psycopg.connect(TEST_DSN) as conn:
+        conn.execute(
+            """
+            INSERT INTO fct_campaign_daily
+                (event_date, campaign_id, advertiser_id, channel, impressions,
+                 clicks, conversions, spend, revenue, is_anomaly)
+            VALUES (%s, %s, %s, 'search', 1000, 10, 1, 50.0, 100.0, TRUE)
+            """,
+            (_ORPHAN_EVENT_DATE, _ORPHAN_CAMPAIGN_ID, _ORPHAN_ADVERTISER_ID),
+        )
+        conn.execute(
+            """
+            INSERT INTO anomaly_predictions
+                (event_date, campaign_id, run_id, cause, confidence, severity,
+                 escalate, anomaly_score)
+            VALUES (%s, %s, 'run_2', 'budget_pacing', 0.9, 3, TRUE, 0.8)
+            """,
+            (_ORPHAN_EVENT_DATE, _ORPHAN_CAMPAIGN_ID),
+        )
+        conn.commit()
+
+    try:
+        yield _ORPHAN_CAMPAIGN_ID, _ORPHAN_ADVERTISER_ID, _ORPHAN_EVENT_DATE
+    finally:
+        with psycopg.connect(TEST_DSN) as conn:
+            conn.execute(
+                "DELETE FROM fct_campaign_daily WHERE campaign_id = %s",
+                (_ORPHAN_CAMPAIGN_ID,),
+            )
+            conn.execute(
+                "DELETE FROM anomaly_predictions WHERE campaign_id = %s",
+                (_ORPHAN_CAMPAIGN_ID,),
+            )
+            conn.commit()
 
 
 def _flat_series(days: int = 40, spend: float = 100.0) -> pd.DataFrame:
@@ -386,6 +446,11 @@ def _api_seed(tmp_path_factory) -> str:
         conn.execute("TRUNCATE TABLE fct_campaign_daily")
         conn.commit()
     load_mart_to_postgres(duckdb_path, TEST_DSN)
+    # The dimension is loaded from the same DuckDB file as the mart, so every
+    # fact campaign here has a dimension row and the API's name fields hold
+    # real names. `load_dim_campaign` truncates first, so rows left behind by
+    # an earlier run of this suite cannot leak into these assertions.
+    load_dim_campaign(duckdb_path, TEST_DSN)
 
     ensure_ml_schema(TEST_DSN)
     with psycopg.connect(TEST_DSN) as conn:
@@ -553,6 +618,7 @@ def empty_client():
     with psycopg.connect(EMPTY_TEST_DSN) as conn:
         for table in (
             "fct_campaign_daily",
+            "dim_campaign",
             "model_metrics",
             "drift_reports",
             "anomaly_predictions",
@@ -592,6 +658,7 @@ def dropped_tables_client():
     with psycopg.connect(DROPPED_TEST_DSN) as conn:
         for table in (
             "fct_campaign_daily",
+            "dim_campaign",
             "model_metrics",
             "drift_reports",
             "anomaly_predictions",

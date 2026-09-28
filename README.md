@@ -204,9 +204,9 @@ pipeline writes.
 | Endpoint | Returns |
 |---|---|
 | `GET /health` | Liveness check |
-| `GET /campaigns` | Every known campaign |
+| `GET /campaigns` | Every known campaign, with its campaign and advertiser display names |
 | `GET /campaigns/{id}/metrics` | One campaign's full daily time series |
-| `GET /anomalies` | One bounded page of current anomaly predictions (`limit`, `offset`) |
+| `GET /anomalies` | One bounded page of current anomaly predictions, each carrying its campaign name (`limit`, `offset`) |
 | `GET /anomalies/{campaign_id}/{event_date}` | One campaign-day's prediction |
 | `GET /models` | One bounded page of training-run evaluations, newest first (`limit`, `offset`) |
 | `GET /benchmark` | Recent runs plus which narrative provider answered most recently |

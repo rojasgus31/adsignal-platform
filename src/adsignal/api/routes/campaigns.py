@@ -16,7 +16,9 @@ def get_campaigns(settings: Settings = Depends(get_settings)) -> list[CampaignSu
     return [
         CampaignSummary(
             campaign_id=info.campaign_id,
+            campaign_name=info.campaign_name,
             advertiser_id=info.advertiser_id,
+            advertiser_name=info.advertiser_name,
             channel=info.channel,
         )
         for info in list_campaigns(settings.postgres_dsn)

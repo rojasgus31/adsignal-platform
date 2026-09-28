@@ -5,7 +5,8 @@ from fastapi import APIRouter, Depends, Query
 from adsignal.api.deps import get_settings
 from adsignal.api.schemas import RunOut
 from adsignal.config import Settings
-from adsignal.warehouse.run_log import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, RunEntry, read_runs
+from adsignal.warehouse.paging import DEFAULT_RUN_PAGE_LIMIT, MAX_PAGE_LIMIT
+from adsignal.warehouse.run_log import RunEntry, read_runs
 
 router = APIRouter(tags=["operations"])
 
@@ -25,7 +26,7 @@ def _to_run_out(entry: RunEntry) -> RunOut:
 @router.get("/operations", response_model=list[RunOut])
 def get_operations(
     settings: Settings = Depends(get_settings),
-    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    limit: int = Query(DEFAULT_RUN_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> list[RunOut]:
     """List one page of the pipeline's own operations log, newest first.

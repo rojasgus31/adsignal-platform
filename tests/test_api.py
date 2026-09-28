@@ -3,7 +3,11 @@ import os
 import psycopg
 from fastapi.testclient import TestClient
 
-from adsignal.warehouse.serving_reads import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+from adsignal.warehouse.paging import (
+    DEFAULT_RUN_PAGE_LIMIT,
+    DEFAULT_SERVING_PAGE_LIMIT,
+    MAX_PAGE_LIMIT,
+)
 
 # Same pattern as every other DSN-driven test module: the env var is an
 # override, not a requirement.
@@ -238,7 +242,7 @@ def test_the_collections_default_to_a_bounded_page(client) -> None:
     for path in ("/models", "/anomalies"):
         response = client.get(path)
         assert response.status_code == 200
-        assert len(response.json()) <= DEFAULT_PAGE_LIMIT
+        assert len(response.json()) <= DEFAULT_SERVING_PAGE_LIMIT
 
 
 def test_two_forwarded_callers_do_not_share_a_rate_limit_budget(monkeypatch) -> None:
@@ -263,3 +267,105 @@ def test_two_forwarded_callers_do_not_share_a_rate_limit_budget(monkeypatch) -> 
             headers={"X-Forwarded-For": "198.51.100.2"},
         )
         assert second.status_code == 200, "a second caller inherited the first's budget"
+
+
+def test_campaigns_carry_human_names(client) -> None:
+    """The spec's success criterion: every table shows names, not identifiers.
+
+    The seed loads `dim_campaign` from the same DuckDB file as the mart, so
+    every row here has a dimension row and the names are the generated ones
+    (`build_catalog` never emits a name starting with `cmp_`/`adv_`), not the
+    identifier fallback `test_a_campaign_missing_from_the_dimension_*`
+    covers.
+    """
+    body = client.get("/campaigns").json()
+    assert body
+    assert {"campaign_id", "campaign_name", "advertiser_id", "advertiser_name"} <= set(body[0])
+    for row in body:
+        assert not row["campaign_name"].startswith("cmp_")
+        assert not row["advertiser_name"].startswith("adv_")
+
+
+def test_anomalies_carry_a_campaign_name(client) -> None:
+    """Task 10 groups the anomalies table by campaign name, so the name has to
+    arrive on the anomaly row itself rather than in a second request."""
+    body = client.get("/anomalies", params={"limit": 5}).json()
+    assert body
+    for row in body:
+        assert row["campaign_name"]
+        assert not row["campaign_name"].startswith("cmp_")
+
+
+def test_one_anomaly_carries_a_campaign_name(client) -> None:
+    page = client.get("/anomalies", params={"limit": 1}).json()
+    assert page
+    first = page[0]
+    single = client.get(f"/anomalies/{first['campaign_id']}/{first['event_date']}")
+    assert single.status_code == 200
+    assert single.json()["campaign_name"] == first["campaign_name"]
+
+
+def test_a_campaign_missing_from_the_dimension_falls_back_to_its_id(
+    client, fact_row_without_dimension
+) -> None:
+    """A dashboard showing an id is worse than nothing; a dashboard silently
+    dropping the row is worse still. The id is what the name fields carry when
+    the dimension has no row for the campaign."""
+    campaign_id, advertiser_id, _ = fact_row_without_dimension
+
+    rows = client.get("/campaigns").json()
+    orphan = next((row for row in rows if row["campaign_id"] == campaign_id), None)
+    assert orphan is not None, "the campaign vanished from /campaigns"
+    assert orphan["campaign_name"] == campaign_id
+    assert orphan["advertiser_name"] == advertiser_id
+
+
+def test_an_anomaly_missing_from_the_dimension_falls_back_to_its_id(
+    client, fact_row_without_dimension
+) -> None:
+    campaign_id, _, event_date = fact_row_without_dimension
+
+    page = client.get("/anomalies", params={"limit": 1}).json()
+    assert page, "the orphan anomaly vanished from /anomalies"
+    assert page[0]["campaign_id"] == campaign_id
+    assert page[0]["campaign_name"] == campaign_id
+
+    single = client.get(f"/anomalies/{campaign_id}/{event_date}")
+    assert single.status_code == 200
+    assert single.json()["campaign_name"] == campaign_id
+
+
+def test_the_name_fields_survive_a_fresh_database(empty_client) -> None:
+    """Fresh-database contract for the two name-carrying payloads: 200 with an
+    empty list, never a 500 and never a row missing its new keys."""
+    for path in ("/campaigns", "/anomalies"):
+        response = empty_client.get(path)
+        assert response.status_code == 200, f"{path} returned {response.status_code}"
+        assert response.json() == []
+
+
+def test_the_name_fields_survive_a_database_with_no_tables(dropped_tables_client) -> None:
+    """`dropped_tables_client` drops `dim_campaign` too, so this covers the
+    join's own table being absent, not just empty."""
+    for path in ("/campaigns", "/anomalies"):
+        response = dropped_tables_client.get(path)
+        assert response.status_code == 200, f"{path} returned {response.status_code}"
+        assert response.json() == []
+
+
+def test_each_collection_declares_the_page_default_its_own_reader_uses(client) -> None:
+    """The two `DEFAULT_*_PAGE_LIMIT` constants differ on purpose, and each
+    endpoint has to advertise the one belonging to the reader behind it: the
+    operations log pages at 50, the serving reads at 100. A single shared
+    `DEFAULT_PAGE_LIMIT` would silently move one of them."""
+    paths = client.get("/openapi.json").json()["paths"]
+
+    def declared_default(path: str) -> int:
+        parameters = paths[path]["get"]["parameters"]
+        limit = next(parameter for parameter in parameters if parameter["name"] == "limit")
+        return int(limit["schema"]["default"])
+
+    assert declared_default("/operations") == DEFAULT_RUN_PAGE_LIMIT
+    assert declared_default("/anomalies") == DEFAULT_SERVING_PAGE_LIMIT
+    assert declared_default("/models") == DEFAULT_SERVING_PAGE_LIMIT
+    assert DEFAULT_RUN_PAGE_LIMIT != DEFAULT_SERVING_PAGE_LIMIT

@@ -11,10 +11,18 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class CampaignSummary(BaseModel):
-    """One row of `GET /campaigns`."""
+    """One row of `GET /campaigns`.
+
+    Both name fields are always present and never null. When `dim_campaign`
+    has no row for the campaign they carry the corresponding identifier, so a
+    dashboard rendering `campaign_name` shows an id rather than an empty cell
+    - see `warehouse.campaign_reads._LIST_CAMPAIGNS_SQL`.
+    """
 
     campaign_id: str
+    campaign_name: str
     advertiser_id: str
+    advertiser_name: str
     channel: str
 
 
@@ -38,9 +46,16 @@ class CampaignMetrics(BaseModel):
 
 
 class AnomalyOut(BaseModel):
-    """One row of `GET /anomalies`."""
+    """One row of `GET /anomalies` and of `GET /anomalies/{campaign_id}/{event_date}`.
+
+    `campaign_name` is always present and never null; it carries
+    `campaign_id` when `dim_campaign` has no row for the campaign. It is
+    joined onto the prediction in the warehouse read, so grouping this table
+    by campaign name costs the client no extra request.
+    """
 
     campaign_id: str
+    campaign_name: str
     event_date: date
     cause: str
     confidence: float

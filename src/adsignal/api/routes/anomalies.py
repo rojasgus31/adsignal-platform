@@ -7,9 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from adsignal.api.deps import get_settings
 from adsignal.api.schemas import AnomalyOut
 from adsignal.config import Settings
+from adsignal.warehouse.paging import DEFAULT_SERVING_PAGE_LIMIT, MAX_PAGE_LIMIT
 from adsignal.warehouse.serving_reads import (
-    DEFAULT_PAGE_LIMIT,
-    MAX_PAGE_LIMIT,
     AnomalyPredictionRow,
     read_anomaly_prediction,
     read_anomaly_predictions,
@@ -21,6 +20,7 @@ router = APIRouter(tags=["anomalies"])
 def _to_anomaly_out(row: AnomalyPredictionRow) -> AnomalyOut:
     return AnomalyOut(
         campaign_id=row.campaign_id,
+        campaign_name=row.campaign_name,
         event_date=row.event_date,
         cause=row.cause,
         confidence=row.confidence,
@@ -33,7 +33,7 @@ def _to_anomaly_out(row: AnomalyPredictionRow) -> AnomalyOut:
 @router.get("/anomalies", response_model=list[AnomalyOut])
 def get_anomalies(
     settings: Settings = Depends(get_settings),
-    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    limit: int = Query(DEFAULT_SERVING_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> list[AnomalyOut]:
     """List one page of current anomaly predictions, most recent day first.

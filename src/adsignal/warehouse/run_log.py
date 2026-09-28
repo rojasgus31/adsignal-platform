@@ -19,19 +19,9 @@ one caller in this codebase (`adsignal.pipeline.assets._record`) honours it.
 from dataclasses import dataclass
 from datetime import datetime
 
+from adsignal.warehouse.paging import DEFAULT_RUN_PAGE_LIMIT
 from adsignal.warehouse.pool import connection
 from adsignal.warehouse.schema import apply_schema
-
-# The bound `read_runs`'s own default uses, and the ceiling a caller may ask
-# for. Matches `serving_reads.py`'s rationale: defined here, in the layer that
-# enforces them, so the public endpoint that reads this table in a later task
-# can clamp against `MAX_PAGE_LIMIT` without `api/` inventing its own ceiling
-# and inverting the "api/ depends on warehouse/" dependency. `DEFAULT_PAGE_LIMIT`
-# is 50, not `serving_reads.py`'s 100, to match this module's own pinned
-# `read_runs(..., limit: int = 50, ...)` signature; `MAX_PAGE_LIMIT` reuses
-# `serving_reads.py`'s value.
-DEFAULT_PAGE_LIMIT = 50
-MAX_PAGE_LIMIT = 500
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS pipeline_runs (
@@ -103,7 +93,7 @@ def record_run(dsn: str, entry: RunEntry) -> None:
         conn.commit()
 
 
-def read_runs(dsn: str, limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0) -> list[RunEntry]:
+def read_runs(dsn: str, limit: int = DEFAULT_RUN_PAGE_LIMIT, offset: int = 0) -> list[RunEntry]:
     """Return one page of runs, newest first.
 
     Bounded in SQL, like `warehouse.serving_reads`: the log grows with every

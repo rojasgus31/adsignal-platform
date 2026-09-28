@@ -19,16 +19,41 @@ pickled model bytes from Postgres instead - see
 from dataclasses import dataclass
 from datetime import date, datetime
 
+from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
+from adsignal.warehouse.paging import DEFAULT_SERVING_PAGE_LIMIT
 from adsignal.warehouse.pool import connection
 
-# The bound both collection readers share, and the ceiling a caller may ask
-# for. An unbounded collection is a denial-of-service lever: one response
-# otherwise grows with the table, and clients have no pagination contract to
-# code against. Defined here, in the layer that enforces them, rather than in
-# a router - `api/` depends on `warehouse/`, never the reverse.
-DEFAULT_PAGE_LIMIT = 100
-MAX_PAGE_LIMIT = 500
+# Every anomaly row carries a display name. `anomaly_predictions` stores a
+# campaign_id and nothing else about the campaign, so the name is joined from
+# `dim_campaign` in the same query rather than looked up once per row by the
+# caller. The LEFT JOIN falls back to the identifier because nothing in the
+# schema forces a predicted campaign to have a dimension row, and an INNER
+# JOIN would drop those predictions from the response entirely.
+_ANOMALY_SELECT = """
+SELECT predictions.campaign_id,
+       COALESCE(dim.campaign_name, predictions.campaign_id) AS campaign_name,
+       predictions.event_date, predictions.run_id, predictions.cause,
+       predictions.confidence, predictions.severity, predictions.escalate,
+       predictions.anomaly_score
+FROM anomaly_predictions AS predictions
+LEFT JOIN dim_campaign AS dim ON dim.campaign_id = predictions.campaign_id
+"""
+
+_ANOMALY_PAGE_SQL = (
+    _ANOMALY_SELECT
+    + """
+ORDER BY predictions.event_date DESC, predictions.campaign_id
+LIMIT %s OFFSET %s
+"""
+)
+
+_ONE_ANOMALY_SQL = (
+    _ANOMALY_SELECT
+    + """
+WHERE predictions.campaign_id = %s AND predictions.event_date = %s
+"""
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +86,15 @@ class ModelEvidence:
 
 @dataclass(frozen=True, slots=True)
 class AnomalyPredictionRow:
-    """One `anomaly_predictions` row, as read back for the API."""
+    """One `anomaly_predictions` row, as read back for the API.
+
+    `campaign_name` is not stored on the row: it is joined from
+    `dim_campaign`, and holds `campaign_id` when the dimension has no row for
+    the campaign. It is never empty and never absent.
+    """
 
     campaign_id: str
+    campaign_name: str
     event_date: date
     run_id: str
     cause: str
@@ -74,7 +105,7 @@ class AnomalyPredictionRow:
 
 
 def read_model_metrics(
-    dsn: str, limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0
+    dsn: str, limit: int = DEFAULT_SERVING_PAGE_LIMIT, offset: int = 0
 ) -> list[ModelMetricsRow]:
     """Return one page of training-run evaluations, newest first.
 
@@ -124,41 +155,35 @@ def read_model_evidence(dsn: str, run_id: str) -> ModelEvidence | None:
 
 
 def read_anomaly_predictions(
-    dsn: str, limit: int = DEFAULT_PAGE_LIMIT, offset: int = 0
+    dsn: str, limit: int = DEFAULT_SERVING_PAGE_LIMIT, offset: int = 0
 ) -> list[AnomalyPredictionRow]:
     """Return one page of current anomaly predictions, most recent day first.
 
     Bounded for the same reason as `read_model_metrics`: every campaign-day
     the current model flags is a row here.
+
+    Both `ensure_*_schema` calls run first because the query spans two
+    domains' tables - `anomaly_predictions` from the ML schema and
+    `dim_campaign` from the mart schema - so a database missing either one
+    answers with an empty list rather than "relation does not exist".
     """
     ensure_ml_schema(dsn)
+    ensure_mart_schema(dsn)
     with connection(dsn) as conn:
-        rows = conn.execute(
-            """
-            SELECT campaign_id, event_date, run_id, cause, confidence, severity,
-                   escalate, anomaly_score
-            FROM anomaly_predictions
-            ORDER BY event_date DESC, campaign_id
-            LIMIT %s OFFSET %s
-            """,
-            (limit, offset),
-        ).fetchall()
+        rows = conn.execute(_ANOMALY_PAGE_SQL, (limit, offset)).fetchall()
     return [AnomalyPredictionRow(*row) for row in rows]
 
 
 def read_anomaly_prediction(
     dsn: str, campaign_id: str, event_date: date
 ) -> AnomalyPredictionRow | None:
-    """Return the prediction for one campaign-day, or None if there is none."""
+    """Return the prediction for one campaign-day, or None if there is none.
+
+    Carries the same joined `campaign_name`, and the same identifier
+    fallback, as `read_anomaly_predictions`.
+    """
     ensure_ml_schema(dsn)
+    ensure_mart_schema(dsn)
     with connection(dsn) as conn:
-        row = conn.execute(
-            """
-            SELECT campaign_id, event_date, run_id, cause, confidence, severity,
-                   escalate, anomaly_score
-            FROM anomaly_predictions
-            WHERE campaign_id = %s AND event_date = %s
-            """,
-            (campaign_id, event_date),
-        ).fetchone()
+        row = conn.execute(_ONE_ANOMALY_SQL, (campaign_id, event_date)).fetchone()
     return AnomalyPredictionRow(*row) if row is not None else None

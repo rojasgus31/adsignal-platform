@@ -20,10 +20,25 @@ from adsignal.warehouse.pool import connection
 # The mart is keyed (event_date, campaign_id), so a campaign's advertiser and
 # channel are carried on every one of its rows. `DISTINCT ON` takes them from
 # the campaign's earliest row and lets Postgres do the deduplication.
+#
+# The display names come from `dim_campaign` in the same query. It is a LEFT
+# JOIN, and the names fall back to the identifiers, because nothing in the
+# schema forces a fact campaign to have a dimension row: a pipeline that
+# loaded the mart but not the dimension would otherwise drop those campaigns
+# from the list entirely. One join, not one lookup per row.
 _LIST_CAMPAIGNS_SQL = """
-SELECT DISTINCT ON (campaign_id) campaign_id, advertiser_id, channel
-FROM fct_campaign_daily
-ORDER BY campaign_id, event_date
+SELECT facts.campaign_id,
+       COALESCE(dim.campaign_name, facts.campaign_id) AS campaign_name,
+       facts.advertiser_id,
+       COALESCE(dim.advertiser_name, facts.advertiser_id) AS advertiser_name,
+       facts.channel
+FROM (
+    SELECT DISTINCT ON (campaign_id) campaign_id, advertiser_id, channel
+    FROM fct_campaign_daily
+    ORDER BY campaign_id, event_date
+) AS facts
+LEFT JOIN dim_campaign AS dim ON dim.campaign_id = facts.campaign_id
+ORDER BY facts.campaign_id
 """
 
 _CAMPAIGN_METRICS_SQL = """
@@ -36,10 +51,18 @@ ORDER BY event_date
 
 @dataclass(frozen=True, slots=True)
 class CampaignInfo:
-    """One distinct campaign known to the mart."""
+    """One distinct campaign known to the mart, with its display names.
+
+    `campaign_name` and `advertiser_name` hold the campaign's own identifier
+    and its advertiser's identifier when `dim_campaign` has no row for the
+    campaign - see `_LIST_CAMPAIGNS_SQL`. They are never empty and never
+    absent.
+    """
 
     campaign_id: str
+    campaign_name: str
     advertiser_id: str
+    advertiser_name: str
     channel: str
 
 
@@ -60,15 +83,21 @@ def list_campaigns(dsn: str) -> list[CampaignInfo]:
     """Return one entry per distinct campaign, ordered by campaign_id.
 
     Empty, not an error, on a mart that has never been loaded — including
-    against a database where `fct_campaign_daily` does not exist at all yet,
-    which `ensure_schema` guards against before the query runs.
+    against a database where neither `fct_campaign_daily` nor `dim_campaign`
+    exists yet: `ensure_schema` creates both before the query runs.
     """
     ensure_schema(dsn)
     with connection(dsn) as conn:
         rows = conn.execute(_LIST_CAMPAIGNS_SQL).fetchall()
     return [
-        CampaignInfo(str(campaign_id), str(advertiser_id), str(channel))
-        for campaign_id, advertiser_id, channel in rows
+        CampaignInfo(
+            str(campaign_id),
+            str(campaign_name),
+            str(advertiser_id),
+            str(advertiser_name),
+            str(channel),
+        )
+        for campaign_id, campaign_name, advertiser_id, advertiser_name, channel in rows
     ]
 
 

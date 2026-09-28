@@ -6,12 +6,8 @@ from adsignal.api.deps import get_settings
 from adsignal.api.schemas import BenchmarkOut, BenchmarkRun, ModelMetricsOut
 from adsignal.config import Settings
 from adsignal.warehouse.narrative_store import read_latest_narrative
-from adsignal.warehouse.serving_reads import (
-    DEFAULT_PAGE_LIMIT,
-    MAX_PAGE_LIMIT,
-    ModelMetricsRow,
-    read_model_metrics,
-)
+from adsignal.warehouse.paging import DEFAULT_SERVING_PAGE_LIMIT, MAX_PAGE_LIMIT
+from adsignal.warehouse.serving_reads import ModelMetricsRow, read_model_metrics
 
 router = APIRouter(tags=["models"])
 
@@ -32,7 +28,7 @@ def _to_model_metrics_out(row: ModelMetricsRow) -> ModelMetricsOut:
 @router.get("/models", response_model=list[ModelMetricsOut])
 def get_models(
     settings: Settings = Depends(get_settings),
-    limit: int = Query(DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    limit: int = Query(DEFAULT_SERVING_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
     offset: int = Query(0, ge=0),
 ) -> list[ModelMetricsOut]:
     """List one page of training-run evaluations, newest first.
