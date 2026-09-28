@@ -117,6 +117,22 @@ CONCURRENCY_TEST_DSN = os.environ.get(
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_concurrent",
 )
 
+# A sixth, separate database for `loaded_dimension` and everything in
+# `test_dim_campaign.py`. That fixture calls `load_dim_campaign`, which
+# TRUNCATEs before inserting, and it used to run against `TEST_DSN` - the same
+# database the module-scoped `_api_seed` loads `dim_campaign` into. One
+# function-scoped fixture replacing a module-scoped fixture's rows mid-session
+# was harmless only for as long as both happened to build from the same
+# `_build_small_dataset` call; changing either one's seed, advertiser count or
+# date window would have turned it into an order-dependent failure in
+# `test_campaigns_carry_human_names` that reads exactly like a serving-layer
+# bug (Task 9b review, Finding 4). A database of its own removes the
+# collision rather than documenting it.
+DIM_TEST_DSN = os.environ.get(
+    "ADSIGNAL_DIM_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_dim",
+)
+
 # A fifth, separate database for `db_only_client`: the production topology
 # Task 6b exists to make true, where the API and the training job do not
 # share a filesystem. `_db_only_seed` never calls `ml.registry.save_models`,
@@ -134,6 +150,7 @@ _ensure_test_database(EMPTY_TEST_DSN)
 _ensure_test_database(DROPPED_TEST_DSN)
 _ensure_test_database(CONCURRENCY_TEST_DSN)
 _ensure_test_database(DB_ONLY_TEST_DSN)
+_ensure_test_database(DIM_TEST_DSN)
 
 
 def _postgres_available(dsn: str) -> bool:
@@ -240,15 +257,26 @@ def built_duckdb_with_orphan_campaign(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def loaded_dimension(built_duckdb):
-    """Load `dim_campaign` into TEST_DSN.
+    """Load both `fct_campaign_daily` and `dim_campaign` into `DIM_TEST_DSN`.
+
+    Returns the DSN, which callers must use rather than reaching for
+    `TEST_DSN`: this fixture owns a database of its own so that its
+    truncating loads cannot replace the rows `_api_seed` put in `TEST_DSN`
+    (see `DIM_TEST_DSN` above).
+
+    Both tables are loaded from the same `built_duckdb` file, so
+    `test_every_fact_campaign_resolves_to_a_dimension_row` compares a fact
+    table and a dimension built from one dataset instead of depending on
+    whatever another module happened to leave behind.
 
     Function-scoped to match `built_duckdb`'s own scope — a module-scoped
     fixture cannot depend on a function-scoped one.
     """
-    if not _postgres_available(TEST_DSN):
+    if not _postgres_available(DIM_TEST_DSN):
         pytest.skip("postgres unavailable")
-    load_dim_campaign(built_duckdb, TEST_DSN)
-    return TEST_DSN
+    load_mart_to_postgres(built_duckdb, DIM_TEST_DSN)
+    load_dim_campaign(built_duckdb, DIM_TEST_DSN)
+    return DIM_TEST_DSN
 
 
 _ORPHAN_CAMPAIGN_ID = "cmp_without_a_dimension_row"

@@ -26,11 +26,18 @@ from adsignal.warehouse.pool import connection
 # schema forces a fact campaign to have a dimension row: a pipeline that
 # loaded the mart but not the dimension would otherwise drop those campaigns
 # from the list entirely. One join, not one lookup per row.
+#
+# `NULLIF(..., '')` sits inside each `COALESCE` because `COALESCE` substitutes
+# only on SQL NULL, while `dim_campaign.campaign_name` is `TEXT NOT NULL` and
+# its dbt `not_null` test both admit the empty string. Without it a dimension
+# row carrying '' would serve '' - an empty cell in the dashboard, which is
+# the outcome this fallback exists to prevent. A blank name is treated as a
+# missing one.
 _LIST_CAMPAIGNS_SQL = """
 SELECT facts.campaign_id,
-       COALESCE(dim.campaign_name, facts.campaign_id) AS campaign_name,
+       COALESCE(NULLIF(dim.campaign_name, ''), facts.campaign_id) AS campaign_name,
        facts.advertiser_id,
-       COALESCE(dim.advertiser_name, facts.advertiser_id) AS advertiser_name,
+       COALESCE(NULLIF(dim.advertiser_name, ''), facts.advertiser_id) AS advertiser_name,
        facts.channel
 FROM (
     SELECT DISTINCT ON (campaign_id) campaign_id, advertiser_id, channel
@@ -55,8 +62,13 @@ class CampaignInfo:
 
     `campaign_name` and `advertiser_name` hold the campaign's own identifier
     and its advertiser's identifier when `dim_campaign` has no row for the
-    campaign - see `_LIST_CAMPAIGNS_SQL`. They are never empty and never
-    absent.
+    campaign, or when the row it has carries a blank name - see
+    `_LIST_CAMPAIGNS_SQL`. They are never None.
+
+    They are not guaranteed non-empty: that would require the identifiers
+    themselves to be non-empty, and `campaign_id`/`advertiser_id` are only
+    `TEXT NOT NULL` in the mart. What is guaranteed is that a blank in the
+    dimension is never what gets served.
     """
 
     campaign_id: str

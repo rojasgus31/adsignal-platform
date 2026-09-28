@@ -356,8 +356,16 @@ def test_the_name_fields_survive_a_database_with_no_tables(dropped_tables_client
 def test_each_collection_declares_the_page_default_its_own_reader_uses(client) -> None:
     """The two `DEFAULT_*_PAGE_LIMIT` constants differ on purpose, and each
     endpoint has to advertise the one belonging to the reader behind it: the
-    operations log pages at 50, the serving reads at 100. A single shared
-    `DEFAULT_PAGE_LIMIT` would silently move one of them."""
+    operations log pages at 50, the serving reads at 100.
+
+    The published defaults are asserted against the literals 50 and 100, not
+    only against the constants. Comparing an endpoint's declared default to
+    the constant it is populated from lets both sides move together - editing
+    `paging.py` from 50 to 75 would change what `/operations` promises every
+    client while the test stayed green (Task 9b review, Finding 1). The
+    constants are then checked against the same literals, so a rename that
+    repointed an endpoint at the other reader's default still fails.
+    """
     paths = client.get("/openapi.json").json()["paths"]
 
     def declared_default(path: str) -> int:
@@ -365,7 +373,10 @@ def test_each_collection_declares_the_page_default_its_own_reader_uses(client) -
         limit = next(parameter for parameter in parameters if parameter["name"] == "limit")
         return int(limit["schema"]["default"])
 
-    assert declared_default("/operations") == DEFAULT_RUN_PAGE_LIMIT
-    assert declared_default("/anomalies") == DEFAULT_SERVING_PAGE_LIMIT
-    assert declared_default("/models") == DEFAULT_SERVING_PAGE_LIMIT
-    assert DEFAULT_RUN_PAGE_LIMIT != DEFAULT_SERVING_PAGE_LIMIT
+    assert declared_default("/operations") == 50
+    assert declared_default("/anomalies") == 100
+    assert declared_default("/models") == 100
+
+    assert DEFAULT_RUN_PAGE_LIMIT == 50
+    assert DEFAULT_SERVING_PAGE_LIMIT == 100
+    assert MAX_PAGE_LIMIT == 500

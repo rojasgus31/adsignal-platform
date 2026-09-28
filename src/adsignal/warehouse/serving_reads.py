@@ -30,9 +30,13 @@ from adsignal.warehouse.pool import connection
 # caller. The LEFT JOIN falls back to the identifier because nothing in the
 # schema forces a predicted campaign to have a dimension row, and an INNER
 # JOIN would drop those predictions from the response entirely.
+#
+# `NULLIF(..., '')` for the same reason as in `campaign_reads.py`: the column
+# is `TEXT NOT NULL`, which admits '', and serving '' would put an empty cell
+# where the fallback is supposed to put an identifier.
 _ANOMALY_SELECT = """
 SELECT predictions.campaign_id,
-       COALESCE(dim.campaign_name, predictions.campaign_id) AS campaign_name,
+       COALESCE(NULLIF(dim.campaign_name, ''), predictions.campaign_id) AS campaign_name,
        predictions.event_date, predictions.run_id, predictions.cause,
        predictions.confidence, predictions.severity, predictions.escalate,
        predictions.anomaly_score
@@ -90,7 +94,9 @@ class AnomalyPredictionRow:
 
     `campaign_name` is not stored on the row: it is joined from
     `dim_campaign`, and holds `campaign_id` when the dimension has no row for
-    the campaign. It is never empty and never absent.
+    the campaign or that row's name is blank. It is never None; see
+    `campaign_reads.CampaignInfo` for why "never empty" would be a stronger
+    claim than the mart's columns support.
     """
 
     campaign_id: str

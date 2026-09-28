@@ -14,9 +14,11 @@ class CampaignSummary(BaseModel):
     """One row of `GET /campaigns`.
 
     Both name fields are always present and never null. When `dim_campaign`
-    has no row for the campaign they carry the corresponding identifier, so a
-    dashboard rendering `campaign_name` shows an id rather than an empty cell
-    - see `warehouse.campaign_reads._LIST_CAMPAIGNS_SQL`.
+    has no row for the campaign, or the row it has carries a blank name, they
+    carry the corresponding identifier - so a dashboard rendering
+    `campaign_name` shows an id rather than an empty cell. See
+    `warehouse.campaign_reads._LIST_CAMPAIGNS_SQL`, which is where both the
+    fallback and the blank-name handling live.
     """
 
     campaign_id: str
@@ -49,9 +51,10 @@ class AnomalyOut(BaseModel):
     """One row of `GET /anomalies` and of `GET /anomalies/{campaign_id}/{event_date}`.
 
     `campaign_name` is always present and never null; it carries
-    `campaign_id` when `dim_campaign` has no row for the campaign. It is
-    joined onto the prediction in the warehouse read, so grouping this table
-    by campaign name costs the client no extra request.
+    `campaign_id` when `dim_campaign` has no row for the campaign or that
+    row's name is blank. It is joined onto the prediction in the warehouse
+    read, so labelling this table with campaign names costs the client no
+    extra request.
     """
 
     campaign_id: str
