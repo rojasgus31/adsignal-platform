@@ -102,11 +102,35 @@ class BenchmarkRun(BaseModel):
     detector_roc_auc: float
 
 
+class NarrativeOut(BaseModel):
+    """The most recently stored narrative, served inside `GET /benchmark`.
+
+    `text` is the prose exactly as `narrative_runs` holds it: the API reads
+    the row and passes it through, it does not regenerate or reformat it, so
+    what a reader sees is what the provider that answered actually wrote.
+
+    `provider` is that provider's name (`stub`, `gemini`, ...) and nothing
+    else - `narrative_runs` stores no key, model identifier or endpoint URL,
+    so there is none to leak here.
+    """
+
+    as_of: date
+    text: str
+    provider: str
+    generated_at: datetime
+
+
 class BenchmarkOut(BaseModel):
-    """`GET /benchmark`: every run, plus which narrative provider answered most recently."""
+    """`GET /benchmark`: every run, plus the most recently stored narrative.
+
+    `latest_narrative` is null when `narrative_runs` holds no row - a
+    database the narrative job has never run against answers 200 with a null
+    here, rather than failing or serving an empty string that a dashboard
+    would render as a blank paragraph.
+    """
 
     runs: list[BenchmarkRun]
-    latest_narrative_provider: str | None = None
+    latest_narrative: NarrativeOut | None = None
 
 
 class RunOut(BaseModel):

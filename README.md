@@ -209,7 +209,7 @@ pipeline writes.
 | `GET /anomalies` | One bounded page of current anomaly predictions, each carrying its campaign name (`limit`, `offset`) |
 | `GET /anomalies/{campaign_id}/{event_date}` | One campaign-day's prediction |
 | `GET /models` | One bounded page of training-run evaluations, newest first (`limit`, `offset`) |
-| `GET /benchmark` | Recent runs plus which narrative provider answered most recently |
+| `GET /benchmark` | Recent runs plus the most recently stored narrative: its prose, date, provider name and generation time (null before the narrative job has run) |
 | `POST /search` | Semantic search over stored entity embeddings |
 | `POST /score` | Score one campaign-day on demand, with the loaded models |
 | `POST /ask` | A natural-language question, answered from precomputed data |

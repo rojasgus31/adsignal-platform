@@ -35,6 +35,10 @@ def test_endpoints_return_empty_not_error_on_a_fresh_database(empty_client) -> N
     benchmark = empty_client.get("/benchmark")
     assert benchmark.status_code == 200
     assert benchmark.json()["runs"] == []
+    # No narrative has been generated yet, so the field is explicitly null.
+    # Never an empty string, which a dashboard would render as a blank
+    # paragraph rather than as "nothing to show".
+    assert benchmark.json()["latest_narrative"] is None
 
 
 def test_endpoints_return_empty_not_error_with_no_tables_at_all(dropped_tables_client) -> None:
@@ -60,6 +64,7 @@ def test_endpoints_return_empty_not_error_with_no_tables_at_all(dropped_tables_c
     benchmark = dropped_tables_client.get("/benchmark")
     assert benchmark.status_code == 200
     assert benchmark.json()["runs"] == []
+    assert benchmark.json()["latest_narrative"] is None
 
     search = dropped_tables_client.post("/search", json={"query": "anything", "limit": 3})
     assert search.status_code == 200
@@ -114,6 +119,29 @@ def test_models_returns_metric_history_newest_first(client) -> None:
     assert isinstance(body, list)
     if len(body) > 1:
         assert body[0]["trained_at"] >= body[1]["trained_at"]
+
+
+def test_benchmark_serves_the_stored_narrative(client, seeded_narrative) -> None:
+    """The prose the dashboard shows is the row in `narrative_runs`, verbatim.
+
+    Asserting equality against the seeded text - not just "some non-empty
+    string" - is what keeps the API from regenerating or reformatting the
+    narrative: whatever provider wrote the row is what a reader sees.
+    """
+    body = client.get("/benchmark").json()
+    narrative = body["latest_narrative"]
+    assert narrative is not None
+    assert narrative["text"] == seeded_narrative.text
+    assert narrative["provider"] == seeded_narrative.provider
+    assert narrative["as_of"] == "2024-06-02"
+    assert narrative["generated_at"]
+
+
+def test_benchmark_narrative_carries_no_credential(client) -> None:
+    """`provider` is a name only - no key, no endpoint URL that could carry one."""
+    narrative = client.get("/benchmark").json()["latest_narrative"]
+    assert narrative["provider"].isidentifier()
+    assert "://" not in narrative["provider"]
 
 
 def test_search_returns_ranked_hits(client) -> None:

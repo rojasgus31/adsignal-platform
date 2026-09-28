@@ -22,6 +22,8 @@ from adsignal.ml.evaluation import DetectorMetrics, TriageMetrics
 from adsignal.ml.features import build_features
 from adsignal.ml.registry import dumps_models, load_models, save_models
 from adsignal.ml.training import BASELINE_WINDOW, train_and_evaluate
+from adsignal.narrative.summary import summarize
+from adsignal.narrative.types import NarrativeRequest, NarrativeResult
 from adsignal.warehouse.artifact_store import ensure_artifact_schema, write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
@@ -31,7 +33,7 @@ from adsignal.warehouse.metrics_store import (
     write_model_metrics,
     write_predictions,
 )
-from adsignal.warehouse.narrative_store import ensure_narrative_schema
+from adsignal.warehouse.narrative_store import ensure_narrative_schema, write_narrative
 from adsignal.warehouse.reader import read_campaign_daily
 from adsignal.warehouse.schema import reset_schema_memo
 from adsignal.warehouse.vector_store import EmbeddingRow, ensure_vector_schema, upsert_embeddings
@@ -451,6 +453,27 @@ def trained_artifacts(tmp_path_factory) -> Path:
     return _train_artifacts(_labelled_series(180), tmp_path_factory.mktemp("trained_artifacts"))
 
 
+# The narrative `_api_seed` stores in `narrative_runs`. It is real prose from
+# `narrative.summary.summarize` rather than a literal, and it lives at module
+# scope so `test_benchmark_serves_the_stored_narrative` can assert `/benchmark`
+# returns these exact bytes back - which is what distinguishes serving the
+# stored text from recomposing it at the API boundary.
+SEEDED_NARRATIVE_AS_OF = date(2024, 6, 2)
+SEEDED_NARRATIVE = NarrativeResult(
+    text=summarize(
+        NarrativeRequest(
+            as_of=SEEDED_NARRATIVE_AS_OF,
+            campaign_count=3,
+            anomaly_count=2,
+            top_causes=("budget_pacing", "creative_fatigue"),
+            escalated_count=1,
+        )
+    ),
+    provider="stub",
+    latency_ms=0.4,
+)
+
+
 @pytest.fixture(scope="module")
 def _api_seed(tmp_path_factory) -> str:
     """Build a small dataset and load it into `TEST_DSN` once per test module.
@@ -547,6 +570,15 @@ def _api_seed(tmp_path_factory) -> str:
         ],
     )
 
+    # One narrative row, so `/benchmark` has stored prose to serve. Written
+    # through `write_narrative` rather than inserted by hand, and truncated
+    # first so repeated runs of this suite leave exactly one row here.
+    ensure_narrative_schema(TEST_DSN)
+    with psycopg.connect(TEST_DSN) as conn:
+        conn.execute("TRUNCATE TABLE narrative_runs")
+        conn.commit()
+    write_narrative(TEST_DSN, SEEDED_NARRATIVE_AS_OF, SEEDED_NARRATIVE)
+
     return str(mart["campaign_id"].iloc[0])
 
 
@@ -615,6 +647,12 @@ def db_only_client(_db_only_seed: str):
 def seeded_campaign_id(_api_seed: str) -> str:
     """A campaign_id known to exist in the seeded mart."""
     return _api_seed
+
+
+@pytest.fixture(scope="module")
+def seeded_narrative(_api_seed: str) -> NarrativeResult:
+    """The narrative row `_api_seed` wrote into `TEST_DSN`."""
+    return SEEDED_NARRATIVE
 
 
 @pytest.fixture(scope="module")
