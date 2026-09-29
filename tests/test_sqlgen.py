@@ -15,6 +15,8 @@ from adsignal.config import DEFAULT_GEMINI_MODEL, Settings
 from adsignal.narrative.providers.gemini import GeminiProvider
 from adsignal.narrative.providers.gemini_sql import GeminiSqlProvider
 from adsignal.narrative.sqlgen import (
+    OUT_OF_SCOPE_SENTINEL,
+    QuestionOutOfScope,
     SqlGenerationFailed,
     SqlGenerator,
     SqlQuestion,
@@ -252,7 +254,7 @@ def test_a_redacted_provider_message_reaches_the_user_whole() -> None:
     generator = SqlGenerator(_StubProvider(error=error))
     with pytest.raises(SqlGenerationFailed) as failed:
         generator.generate(QUESTION)
-    assert str(failed.value) == "gemini returned 503 (url REDACTED, key REDACTED)"
+    assert "gemini returned 503 (url REDACTED, key REDACTED)" in str(failed.value)
 
 
 def test_the_status_code_is_what_distinguishes_one_outage_from_another() -> None:
@@ -491,3 +493,169 @@ def test_the_narrative_path_is_left_alone() -> None:
     with pytest.raises(ProviderUnavailable):
         provider.generate(NARRATIVE_REQUEST)
     assert calls["n"] == 1
+
+
+# --- the question that is not about the data at all ------------------------
+#
+# The defect: the prompt's only instruction for an unanswerable question was
+# "return a query that answers the closest thing that can be", so
+# "how does this dashboard work?" got either an unrelated query or a model
+# that generated until the request hit `narrative_timeout_seconds` and died.
+# The user was then told the model was unreachable, had timed out, or had an
+# open breaker - three guesses, none of them the truth.
+
+
+def test_the_prompt_offers_an_out_for_a_question_the_schema_cannot_answer() -> None:
+    """The model cannot take an exit it was never told about."""
+    prompt = build_sql_prompt(QUESTION)
+    assert OUT_OF_SCOPE_SENTINEL in prompt
+
+
+def test_the_sentinel_alone_is_an_out_of_scope_signal_rather_than_sql() -> None:
+    generator = SqlGenerator(_StubProvider(sql=OUT_OF_SCOPE_SENTINEL))
+    with pytest.raises(QuestionOutOfScope):
+        generator.generate(QUESTION)
+
+
+def test_a_fenced_sentinel_is_recognised_too() -> None:
+    """Models fence everything, including a one-word answer.
+
+    Through the real provider, because the fence is stripped there
+    (`extract_sql`) and a stub that returned the fence raw would be testing a
+    layer that does not exist in production.
+    """
+    generator = SqlGenerator(
+        GeminiSqlProvider(
+            api_key=SECRET, model=MODEL, client=_answering(f"```\n{OUT_OF_SCOPE_SENTINEL}\n```")
+        )
+    )
+    with pytest.raises(QuestionOutOfScope):
+        generator.generate(QUESTION)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        f"SELECT '{OUT_OF_SCOPE_SENTINEL}' AS note FROM dim_campaign LIMIT 1",
+        f"-- {OUT_OF_SCOPE_SENTINEL}\nSELECT 1",
+        f"{OUT_OF_SCOPE_SENTINEL} is what I would say, but: SELECT 1",
+    ],
+)
+def test_sql_that_merely_contains_the_sentinel_is_still_sql(sql: str) -> None:
+    """Validated exactly, never pattern-matched: only the bare token is the signal."""
+    generated = SqlGenerator(_StubProvider(sql=sql)).generate(QUESTION)
+    assert generated.sql == sql
+
+
+def test_an_out_of_scope_answer_is_a_success_for_the_breaker() -> None:
+    """The provider answered. Counting it as a failure would open the breaker
+    on a run of perfectly healthy calls about the wrong subject."""
+    provider = _StubProvider(sql=OUT_OF_SCOPE_SENTINEL)
+    generator = SqlGenerator(provider, failure_threshold=2, cooldown_seconds=60.0)
+    for _ in range(4):
+        with pytest.raises(QuestionOutOfScope):
+            generator.generate(QUESTION)
+    assert provider.calls == 4, "the breaker opened on successful calls"
+
+
+def test_out_of_scope_is_not_a_generation_failure() -> None:
+    """`api.routes.ask` branches on the type, so the two must not be one."""
+    assert not issubclass(QuestionOutOfScope, SqlGenerationFailed)
+    assert not issubclass(SqlGenerationFailed, QuestionOutOfScope)
+
+
+# --- a refusal that names the cause instead of listing three ---------------
+
+
+def _failing(error: Exception) -> str:
+    generator = SqlGenerator(_StubProvider(error=error))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    return str(failed.value)
+
+
+def test_a_timeout_says_it_timed_out_and_nothing_else() -> None:
+    message = _failing(
+        ProviderUnavailable(
+            "gemini request timed out (url REDACTED, key REDACTED)", None, "timeout"
+        )
+    )
+    assert "too long" in message
+    assert "unreachable" not in message
+    assert "circuit breaker" not in message
+
+
+def test_an_unreachable_provider_says_so() -> None:
+    message = _failing(
+        ProviderUnavailable(
+            "gemini connection failed (url REDACTED, key REDACTED)", None, "unreachable"
+        )
+    )
+    assert "could not be reached" in message
+    assert "too long" not in message
+
+
+def test_an_exhausted_quota_reads_as_a_quota_problem() -> None:
+    message = _failing(
+        ProviderUnavailable("gemini returned 429 (url REDACTED, key REDACTED)", 429, "status")
+    )
+    assert "quota" in message or "rate limit" in message
+    assert "429" in message
+
+
+def test_the_four_causes_do_not_read_alike() -> None:
+    """One sentence per cause. A reader must be able to tell them apart."""
+    messages = {
+        _failing(ProviderUnavailable("m", None, "timeout")),
+        _failing(ProviderUnavailable("m", None, "unreachable")),
+        _failing(ProviderUnavailable("m", 429, "status")),
+        _failing(ProviderUnavailable("m", 500, "status")),
+    }
+    assert len(messages) == 4
+
+
+def test_an_open_breaker_says_it_is_pausing_rather_than_guessing() -> None:
+    provider = _StubProvider(error=ProviderUnavailable("m", 500, "status"))
+    generator = SqlGenerator(provider, failure_threshold=1, cooldown_seconds=60.0)
+    with pytest.raises(SqlGenerationFailed):
+        generator.generate(QUESTION)
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    assert "repeatedly" in str(failed.value)
+    assert provider.calls == 1
+
+
+def test_the_transport_records_which_failure_it_was() -> None:
+    """The cause comes from the branch that caught it, not from its prose."""
+
+    def timing_out(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    def refusing(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    with pytest.raises(ProviderUnavailable) as timed_out:
+        GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(timing_out)).generate_sql(
+            QUESTION
+        )
+    assert timed_out.value.cause == "timeout"
+
+    with pytest.raises(ProviderUnavailable) as unreachable:
+        GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(refusing)).generate_sql(
+            QUESTION
+        )
+    assert unreachable.value.cause == "unreachable"
+
+
+def test_a_cause_specific_sentence_still_carries_no_key() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(f"timed out: {request.url}", request=request)
+
+    generator = SqlGenerator(
+        GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    )
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    message = _chain(failed.value)
+    assert SECRET not in message
+    assert "generativelanguage" not in message

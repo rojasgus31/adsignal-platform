@@ -23,7 +23,11 @@ or a response, and each is raised with `from None` so the original exception
 import httpx
 
 from adsignal.narrative.prompt import build_prompt
-from adsignal.narrative.types import NarrativeRequest, ProviderUnavailable
+from adsignal.narrative.types import (
+    NarrativeRequest,
+    ProviderFailureCause,
+    ProviderUnavailable,
+)
 
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -67,6 +71,10 @@ def generate_text(
     # the server actually answered; a timeout or a refused connection has no
     # status, and `None` is what stops a caller retrying those.
     status: int | None = None
+    # Which kind of failure this was, recorded where it is known rather than
+    # recovered later by matching on the message. `narrative.sqlgen` writes one
+    # user-facing sentence per value.
+    cause: ProviderFailureCause = "unspecified"
     response: httpx.Response | None = None
 
     try:
@@ -75,19 +83,23 @@ def generate_text(
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
+            cause = "status"
             failure = f"gemini returned {status} (url REDACTED, key REDACTED)"
         except httpx.TimeoutException:
+            cause = "timeout"
             failure = "gemini request timed out (url REDACTED, key REDACTED)"
         except httpx.ConnectError:
+            cause = "unreachable"
             failure = "gemini connection failed (url REDACTED, key REDACTED)"
         except httpx.HTTPError:
+            cause = "transport"
             failure = "gemini request failed (url REDACTED, key REDACTED)"
     finally:
         if client is None:
             http.close()
 
     if failure is not None:
-        raise ProviderUnavailable(failure, status)
+        raise ProviderUnavailable(failure, status, cause)
     if response is None:  # pragma: no cover - unreachable while failure is None
         raise ProviderUnavailable("gemini returned no response (url REDACTED, key REDACTED)")
 

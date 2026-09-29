@@ -449,6 +449,38 @@ contributes only a type name for anything else, because no other exception's
 text has been proven free of a key or a DSN. The `rule` is still
 `generation_failed`.
 
+**And it says which failure it was, rather than listing the candidates.** The
+dashboard rendered every `generation_failed` as "the model was unreachable,
+timed out, or its circuit breaker was open" — three guesses, which is what a
+reader is given when the endpoint does not know. It does know:
+`generate_text` now records a `cause` on `ProviderUnavailable` in the same
+branch that catches the failure (`status`, `timeout`, `unreachable`,
+`transport`), and `SqlGenerator` writes one sentence per cause ahead of the
+redacted detail — `gemini took too long to answer`, `gemini could not be
+reached`, `gemini is out of quota or rate-limited right now`, `gemini is
+temporarily unavailable`. An open breaker gets its own: `gemini failed
+repeatedly, so calls to it are paused for a short cooldown`. The cause is
+recorded, never parsed back out of the message, for the reason the status is:
+prose gets reworded.
+
+**A question the warehouse cannot answer is refused, not attempted.** The
+prompt's only instruction for an unanswerable question used to be "return a
+query that answers the closest thing that can be", so *"how does this
+dashboard work?"* got an unrelated query about `narrative_runs` — or, for the
+owner, a generation that ran until the request hit
+`ADSIGNAL_NARRATIVE_TIMEOUT_SECONDS` and died as a model outage it was not.
+The prompt now gives the model an explicit out: when no query over these
+tables could address the question, it answers with the single line
+`CANNOT_ANSWER_FROM_SCHEMA` and nothing else. That sentinel is validated by
+**exact equality** against the whole answer, never searched for, so a query
+that quotes it in a string literal is still a query; a bare uppercase token is
+also something a model cannot emit by accident the way it emits "I'm sorry, I
+cannot". The response is `rule: "out_of_scope"` with no SQL, no rows, and a
+refusal that names what the endpoint *does* answer — seven tables of campaign
+data. It is **not** `generation_failed`: nothing failed, the provider
+answered, and it counts as a success for the circuit breaker, so a run of
+off-topic questions never opens it.
+
 **Not configured is a first-class state.** With `ADSIGNAL_GEMINI_API_KEY`
 unset (the default here), `/ask` answers 200 with
 `rule: "not_configured"` and an explanation the dashboard renders. It never

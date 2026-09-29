@@ -13,7 +13,8 @@ from typing import Any
 import psycopg
 import pytest
 
-from adsignal.narrative.sqlgen import SqlGenerator, SqlQuestion
+from adsignal.api.routes.ask import OUT_OF_SCOPE_RULE
+from adsignal.narrative.sqlgen import OUT_OF_SCOPE_SENTINEL, SqlGenerator, SqlQuestion
 from adsignal.narrative.types import ProviderUnavailable
 
 # Same pattern as every other DSN-driven test module: the env var is an
@@ -398,3 +399,64 @@ def test_a_provider_outage_reports_its_status_rather_than_its_type(ask_client) -
     assert "503" in body["refusal"]
     assert "REDACTED" in body["refusal"]
     assert SECRET not in body["refusal"]
+
+
+# --- a question the warehouse cannot answer at all -------------------------
+
+
+class _OutOfScopeProvider:
+    """A model that takes the prompt's out for an unanswerable question."""
+
+    name = "stub"
+
+    def generate_sql(self, request: SqlQuestion) -> str:
+        return OUT_OF_SCOPE_SENTINEL
+
+
+def test_a_question_the_schema_cannot_answer_is_refused_honestly(ask_client) -> None:
+    """The defect, end to end: "how does this dashboard work?" is not a query.
+
+    It used to be answered with whatever the model judged closest, or to run
+    until the request hit the generation timeout and was reported as three
+    possible causes, none of them the real one.
+    """
+    ask_client.app.state.sql_generator = SqlGenerator(_OutOfScopeProvider())
+    body = _ask(ask_client, "how does this dashboard works?")
+    assert body["rule"] == OUT_OF_SCOPE_RULE
+    assert body["sql"] is None
+    assert body["rows"] == []
+    assert body["columns"] == []
+    assert body["notice"] is None
+    assert body["provider"] == "stub"
+
+
+def test_the_out_of_scope_refusal_says_what_the_endpoint_does_answer(ask_client) -> None:
+    """A refusal that does not say what would have worked teaches nothing."""
+    ask_client.app.state.sql_generator = SqlGenerator(_OutOfScopeProvider())
+    refusal = _ask(ask_client, "how does this dashboard works?")["refusal"]
+    assert "campaign" in refusal.lower()
+    assert OUT_OF_SCOPE_SENTINEL not in refusal, "the sentinel is protocol, not prose"
+
+
+def test_out_of_scope_is_not_reported_as_a_model_failure(ask_client) -> None:
+    """Nothing failed. Reporting `generation_failed` here is the original lie."""
+    ask_client.app.state.sql_generator = SqlGenerator(_OutOfScopeProvider())
+    assert _ask(ask_client, "what is the weather?")["rule"] != "generation_failed"
+
+
+def test_a_timeout_refusal_names_the_timeout_and_not_three_possibilities(ask_client) -> None:
+    """`generation_failed` covered unreachable, timed out and breaker-open with
+    one sentence listing all three. The endpoint knows which happened."""
+
+    class _TimedOut:
+        name = "stub"
+
+        def generate_sql(self, request: SqlQuestion) -> str:
+            raise ProviderUnavailable(
+                "gemini request timed out (url REDACTED, key REDACTED)", None, "timeout"
+            )
+
+    ask_client.app.state.sql_generator = SqlGenerator(_TimedOut())
+    refusal = _ask(ask_client, "anything")["refusal"]
+    assert "too long" in refusal
+    assert "unreachable" not in refusal

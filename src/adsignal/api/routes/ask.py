@@ -65,7 +65,12 @@ from adsignal.api.deps import (
 )
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
-from adsignal.narrative.sqlgen import SqlGenerationFailed, SqlGenerator, SqlQuestion
+from adsignal.narrative.sqlgen import (
+    QuestionOutOfScope,
+    SqlGenerationFailed,
+    SqlGenerator,
+    SqlQuestion,
+)
 from adsignal.warehouse.ask_reads import QueryRefused, load_date_coverage, run_readonly_query
 from adsignal.warehouse.ask_schema import describe_schema, empty_result_notice
 from adsignal.warehouse.sql_guard import SqlRejected, validate_sql
@@ -87,6 +92,34 @@ ASK_CACHE_CAPACITY = 512
 # database configured. Distinct from every validator and database rule: it
 # says the endpoint is switched off, not that the question was bad.
 NOT_CONFIGURED_RULE = "not_configured"
+
+# The refusal rule reported when the question is not about this data at all.
+#
+# Distinct from `generation_failed`, which means the model did not answer.
+# Here it answered, immediately and correctly, that no query over these seven
+# tables addresses the question — "how does this dashboard work?" is not a
+# question about campaign performance. Reported as its own rule because a
+# client that renders it as a model outage is telling the reader to try again,
+# and trying again will produce the same answer.
+#
+# A new value in the `rule` taxonomy, which is a client-contract change. The
+# dashboard enumerates the rules it knows and renders an unknown one through a
+# fallback, so it degrades to the generic refusal rather than breaking.
+OUT_OF_SCOPE_RULE = "out_of_scope"
+
+# What the reader is told instead. It names the subject the endpoint covers
+# rather than apologising, because the useful half of a refusal is the part
+# that says what would have worked. The sentinel the model returned
+# (`narrative.sqlgen.OUT_OF_SCOPE_SENTINEL`) is protocol between this service
+# and the model and is deliberately absent from it.
+OUT_OF_SCOPE_REASON = (
+    "That question is not about the campaign warehouse, so there is no query to run. "
+    "This endpoint answers questions about seven tables of campaign data: daily "
+    "performance per campaign (spend, impressions, clicks, conversions, revenue, CTR, "
+    "CPC, CPA, ROAS), campaign and advertiser names and channels, detected anomalies "
+    "and their triaged causes, model training metrics, feature drift, pipeline runs, "
+    "and the stored daily narratives."
+)
 
 # The refusal reported when something raised that this module did not expect.
 # The endpoint's contract is that it always answers 200 with the same eight
@@ -204,6 +237,10 @@ def _answer(question: str, generator: SqlGenerator, readonly_dsn: str) -> AskRes
         generated = generator.generate(
             SqlQuestion(question=question, schema_description=describe_schema(coverage))
         )
+    except QuestionOutOfScope:
+        # The model answered, and its answer was that no SQL applies. Nothing
+        # failed, so this is not `generation_failed`; see `OUT_OF_SCOPE_RULE`.
+        return _refused(question, None, generator.name, OUT_OF_SCOPE_REASON, OUT_OF_SCOPE_RULE)
     except SqlGenerationFailed as failure:
         return _refused(question, None, generator.name, str(failure), "generation_failed")
 

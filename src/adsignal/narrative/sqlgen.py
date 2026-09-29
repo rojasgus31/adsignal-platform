@@ -27,12 +27,20 @@ from adsignal.config import Settings
 from adsignal.narrative.breaker import CircuitBreaker
 from adsignal.narrative.types import ProviderUnavailable
 
+# The one answer that is not SQL. A bare uppercase token: it is not a valid
+# query, no valid query is equal to it, and a model cannot arrive at it by
+# accident the way it can arrive at prose like "I cannot answer that". It is
+# matched by exact equality against the whole stripped answer (see
+# `SqlGenerator.generate`), never searched for, so a query that quotes it in a
+# string literal is still a query.
+OUT_OF_SCOPE_SENTINEL = "CANNOT_ANSWER_FROM_SCHEMA"
+
 # The model is asked for the same shape the validator accepts. This is a
 # quality measure, not a control: every rule named here is independently
 # enforced by `warehouse.sql_guard`, and the read-only role enforces the
 # important ones again. A model that ignores all of it produces a refusal,
 # not a breach.
-_INSTRUCTIONS = """\
+_INSTRUCTIONS = f"""\
 You write PostgreSQL for a read-only analytics API. Answer with one SQL
 query and nothing else: no explanation, no markdown fence, no semicolon.
 
@@ -42,8 +50,15 @@ Rules the query must follow, all of which are checked before it runs:
 - read only the tables described below, by their bare names
 - no SQL comments
 - include a LIMIT of 200 or fewer
-- if the question cannot be answered from these tables, return a query that
-  answers the closest thing that can be
+
+If the question is not about this data at all - it asks how the dashboard
+works, what you are, today's news, anything these tables do not describe -
+do not write SQL and do not guess at a nearby question. Answer with exactly
+this one line and nothing else:
+{OUT_OF_SCOPE_SENTINEL}
+
+Use that line only when no query over these tables could address the
+question. If the tables can answer it even partially, write the query.
 """
 
 
@@ -100,6 +115,21 @@ class SqlProvider(Protocol):
     def generate_sql(self, request: SqlQuestion) -> str:
         """Return SQL, or raise if this provider cannot."""
         ...
+
+
+class QuestionOutOfScope(RuntimeError):
+    """The model said the question cannot be answered from these tables.
+
+    Not a failure and deliberately not a subclass of `SqlGenerationFailed`:
+    the provider was reachable, answered quickly and did what it was asked.
+    The two are separate types so `api.routes.ask` branches on the type rather
+    than on a string, and so a run of out-of-scope questions never counts
+    toward opening the circuit breaker.
+
+    Carries no message of its own. The sentence a user reads is the
+    endpoint's, because only the endpoint knows what it offers instead; see
+    `api.routes.ask.OUT_OF_SCOPE_REASON`.
+    """
 
 
 class SqlGenerationFailed(RuntimeError):
@@ -169,7 +199,7 @@ class SqlGenerator:
         `providers.gemini.generate_text`, for the same reason.
         """
         if self._breaker.is_open():
-            raise SqlGenerationFailed(f"{self._provider.name} is unavailable")
+            raise SqlGenerationFailed(_breaker_open_reason(self._provider.name))
 
         outcome = self._attempt(request)
         retried = False
@@ -182,6 +212,8 @@ class SqlGenerator:
             self._breaker.record_failure()
             raise SqlGenerationFailed(_failure_reason(self._provider.name, outcome, retried))
         self._breaker.record_success()
+        if outcome == OUT_OF_SCOPE_SENTINEL:
+            raise QuestionOutOfScope(OUT_OF_SCOPE_SENTINEL)
         return GeneratedSql(sql=outcome, provider=self._provider.name)
 
     def _attempt(self, request: SqlQuestion) -> str | Exception:
@@ -209,15 +241,56 @@ def _is_retriable(error: Exception) -> bool:
     return isinstance(error, ProviderUnavailable) and error.status == RETRY_STATUS
 
 
+def _breaker_open_reason(provider_name: str) -> str:
+    """What a user is told while the breaker is holding calls back.
+
+    Says that calls are paused and why, rather than "is unavailable", which
+    reads identically to a dead backend and leaves a reader with nothing to do
+    about it. This is one of the three causes the dashboard used to list
+    together; it is now the only one this string describes.
+    """
+    return (
+        f"{provider_name} failed repeatedly, so calls to it are paused for a short "
+        f"cooldown; try again shortly"
+    )
+
+
+def _cause_sentence(provider_name: str, error: ProviderUnavailable) -> str:
+    """One plain sentence naming what actually went wrong.
+
+    Reads `status` and `cause`, both recorded by the branch in
+    `providers.gemini.generate_text` that caught the failure, and never the
+    message. A sentence chosen by matching prose is wrong the first time the
+    prose is reworded.
+
+    The user used to be told the model "was unreachable, timed out, or its
+    circuit breaker was open" for every one of these — three possibilities,
+    which tells a reader the endpoint did not know which had happened. It
+    knows.
+    """
+    if error.status is not None:
+        if error.status == 429:
+            return f"{provider_name} is out of quota or rate-limited right now"
+        if error.status >= 500:
+            return f"{provider_name} is temporarily unavailable"
+        return f"{provider_name} rejected the request"
+    if error.cause == "timeout":
+        return f"{provider_name} took too long to answer"
+    if error.cause == "unreachable":
+        return f"{provider_name} could not be reached"
+    return f"{provider_name} could not answer"
+
+
 def _failure_reason(provider_name: str, error: Exception, retried: bool = False) -> str:
     """What a user is told when a provider did not produce a query.
 
-    A `ProviderUnavailable` is passed through whole. Its message was composed
-    by the provider with the URL and the key already replaced by the word
-    REDACTED (see `narrative.types.ProviderUnavailable`), so it can name the
-    status code — and a transient 503, a rate limit, an expired key and a
-    retired model are four different problems that used to reach the user as
-    the single word "RuntimeError".
+    A `ProviderUnavailable` contributes two things: a sentence naming its
+    cause (`_cause_sentence`) and its own message, appended whole. That
+    message was composed by the provider with the URL and the key already
+    replaced by the word REDACTED (see `narrative.types.ProviderUnavailable`),
+    so it can name the status code — and a transient 503, a rate limit, an
+    expired key and a retired model are four different problems that used to
+    reach the user as the single word "RuntimeError".
 
     Anything else contributes its type name and nothing more. No other
     exception in this process has had its text proven free of a key, a DSN or
@@ -228,7 +301,7 @@ def _failure_reason(provider_name: str, error: Exception, retried: bool = False)
     happened.
     """
     reason = (
-        str(error)
+        f"{_cause_sentence(provider_name, error)} — {error}"
         if isinstance(error, ProviderUnavailable)
         else f"{provider_name} could not answer ({type(error).__name__})"
     )

@@ -351,6 +351,21 @@ current list from the ListModels endpoint.
 no read-only DSN is set. Neither is ever a 500, and neither is ever a
 fabricated answer.
 
+**"Not about the data" is an answer the model is allowed to give.** The
+prompt used to tell it that an unanswerable question should get "a query that
+answers the closest thing that can be", which has no true case for *"how does
+this dashboard work?"* — so the model either answered a question nobody asked
+or generated until the request hit the timeout and was reported as an outage.
+The prompt now names a sentinel, `CANNOT_ANSWER_FROM_SCHEMA`, for exactly
+that case. It is a bare uppercase token compared by **exact equality** to the
+whole answer: no valid query equals it, so it cannot collide with SQL, and
+unlike prose ("I cannot answer that") a model does not produce it by
+accident. `SqlGenerator` raises `QuestionOutOfScope` — a sibling of
+`SqlGenerationFailed`, not a subclass, because nothing failed — and the
+endpoint answers `rule: "out_of_scope"` with a refusal naming the seven
+tables it does cover. The call counts as a provider success, so off-topic
+questions never open the breaker.
+
 **The endpoint answers 200, 429 or 422, and nothing else.** A rate-limit
 refusal and a malformed body are the two status codes; every other outcome —
 a model failure, a refused query, a database error, and anything nobody

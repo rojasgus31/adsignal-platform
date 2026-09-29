@@ -2,7 +2,19 @@
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
+
+ProviderFailureCause = Literal["status", "timeout", "unreachable", "transport", "unspecified"]
+"""Which kind of failure a `ProviderUnavailable` reports.
+
+Set by the branch in `narrative.providers.gemini.generate_text` that caught
+the failure, so a caller can write one sentence per cause without reading the
+message. "status" means the server answered (see `ProviderUnavailable.status`),
+"timeout" that it did not answer in time, "unreachable" that the connection
+never opened, "transport" any other HTTP-level failure, and "unspecified" that
+whoever raised it did not say - which is what a caller must assume when it was
+constructed with two arguments, as the tests and older call sites do.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,8 +88,20 @@ class ProviderUnavailable(RuntimeError):
     refused connection). It exists so a caller can tell *which* failure this
     is without parsing the message: `narrative.sqlgen` retries a 503 and
     nothing else, and a regex over prose is not a thing to hang that on.
+
+    `cause` is the same distinction one level coarser: a timeout, a refused
+    connection and an answered-with-a-status failure all reach a user through
+    the same field, and the sentence each deserves is different. It is recorded
+    by the branch that caught the failure rather than parsed back out of the
+    message, for the reason `status` is: prose gets reworded.
     """
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        cause: ProviderFailureCause = "unspecified",
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.cause = cause
