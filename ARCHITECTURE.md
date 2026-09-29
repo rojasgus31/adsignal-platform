@@ -429,6 +429,29 @@ Belt and braces beneath all of it: the chain always ends in a local
 `StubProvider`, exempt from the budget, so a deployment with no API keys at
 all renders placeholder narrative text rather than failing.
 
+**The fallback is demonstrable, not theoretical: Gemini's free tier fails
+often enough to exercise it.** Measured against a real key through
+`GeminiSqlProvider`, six calls a second apart: `gemini-3.6-flash` answered
+6/6, `gemini-3.8-flash` 5/6 — and `python -m adsignal.cli.check_model`
+reported a model healthy immediately before an `/ask` call to that same model
+returned 503. Roughly one call in twelve, intermittent and spread across
+models rather than concentrated in a dead one. A reader deploying this will
+meet it.
+
+Two consequences, and they pull in opposite directions on purpose. For the
+nightly narrative, this is what the chain is *for*: a 503 drops to the next
+provider and the run still produces text, which is why the fallback ordering
+earns its complexity. For `/ask` there is no next provider, so a 503 was a
+dead end the user saw — and at one in twelve, three failures in a row is an
+ordinary run of luck, which is exactly what led this project's owner to
+conclude the feature was broken. `narrative.sqlgen` therefore retries a 503
+exactly once, and nothing else (`RETRY_STATUS`): a 4xx is a real answer about
+a real problem, and a timeout retried is a second long wait rather than a
+fast refusal. The retry lives in `SqlGenerator` and not in the shared
+transport precisely because of the budget behaviour above — the chain cannot
+cancel a running provider, so stretching every provider's worst case is not
+something the budget could absorb.
+
 ---
 
 ## 7. GitHub Actions as the production scheduler

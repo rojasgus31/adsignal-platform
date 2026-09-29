@@ -425,6 +425,19 @@ filter outside that range matches nothing."` It is an eighth field, always
 present and `null` on every other response; it is **not** a refusal, and a
 client that renders refusals as errors must not render it as one.
 
+**An intermittent 503 is retried once.** Gemini's free tier fails at roughly
+one call in twelve — measured six calls apart, `gemini-3.6-flash` 6/6 and
+`gemini-3.8-flash` 5/6, with `check_model` reporting a model healthy moments
+before an `/ask` call to it returned 503. `/ask` has no second provider to
+fall back to, so one retry after a short backoff takes a user-visible failure
+from about 8% to under 1%. **Only a 503, and only once**: a 4xx is a real
+answer about a retired model, a rejected key or an exhausted quota, and
+delaying it hides the diagnosis; a timeout is not retried either, because a
+second full wait is worse than a fast refusal. A refusal that survived the
+retry says `; retried once`, which is the difference between "click again"
+and "this one is persistent". One refusal is still one circuit-breaker
+failure, so the breaker opens after the same number of refusals a user saw.
+
 **A provider failure says what the provider said.** A Gemini outage used to
 reach the user as `gemini could not answer (RuntimeError)` — indistinguishable
 from a rate limit, an expired key or a retired model. `generate_text` builds

@@ -24,6 +24,14 @@ through `Settings`, the work is one function a test can call directly, and
 of a list, and a list is what shipped the bug — but it is why this is a
 command a person runs rather than anything the API or the suite does.
 
+**It deliberately does not retry**, unlike `/ask` (see
+`narrative.sqlgen.RETRY_STATUS`). Gemini's free tier returns 503 at roughly
+one call in twelve, so a single OK here is evidence the model exists and
+generates, not that every call will succeed — this command reported
+`gemini-3.6-flash answered` immediately before an `/ask` call to the same
+model got a 503. Retrying would make the output smoother and less true, and
+this command exists to report what the service actually did.
+
 Nothing here prints, logs or returns the key. The prompt is a fixed literal,
 and the only failure text it reports comes from `providers.gemini`, whose
 messages replace the URL and the key with the word REDACTED by construction

@@ -18,6 +18,8 @@ job, and validating it first is `warehouse.sql_guard`'s.
 """
 
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -43,6 +45,29 @@ Rules the query must follow, all of which are checked before it runs:
 - if the question cannot be answered from these tables, return a query that
   answers the closest thing that can be
 """
+
+
+# The one status worth trying again, and how long to wait first.
+#
+# Gemini's free tier returns 503 intermittently: measured over six calls a
+# second apart through `GeminiSqlProvider`, `gemini-3.6-flash` answered 6/6
+# and `gemini-3.8-flash` 5/6, and `cli.check_model` reported a model healthy
+# immediately before an `/ask` call to the same model got a 503. That is
+# roughly one failure in twelve, spread across models — not a dead model, and
+# not something a user should have to diagnose. Three in a row is enough to
+# conclude the feature is broken, which is what happened to this project's
+# owner.
+#
+# **Only 503, and only once.** A 4xx is a real answer about a real problem —
+# a retired model, a rejected key, an exhausted quota — and retrying it hides
+# the diagnosis behind a delay while changing nothing. A timeout is not
+# retried either: a second full wait is worse for the caller than a fast
+# refusal, and it is the one failure mode that would genuinely double this
+# endpoint's worst case. Restricting the retry to a status the server
+# actually returned keeps the added latency to one fast round trip plus the
+# backoff, because a 503 arrives quickly by definition.
+RETRY_STATUS = 503
+RETRY_BACKOFF_SECONDS = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,8 +127,15 @@ class SqlGenerator:
         provider: SqlProvider,
         failure_threshold: int = 2,
         cooldown_seconds: float = 60.0,
+        retry_backoff_seconds: float = RETRY_BACKOFF_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._provider = provider
+        self._retry_backoff_seconds = retry_backoff_seconds
+        # Injected for the same reason `CircuitBreaker` injects its clock:
+        # a test that proves the retry happens must not spend half a second
+        # doing it.
+        self._sleep = sleep
         self._breaker = CircuitBreaker(
             failure_threshold=failure_threshold, cooldown_seconds=cooldown_seconds
         )
@@ -116,34 +148,68 @@ class SqlGenerator:
     def generate(self, request: SqlQuestion) -> GeneratedSql:
         """Return candidate SQL, or raise `SqlGenerationFailed`.
 
-        The failure is composed inside the `except` block and raised *below*
-        it, the same discipline `providers.gemini.generate_text` follows and
-        for the same reason: `raise ... from None` clears `__cause__` but
-        leaves `__context__` pointing at the provider's own exception, and a
-        structured logger or an error reporter walks that chain. The
-        provider's exception can be an httpx error carrying the key in a URL
-        or a driver error carrying a DSN, so the only chain safe to hand on
-        is no chain at all. Raising with nothing being handled is what makes
-        `__context__` genuinely `None`.
+        A 503 is tried once more after `RETRY_BACKOFF_SECONDS`; see
+        `RETRY_STATUS` for why that status and no other.
+
+        **One call here is one breaker event, whether it took one attempt or
+        two.** The breaker still opens after the same number of *refusals the
+        user saw*, which is what its threshold is counting; a retry that
+        recorded two failures would open it twice as fast on a backend that
+        is merely flaky. A 503 followed by a success is recorded as the
+        success it was, so an intermittent fault never accumulates toward
+        opening.
+
+        `_attempt` returns the provider's exception rather than raising it, so
+        by the time `SqlGenerationFailed` is raised no exception is being
+        handled. That is deliberate: `raise ... from None` clears `__cause__`
+        but leaves `__context__` pointing at the provider's own exception,
+        which a structured logger or an error reporter walks — and that
+        exception can be an httpx error carrying the key in a URL or a driver
+        error carrying a DSN. The same discipline as
+        `providers.gemini.generate_text`, for the same reason.
         """
         if self._breaker.is_open():
             raise SqlGenerationFailed(f"{self._provider.name} is unavailable")
 
-        failure: str | None = None
-        sql = ""
-        try:
-            sql = self._provider.generate_sql(request)
-        except Exception as error:  # noqa: BLE001 - any provider failure is one failure
+        outcome = self._attempt(request)
+        retried = False
+        if isinstance(outcome, Exception) and _is_retriable(outcome):
+            self._sleep(self._retry_backoff_seconds)
+            retried = True
+            outcome = self._attempt(request)
+
+        if isinstance(outcome, Exception):
             self._breaker.record_failure()
-            failure = _failure_reason(self._provider.name, error)
-
-        if failure is not None:
-            raise SqlGenerationFailed(failure)
+            raise SqlGenerationFailed(_failure_reason(self._provider.name, outcome, retried))
         self._breaker.record_success()
-        return GeneratedSql(sql=sql, provider=self._provider.name)
+        return GeneratedSql(sql=outcome, provider=self._provider.name)
+
+    def _attempt(self, request: SqlQuestion) -> str | Exception:
+        """One call to the provider: its SQL, or the exception it raised.
+
+        Returning the exception instead of letting it propagate is what keeps
+        the retry decision and the raise site outside any `except` block. The
+        object is inspected and its message read; it is never chained onto
+        anything that leaves this class.
+        """
+        try:
+            return self._provider.generate_sql(request)
+        except Exception as error:  # noqa: BLE001 - any provider failure is one failure
+            return error
 
 
-def _failure_reason(provider_name: str, error: Exception) -> str:
+def _is_retriable(error: Exception) -> bool:
+    """Whether this failure is the intermittent 503 worth one more attempt.
+
+    Reads `ProviderUnavailable.status`, which the provider set from the
+    response, rather than matching on the message. A retry predicate that
+    parses prose breaks the first time the prose is reworded, and this one
+    decides whether a user waits.
+    """
+    return isinstance(error, ProviderUnavailable) and error.status == RETRY_STATUS
+
+
+def _failure_reason(provider_name: str, error: Exception, retried: bool = False) -> str:
     """What a user is told when a provider did not produce a query.
 
     A `ProviderUnavailable` is passed through whole. Its message was composed
@@ -156,10 +222,17 @@ def _failure_reason(provider_name: str, error: Exception) -> str:
     Anything else contributes its type name and nothing more. No other
     exception in this process has had its text proven free of a key, a DSN or
     a URL, and an httpx error carries the request URL with the key inside it.
+
+    `retried` appends a clause saying so. It is the difference between "click
+    again" and "this one is persistent", and only the endpoint knows which
+    happened.
     """
-    if isinstance(error, ProviderUnavailable):
-        return str(error)
-    return f"{provider_name} could not answer ({type(error).__name__})"
+    reason = (
+        str(error)
+        if isinstance(error, ProviderUnavailable)
+        else f"{provider_name} could not answer ({type(error).__name__})"
+    )
+    return f"{reason}; retried once" if retried else reason
 
 
 def build_sql_generator(settings: Settings) -> SqlGenerator | None:

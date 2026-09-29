@@ -63,6 +63,10 @@ def generate_text(
     # error reporter, a test) can still read the key out of it. Raising with
     # no exception being handled is what makes `__context__` genuinely None.
     failure: str | None = None
+    # The status carried on the raised `ProviderUnavailable`. Set only where
+    # the server actually answered; a timeout or a refused connection has no
+    # status, and `None` is what stops a caller retrying those.
+    status: int | None = None
     response: httpx.Response | None = None
 
     try:
@@ -70,7 +74,8 @@ def generate_text(
             response = http.post(url, params={"key": api_key}, json=payload, timeout=timeout)
             response.raise_for_status()
         except httpx.HTTPStatusError as error:
-            failure = f"gemini returned {error.response.status_code} (url REDACTED, key REDACTED)"
+            status = error.response.status_code
+            failure = f"gemini returned {status} (url REDACTED, key REDACTED)"
         except httpx.TimeoutException:
             failure = "gemini request timed out (url REDACTED, key REDACTED)"
         except httpx.ConnectError:
@@ -82,7 +87,7 @@ def generate_text(
             http.close()
 
     if failure is not None:
-        raise ProviderUnavailable(failure)
+        raise ProviderUnavailable(failure, status)
     if response is None:  # pragma: no cover - unreachable while failure is None
         raise ProviderUnavailable("gemini returned no response (url REDACTED, key REDACTED)")
 

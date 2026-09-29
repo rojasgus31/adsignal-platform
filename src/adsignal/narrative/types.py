@@ -70,4 +70,14 @@ class ProviderUnavailable(RuntimeError):
 
     A `RuntimeError` subclass, so every existing `except RuntimeError` and
     every catch-all still behaves exactly as it did.
+
+    `status` is the HTTP status when the provider answered with one, and
+    `None` for a transport failure that never got a response (a timeout, a
+    refused connection). It exists so a caller can tell *which* failure this
+    is without parsing the message: `narrative.sqlgen` retries a 503 and
+    nothing else, and a regex over prose is not a thing to hang that on.
     """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status

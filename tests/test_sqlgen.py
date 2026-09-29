@@ -6,10 +6,13 @@ first and hardest here: it must be a state the endpoint can describe, never
 an exception and never a fabricated answer.
 """
 
+from datetime import date
+
 import httpx
 import pytest
 
 from adsignal.config import DEFAULT_GEMINI_MODEL, Settings
+from adsignal.narrative.providers.gemini import GeminiProvider
 from adsignal.narrative.providers.gemini_sql import GeminiSqlProvider
 from adsignal.narrative.sqlgen import (
     SqlGenerationFailed,
@@ -19,9 +22,19 @@ from adsignal.narrative.sqlgen import (
     build_sql_prompt,
     extract_sql,
 )
-from adsignal.narrative.types import ProviderUnavailable
+from adsignal.narrative.types import NarrativeRequest, ProviderUnavailable
 
 SECRET = "sk-super-secret-key-do-not-leak"
+
+# The narrative contract's own request, for the one test that proves the
+# `/ask` retry did not leak into the narrative path.
+NARRATIVE_REQUEST = NarrativeRequest(
+    as_of=date(2025, 12, 31),
+    campaign_count=1,
+    anomaly_count=0,
+    top_causes=(),
+    escalated_count=0,
+)
 MODEL = DEFAULT_GEMINI_MODEL
 
 QUESTION = SqlQuestion(
@@ -302,3 +315,179 @@ def test_a_provider_error_the_model_layer_did_not_write_is_still_typed_only() ->
     with pytest.raises(SqlGenerationFailed) as failed:
         generator.generate(QUESTION)
     assert str(failed.value) == "gemini could not answer (ValueError)"
+
+
+# --- the single retry on an intermittent 503 -------------------------------
+#
+# Gemini's free tier returns 503 at roughly one call in twelve, measured six
+# calls apart through `GeminiSqlProvider`. The owner met three in a row and
+# concluded the feature was broken. One retry takes a user-visible failure
+# from ~8% to under 1%; the cost is bounded because a 503 arrives fast and
+# nothing else is retried.
+
+
+class _SequenceProvider:
+    """A `SqlProvider` that replays a scripted list of outcomes, then repeats.
+
+    Each entry is either SQL to return or an exception to raise, so a test
+    can say "503 then success" and "503 then 503" exactly.
+    """
+
+    def __init__(self, *outcomes: str | Exception) -> None:
+        self.name = "stub"
+        self._outcomes = list(outcomes)
+        self.calls = 0
+
+    def generate_sql(self, request: SqlQuestion) -> str:
+        outcome = self._outcomes[min(self.calls, len(self._outcomes) - 1)]
+        self.calls += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def _unavailable(status: int | None) -> ProviderUnavailable:
+    return ProviderUnavailable(f"gemini returned {status} (url REDACTED, key REDACTED)", status)
+
+
+def _generator(provider: _SequenceProvider, **kwargs: object) -> SqlGenerator:
+    """A generator whose backoff costs the suite nothing."""
+    slept: list[float] = []
+    generator = SqlGenerator(provider, sleep=slept.append, **kwargs)  # type: ignore[arg-type]
+    generator.slept = slept  # type: ignore[attr-defined]
+    return generator
+
+
+def test_a_503_is_tried_once_more_and_the_second_answer_is_used() -> None:
+    provider = _SequenceProvider(_unavailable(503), "SELECT 1 FROM dim_campaign")
+    generated = _generator(provider).generate(QUESTION)
+    assert generated.sql == "SELECT 1 FROM dim_campaign"
+    assert provider.calls == 2
+
+
+def test_the_retry_waits_the_configured_backoff() -> None:
+    provider = _SequenceProvider(_unavailable(503), "SELECT 1 FROM dim_campaign")
+    generator = _generator(provider, retry_backoff_seconds=0.25)
+    generator.generate(QUESTION)
+    assert generator.slept == [0.25]  # type: ignore[attr-defined]
+
+
+def test_a_successful_first_attempt_never_waits() -> None:
+    generator = _generator(_SequenceProvider("SELECT 1 FROM dim_campaign"))
+    generator.generate(QUESTION)
+    assert generator.slept == []  # type: ignore[attr-defined]
+
+
+def test_a_503_twice_is_a_refusal_that_says_it_was_retried() -> None:
+    """ "Click again" and "this one is persistent" are different instructions."""
+    provider = _SequenceProvider(_unavailable(503))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        _generator(provider).generate(QUESTION)
+    assert provider.calls == 2
+    assert "503" in str(failed.value)
+    assert "retried once" in str(failed.value)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 429, 500])
+def test_no_status_other_than_503_is_retried(status: int) -> None:
+    """A 4xx is a real answer about a real problem; delaying it helps nobody."""
+    provider = _SequenceProvider(_unavailable(status))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        _generator(provider).generate(QUESTION)
+    assert provider.calls == 1, f"{status} was retried"
+    assert "retried once" not in str(failed.value)
+
+
+def test_a_timeout_is_not_retried() -> None:
+    """A second full wait is worse for the caller than a fast refusal."""
+    provider = _SequenceProvider(
+        ProviderUnavailable("gemini request timed out (url REDACTED, key REDACTED)")
+    )
+    with pytest.raises(SqlGenerationFailed):
+        _generator(provider).generate(QUESTION)
+    assert provider.calls == 1
+
+
+def test_an_arbitrary_exception_is_not_retried() -> None:
+    provider = _SequenceProvider(RuntimeError("something else entirely"))
+    with pytest.raises(SqlGenerationFailed):
+        _generator(provider).generate(QUESTION)
+    assert provider.calls == 1
+
+
+def test_one_refusal_is_one_breaker_failure_however_many_attempts_it_took() -> None:
+    """The breaker still opens after the same number of refusals a user saw.
+
+    Recording each attempt would open it twice as fast on a merely flaky
+    backend, which is the opposite of what a retry is for.
+    """
+    provider = _SequenceProvider(_unavailable(503))
+    generator = _generator(provider, failure_threshold=2, cooldown_seconds=60.0)
+    for _ in range(4):
+        with pytest.raises(SqlGenerationFailed):
+            generator.generate(QUESTION)
+    assert provider.calls == 4, "the breaker opened after the wrong number of refusals"
+
+
+def test_an_intermittent_503_never_accumulates_toward_opening() -> None:
+    """A 503 that the retry recovers from is recorded as the success it was."""
+    provider = _SequenceProvider(_unavailable(503), "SELECT 1 FROM dim_campaign")
+    generator = _generator(provider)
+    for _ in range(10):
+        provider.calls = 0
+        assert generator.generate(QUESTION).sql == "SELECT 1 FROM dim_campaign"
+
+
+def test_a_retried_failure_still_carries_no_key_and_no_dsn() -> None:
+    """The retry must not reintroduce the chain the raise site removed."""
+    dsn = f"postgresql://adsignal:{SECRET}@db.internal:5432/adsignal"
+    provider = _SequenceProvider(_unavailable(503), RuntimeError(f"connection to {dsn} failed"))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        _generator(provider).generate(QUESTION)
+    message = _chain(failed.value)
+    assert SECRET not in message
+    assert "postgresql://" not in message
+
+
+def test_the_status_comes_from_the_response_not_from_the_message() -> None:
+    """A retry predicate that parsed prose would break on a reworded string."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "overloaded"}})
+
+    provider = GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    with pytest.raises(ProviderUnavailable) as raised:
+        provider.generate_sql(QUESTION)
+    assert raised.value.status == 503
+
+
+def test_a_transport_failure_carries_no_status_at_all() -> None:
+    """`None` is what stops a timeout or a refused connection being retried."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused")
+
+    provider = GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    with pytest.raises(ProviderUnavailable) as raised:
+        provider.generate_sql(QUESTION)
+    assert raised.value.status is None
+
+
+def test_the_narrative_path_is_left_alone() -> None:
+    """The retry is `/ask`'s. `NarrativeChain` enters a provider exactly once.
+
+    The chain's budget gates *entry* and never cancels a running provider, so
+    a retry inside the shared transport would have stretched every narrative
+    provider's worst case past a budget that cannot stop it. Keeping the
+    retry in `SqlGenerator` is what confines it.
+    """
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503, json={"error": {"message": "overloaded"}})
+
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    with pytest.raises(ProviderUnavailable):
+        provider.generate(NARRATIVE_REQUEST)
+    assert calls["n"] == 1
