@@ -372,3 +372,35 @@ def test_no_provider_key_is_visible_to_the_suite() -> None:
         if getattr(settings, name).get_secret_value()
     ]
     assert configured == [], f"provider keys reached the suite: {configured}"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda client: GeminiProvider(api_key=SECRET, model=MODEL, client=client),
+        lambda client: GroqProvider(api_key=SECRET, client=client),
+        lambda client: JevProvider(api_key=SECRET, client=client),
+        lambda client: AnthropicProvider(api_key=SECRET, client=client),
+    ],
+    ids=["gemini", "groq", "jev", "anthropic"],
+)
+def test_no_provider_leaves_the_httpx_exception_in_the_chain(build) -> None:
+    """Fix round 2: `from None` is not enough, and every provider does it the same way.
+
+    `raise ... from None` clears `__cause__` and leaves `__context__` holding
+    the httpx exception. For Gemini that exception's text carries the key, in
+    the URL. The others send the key in a header, so nothing is leaked there
+    today — but the pattern is what the next provider will be copied from, so
+    all four raise outside the `except` block and none of them retains a link.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"refused: {request.url}", request=request)
+
+    provider = build(_client(handler))
+    with pytest.raises(RuntimeError) as excinfo:
+        provider.generate(REQUEST)
+
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
+    assert SECRET not in _chain(excinfo.value)

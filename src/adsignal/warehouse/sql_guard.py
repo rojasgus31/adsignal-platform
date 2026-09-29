@@ -24,15 +24,33 @@ sqlglot did not understand is therefore absent from what reaches Postgres
 rather than passing through unexamined — `LIMIT ALL`, for instance, which
 sqlglot drops and which would otherwise have suppressed the row cap.
 
+**And rendering is checked, because rendering was itself a hole.** That
+reasoning held in one direction and not the other: sqlglot can *emit*
+something it models differently from Postgres. Review found
+`SELECT E'\\' AS a, ', b FROM model_artifacts --' AS c FROM dim_campaign`
+accepted, because sqlglot rendered the escape string as `e'\\'`, where
+Postgres reads `\\'` as an escaped quote rather than a terminator. The
+literal's boundary moved between what was validated and what would have run,
+and the rendered query re-parses to `FROM model_artifacts` with the row cap
+commented out — three rules defeated by one payload.
+
+So every query is validated **twice**: once as written, and again as
+rendered, with the two required to agree on their real table set, their
+comment absence and their effective cap, and the rendering required to be a
+fixed point. A validator whose own output re-parses to something else has not
+finished its job.
+
 No I/O of any kind: this module reads a string and returns a string or
 raises. That is what makes the whole rule set testable without a database,
 and `tests/test_sql_guard.py` asserts the module stays that way.
 """
 
 import unicodedata
+from dataclasses import dataclass
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import build_scope
 
 from adsignal.warehouse.ask_schema import ALLOWED_TABLES
 
@@ -84,6 +102,13 @@ _FORBIDDEN_NODES = tuple(
 # `pg_` is refused as a whole prefix rather than as a list of the interesting
 # functions: the list of interesting catalog functions is long and grows with
 # each Postgres release, and no answer about campaign performance needs one.
+# Both spellings of a row bound. `Fetch` is `FETCH FIRST n ROWS ONLY`, which
+# is LIMIT in standard SQL clothing and was missed by the first parser
+# version.
+_BOUND_NODES = tuple(
+    node for name in ("Limit", "Fetch") if (node := getattr(exp, name, None)) is not None
+)
+
 _FORBIDDEN_NAMES = frozenset({"information_schema", "dblink", "dblink_connect", "dblink_exec"})
 _FORBIDDEN_PREFIX = "pg_"
 
@@ -110,25 +135,87 @@ class SqlRejected(ValueError):
         self.rule = rule
 
 
+@dataclass(frozen=True, slots=True)
+class _Shape:
+    """What a query does, reduced to the things the round-trip must preserve.
+
+    The real tables it reads (CTE names resolved away), whether it carries a
+    comment, and the row bound it will actually be subject to. Two parses of
+    what should be the same query must agree on all three.
+    """
+
+    tables: frozenset[str]
+    has_comment: bool
+    row_bound: int | None
+
+
 def validate_sql(sql: str) -> str:
     """Return the exact SQL that may execute, or raise `SqlRejected`.
 
-    The returned string is rendered from the parsed tree and carries a
-    `LIMIT {MAX_ROWS}` on its outermost statement. It is what runs and what
-    the user is shown, so the two cannot differ.
+    The returned string is rendered from the parsed tree and carries a row
+    bound of at most `MAX_ROWS` on its outermost query. It is what runs and
+    what the user is shown, so the two cannot differ — and it has been
+    re-parsed and re-validated in that exact form, so what Postgres will read
+    is what this module checked.
     """
     text = unicodedata.normalize("NFKC", sql).strip()
     if not text:
         raise SqlRejected("the model produced no query", "empty")
 
     _reject_unsupported_characters(text)
+    query, shape = _analyse(text)
+    rendered = _capped(query).sql(dialect=DIALECT)
+    _require_round_trip(rendered, shape)
+    return rendered
+
+
+def _analyse(text: str) -> tuple[exp.Query, _Shape]:
+    """Parse `text`, enforce every rule on it, and describe what it does.
+
+    Run twice per query — once on the model's text and once on this module's
+    own rendering of it — so the second run is a real re-validation and not a
+    cheaper summary of the first.
+    """
     statement = _single_statement(text)
-    _reject_comments(statement)
+    has_comment = _reject_comments(statement)
     query = _require_read_root(statement)
     _reject_forbidden_nodes(query)
     _reject_forbidden_names(query)
-    _require_allowlisted_tables(query)
-    return _capped(query).sql(dialect=DIALECT)
+    tables = _require_allowlisted_tables(query)
+    bound = _row_bound(query)
+    return query, _Shape(tables=tables, has_comment=has_comment, row_bound=bound)
+
+
+def _require_round_trip(rendered: str, original: _Shape) -> None:
+    """Re-validate this module's own output and require it to mean the same thing.
+
+    Three ways to fail, any one of which means the rendering says something
+    to Postgres that the validated tree did not say: the rendered query reads
+    a different set of real tables, it is not bounded by the cap after all,
+    or rendering it again produces different text (so there is no stable
+    string to reason about at all). The refusal deliberately does not explain
+    which, because the query that produced it is not one to iterate against.
+    """
+    try:
+        rendered_query, rendered_shape = _analyse(rendered)
+    except SqlRejected as rejection:
+        raise SqlRejected(
+            "that query does not survive being read back, so it will not be run",
+            "round_trip",
+        ) from rejection
+
+    bound = rendered_shape.row_bound
+    if (
+        rendered_shape.tables != original.tables
+        or rendered_shape.has_comment
+        or bound is None
+        or bound > MAX_ROWS
+        or rendered_query.sql(dialect=DIALECT) != rendered
+    ):
+        raise SqlRejected(
+            "that query does not survive being read back, so it will not be run",
+            "round_trip",
+        )
 
 
 def _reject_unsupported_characters(text: str) -> None:
@@ -163,7 +250,7 @@ def _single_statement(text: str) -> exp.Expression:
     return statements[0]
 
 
-def _reject_comments(statement: exp.Expression) -> None:
+def _reject_comments(statement: exp.Expression) -> bool:
     """Refuse SQL comments, in either syntax, anywhere in the tree.
 
     Read off the parsed nodes rather than by scanning for `--` and `/*`, so a
@@ -174,6 +261,7 @@ def _reject_comments(statement: exp.Expression) -> None:
     for node in statement.walk():
         if node.comments:
             raise SqlRejected("SQL comments are not allowed", "no_comments")
+    return False
 
 
 def _require_read_root(statement: exp.Expression) -> exp.Query:
@@ -226,54 +314,132 @@ def _name_of(node: object) -> str | None:
     return None
 
 
-def _require_allowlisted_tables(statement: exp.Query) -> None:
-    """Refuse any table reference outside the allowlist or the query's own CTEs.
+def _require_allowlisted_tables(statement: exp.Query) -> frozenset[str]:
+    """Refuse any real table outside the allowlist, and return the ones it reads.
 
-    Every `Table` node is checked, however it was written: quoted, mixed
-    case, comma-joined, or nested in a subquery. A schema qualifier is
-    refused outright rather than resolved — `public.dim_campaign` is a
-    different string from the one that was allowlisted, and the read-only
-    role's search path is not this module's to assume. A `Table` with no name
-    is a table function (`generate_series(...)`, `dblink(...)`), which is not
-    a documented table either.
+    **Scope-aware, because collecting CTE names tree-wide was wrong.** A
+    `WITH` nested inside a sub-select declares a name only for that
+    sub-select, but a tree-wide collection let it launder the same name for
+    the outer query:
+
+        SELECT * FROM model_artifacts WHERE 1 IN
+          (WITH model_artifacts AS (SELECT 1 AS x) SELECT x FROM model_artifacts)
+
+    sqlglot's scope machinery resolves each reference in the scope that
+    declares it, so the outer `model_artifacts` is a real table (refused)
+    while the inner one is a CTE reference (allowed). That is the same class
+    of error as the string-literal CTE bug, made with valid syntax.
+
+    Anything the scope walk does not classify as a source is checked too, and
+    is allowed only if it names a CTE the query really declares — so a
+    reference the analyser did not reach fails closed rather than silently.
     """
-    defined = {cte.alias.lower() for cte in statement.find_all(exp.CTE) if cte.alias}
+    declared = {cte.alias.lower() for cte in statement.find_all(exp.CTE) if cte.alias}
+    real_sources = _real_table_sources(statement)
+
+    tables: set[str] = set()
     for table in statement.find_all(exp.Table):
-        if table.catalog or table.db:
-            qualified = ".".join(part for part in (table.catalog, table.db, table.name) if part)
-            raise SqlRejected(
-                f"{qualified} is not a table this endpoint may read", "table_allowlist"
-            )
-        name = table.name
-        if not name:
-            raise SqlRejected(
-                "only the documented tables may be read, not table functions",
-                "table_allowlist",
-            )
-        if name.lower() in defined or name.lower() in ALLOWED_TABLES:
+        if id(table) in real_sources:
+            tables.add(_checked_table_name(table))
             continue
+        # Not a real source: a CTE reference, or something scope resolved
+        # away. It may only be the former.
+        if table.catalog or table.db or table.name.lower() not in declared:
+            tables.add(_checked_table_name(table))
+    return frozenset(tables)
+
+
+def _real_table_sources(statement: exp.Query) -> set[int]:
+    """The `id()` of every `Table` node scope analysis resolves to a real table.
+
+    Falls back to "every table node is real" if sqlglot cannot build a scope
+    for this query. That is the fail-closed direction: it removes the CTE
+    exemption entirely rather than granting it blindly.
+    """
+    try:
+        root = build_scope(statement)
+    except Exception:  # noqa: BLE001 - any analyser failure falls back to strict
+        root = None
+    if root is None:
+        return {id(table) for table in statement.find_all(exp.Table)}
+
+    sources: set[int] = set()
+    for scope in root.traverse():
+        for source in scope.sources.values():
+            if isinstance(source, exp.Table):
+                sources.add(id(source))
+    return sources
+
+
+def _checked_table_name(table: exp.Table) -> str:
+    """The table's bare name, or a refusal if it is not one this endpoint reads.
+
+    A schema qualifier is refused rather than resolved — `public.dim_campaign`
+    is a different string from the one that was allowlisted, and the
+    read-only role's search path is not this module's to assume. A `Table`
+    with no name is a table function (`generate_series(...)`), which is not a
+    documented table either.
+    """
+    if table.catalog or table.db:
+        qualified = ".".join(part for part in (table.catalog, table.db, table.name) if part)
+        raise SqlRejected(f"{qualified} is not a table this endpoint may read", "table_allowlist")
+    name = table.name
+    if not name:
+        raise SqlRejected(
+            "only the documented tables may be read, not table functions", "table_allowlist"
+        )
+    if name.lower() not in ALLOWED_TABLES:
         raise SqlRejected(f"{name} is not a table this endpoint may read", "table_allowlist")
+    return name.lower()
+
+
+def _row_bound(statement: exp.Query) -> int | None:
+    """The row bound the outermost query carries, refusing any that is too large.
+
+    Both spellings count. `FETCH FIRST n ROWS ONLY` is LIMIT in standard SQL
+    clothing, and the first parser version knew only `Limit`: an oversized
+    `FETCH FIRST` was accepted and rendered uncapped, turning a rule that had
+    been failing closed (a syntax error) into one that failed open. Every
+    bound in the tree is range-checked, inner ones included; the value
+    returned is the outermost one, which is what actually bounds the answer.
+    """
+    for node in statement.find_all(*_BOUND_NODES):
+        _bound_value(node)
+    outer = statement.args.get("limit") or statement.args.get("fetch")
+    return None if outer is None else _bound_value(outer)
+
+
+def _bound_value(node: exp.Expression) -> int:
+    """The integer a LIMIT or FETCH carries, or a refusal.
+
+    The two spell their count differently: `Limit` keeps it as the node's
+    expression, `Fetch` under a `count` argument. sqlglot stores a `Fetch`
+    under the same `limit` key as a `Limit`, so reading only the expression
+    made every `FETCH FIRST n ROWS ONLY` look like a non-numeric bound.
+    """
+    value = node.args.get("count") if isinstance(node, exp.Fetch) else node.expression
+    if isinstance(value, str):
+        # Some sqlglot versions keep the count as a plain string.
+        value = exp.Literal.number(value) if value.isdigit() else None
+    if not isinstance(value, exp.Literal) or not value.is_int:
+        raise SqlRejected(
+            f"a row limit must be a plain number no greater than {MAX_ROWS}", "row_limit"
+        )
+    count = int(value.name)
+    if count > MAX_ROWS:
+        raise SqlRejected(f"a row limit must be no greater than {MAX_ROWS}", "row_limit")
+    return count
 
 
 def _capped(statement: exp.Query) -> exp.Query:
-    """Refuse any LIMIT above the cap, and put the cap on the outermost query.
+    """Put the row cap on the outermost query when it does not already have one.
 
-    Both halves matter. Refusing an oversized LIMIT keeps the query the user
-    is shown honest, since silently shrinking it would display a query that
-    never ran. Applying the cap to the outermost statement *regardless of
-    inner limits* is what stops `SELECT * FROM (SELECT … LIMIT 5) t JOIN …`
-    from returning the whole join: an inner LIMIT bounds a subquery, never
-    the result the API has to hold in memory.
+    Applied *regardless of inner bounds*: an inner LIMIT bounds a subquery,
+    never the result the API has to hold in memory, so
+    `SELECT * FROM (SELECT … LIMIT 5) t JOIN …` still gets the outer cap.
+    An oversized bound is refused by `_row_bound` rather than shrunk here,
+    because silently shrinking it would show the user a query that never ran.
     """
-    for limit in statement.find_all(exp.Limit):
-        value = limit.expression
-        if not isinstance(value, exp.Literal) or not value.is_int:
-            raise SqlRejected(
-                f"LIMIT must be a plain number no greater than {MAX_ROWS}", "row_limit"
-            )
-        if int(value.name) > MAX_ROWS:
-            raise SqlRejected(f"LIMIT must be no greater than {MAX_ROWS}", "row_limit")
-
-    if statement.args.get("limit") is not None:
+    if statement.args.get("limit") is not None or statement.args.get("fetch") is not None:
         return statement
     return statement.limit(MAX_ROWS)

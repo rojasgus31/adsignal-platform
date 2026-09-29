@@ -23,6 +23,7 @@ from adsignal.warehouse.ask_reads import (
     STATEMENT_TIMEOUT,
     QueryRefused,
     ensure_readonly_role,
+    forget_verified_dsns,
     readonly_dsn_for,
     run_readonly_query,
     verify_readonly_dsn,
@@ -49,13 +50,21 @@ def _postgres_available(dsn: str) -> bool:
 
 
 @pytest.fixture(scope="module")
-def readonly_dsn() -> str:
-    """Create `adsignal_ro` against `ASK_TEST_DSN` and return its DSN.
+def readonly_password() -> str:
+    """The password this module's `adsignal_ro` is given.
 
-    The password is generated per run rather than written down anywhere: the
-    role is a local test artefact, and a literal in the repository would be a
-    credential in the repository.
+    Generated per run rather than written down anywhere: the role is a local
+    test artefact, and a literal in the repository would be a credential in
+    the repository. Shared by every test in the module, because the role is
+    cluster-wide — a test that rotated it to a different value would break
+    every direct `psycopg.connect` that ran after it.
     """
+    return secrets.token_urlsafe(24)
+
+
+@pytest.fixture(scope="module")
+def readonly_dsn(readonly_password: str) -> str:
+    """Create `adsignal_ro` against `ASK_TEST_DSN` and return its DSN."""
     if not _postgres_available(ASK_TEST_DSN):
         pytest.skip("Postgres not reachable")
 
@@ -63,9 +72,8 @@ def readonly_dsn() -> str:
     ensure_ml_schema(ASK_TEST_DSN)
     ensure_artifact_schema(ASK_TEST_DSN)
 
-    password = secrets.token_urlsafe(24)
-    ensure_readonly_role(ASK_TEST_DSN, password)
-    return readonly_dsn_for(ASK_TEST_DSN, password)
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
+    return readonly_dsn_for(ASK_TEST_DSN, readonly_password)
 
 
 def _table_exists(table: str) -> bool:
@@ -211,15 +219,22 @@ def test_a_refusal_carries_no_dsn_no_password_and_no_driver_text(readonly_dsn: s
     assert str(refused.value) == refused.value.reason
 
 
-def test_ensure_readonly_role_is_idempotent() -> None:
-    """Running it twice, as a deployment would, must succeed and rotate cleanly."""
+def test_ensure_readonly_role_is_idempotent(readonly_password: str) -> None:
+    """Running it twice, as every deploy does, must succeed and leave it usable.
+
+    Deliberately the module's own password, not a fresh one: `adsignal_ro` is
+    cluster-wide, so rotating it here would invalidate the DSN every other
+    test in this module holds — which is exactly what happened, and was only
+    visible once a later test opened a direct connection instead of reusing
+    a pooled one.
+    """
     if not _postgres_available(ASK_TEST_DSN):
         pytest.skip("Postgres not reachable")
-    password = secrets.token_urlsafe(24)
-    ensure_readonly_role(ASK_TEST_DSN, password)
-    ensure_readonly_role(ASK_TEST_DSN, password)
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
     result = run_readonly_query(
-        readonly_dsn_for(ASK_TEST_DSN, password), "SELECT 1 AS one FROM dim_campaign LIMIT 1"
+        readonly_dsn_for(ASK_TEST_DSN, readonly_password),
+        "SELECT 1 AS one FROM dim_campaign LIMIT 1",
     )
     assert result.columns == ("one",)
 
@@ -286,3 +301,52 @@ def test_the_fetch_is_bounded_even_if_the_query_is_not(readonly_dsn: str) -> Non
     """
     result = run_readonly_query(readonly_dsn, "SELECT campaign_id FROM dim_campaign", max_rows=3)
     assert len(result.rows) <= 3
+
+
+# Fix round 2. Two controls below the rules: the wire protocol, and not
+# retaining a credential in a process-global structure.
+
+
+def test_a_stacked_statement_is_refused_by_the_wire_protocol(readonly_dsn: str) -> None:
+    """Control 2, at a level no rule of ours is involved in.
+
+    The validator refuses stacked statements, but it is bypassable by
+    definition — that is why the executor is tested separately. psycopg sends
+    a parameterless query over the *simple* protocol, where Postgres happily
+    runs several statements separated by semicolons; the executor now forces
+    the extended protocol, where the server refuses them itself.
+
+    This asserts the refusal comes from Postgres, not from us: the statement
+    below never touches `validate_sql`.
+    """
+    with pytest.raises(QueryRefused) as refused:
+        run_readonly_query(readonly_dsn, "SELECT 1 AS a; SELECT 2 AS b")
+    assert refused.value.rule in ("invalid_query", "database_error")
+
+
+def test_the_simple_protocol_would_have_allowed_that_stack(readonly_dsn: str) -> None:
+    """The counter-test, so the one above cannot pass for the wrong reason.
+
+    Run the identical statement on a plain connection with no `prepare`, and
+    Postgres accepts it. If this ever starts failing, the test above stopped
+    proving anything about the protocol and started proving something about
+    the SQL.
+    """
+    with psycopg.connect(readonly_dsn) as conn:
+        rows = conn.execute("SELECT 1 AS a; SELECT 2 AS b").fetchall()
+    assert rows == [(1,)], "the simple protocol no longer accepts a stacked statement"
+
+
+def test_the_verification_memo_does_not_retain_the_dsn(readonly_dsn: str) -> None:
+    """A DSN carries the role's password; a process-global set must not hold it."""
+    from adsignal.warehouse import ask_reads
+
+    forget_verified_dsns()
+    verify_readonly_dsn(readonly_dsn)
+    remembered = " ".join(ask_reads._VERIFIED_DSNS)  # noqa: SLF001 - the point of the test
+    password = psycopg.conninfo.conninfo_to_dict(readonly_dsn)["password"]
+    assert isinstance(password, str)
+    assert password not in remembered
+    assert readonly_dsn not in remembered
+    assert "postgresql://" not in remembered
+    assert remembered, "nothing was memoized, so the check was not exercised"

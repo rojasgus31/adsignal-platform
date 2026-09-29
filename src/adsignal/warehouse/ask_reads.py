@@ -23,6 +23,7 @@ Nothing here validates SQL — `warehouse.sql_guard` does that, and
 the database refuses it on its own.
 """
 
+import hashlib
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -80,6 +81,12 @@ _PROBE_EXCLUDED_TABLE = "model_artifacts"
 # per process rather than one per question. Only successes are remembered: a
 # DSN that failed verification must be re-checked, because the fix is a grant
 # change that this process would otherwise never notice.
+#
+# Keyed by digest, not by the DSN itself. A DSN carries the role's password,
+# and this set lives for the life of the process — retaining it here would be
+# exactly what `ensure_readonly_role` avoids by not using `apply_schema`'s
+# memo. A digest answers "have I checked this one" without holding the
+# credential to do it.
 _VERIFIED_DSNS: set[str] = set()
 _VERIFY_LOCK = threading.Lock()
 
@@ -207,7 +214,8 @@ def verify_readonly_dsn(readonly_dsn: str) -> None:
     Memoized per DSN after it passes, so a healthy deployment pays one round
     trip per process.
     """
-    if readonly_dsn in _VERIFIED_DSNS:
+    fingerprint = _dsn_fingerprint(readonly_dsn)
+    if fingerprint in _VERIFIED_DSNS:
         return
 
     try:
@@ -239,7 +247,17 @@ def verify_readonly_dsn(readonly_dsn: str) -> None:
         )
 
     with _VERIFY_LOCK:
-        _VERIFIED_DSNS.add(readonly_dsn)
+        _VERIFIED_DSNS.add(fingerprint)
+
+
+def _dsn_fingerprint(dsn: str) -> str:
+    """A digest identifying `dsn` without retaining it.
+
+    SHA-256 of the DSN. Not a secret-hiding measure against an attacker who
+    already has the digest and a guessable DSN — it is there so the process
+    never holds the password in a long-lived structure at all.
+    """
+    return hashlib.sha256(dsn.encode("utf-8")).hexdigest()
 
 
 def forget_verified_dsns() -> None:
@@ -272,6 +290,10 @@ def run_readonly_query(
     application validates first; the tests deliberately do not, because a
     control that only works when the validator agrees is not a control.
 
+    Executed on the extended query protocol (see the `prepare=True` comment
+    below), so Postgres refuses a stacked statement before this module's
+    rules are even consulted.
+
     `max_rows` bounds the fetch itself. The validator already caps the outer
     query, so this only bites when the validator was bypassed — which is the
     one case this function is written to survive, and `fetchall()` on an
@@ -284,7 +306,17 @@ def run_readonly_query(
             conn.execute(
                 sql.SQL("SET LOCAL statement_timeout = {}").format(sql.Literal(statement_timeout))
             )
-            cursor = conn.execute(query)
+            # `prepare=True` is what forces psycopg onto the **extended**
+            # query protocol. Without it, a parameterless statement goes out
+            # over the simple protocol, where Postgres itself accepts
+            # several statements separated by semicolons — so
+            # `_single_statement` would be the only thing standing between a
+            # stacked payload and execution. On the extended protocol the
+            # server refuses multiple commands outright, which makes stacking
+            # impossible at the wire level rather than by rule. It also means
+            # Postgres parses the statement with its own grammar, which is
+            # the grammar that ultimately matters.
+            cursor = conn.execute(query, prepare=True)
             columns = tuple(column.name for column in cursor.description or ())
             fetched = cursor.fetchmany(max_rows)
     except psycopg.Error as error:

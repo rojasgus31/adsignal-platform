@@ -46,28 +46,41 @@ class AnthropicProvider:
         }
         client = self._client or httpx.Client(timeout=self._timeout)
 
+        # The failure is recorded here and raised *below*, outside every
+        # `except` block. `raise ... from None` clears `__cause__` but leaves
+        # `__context__` pointing at the httpx exception, so the chain still
+        # reaches whatever that exception's text contains. This provider sends
+        # its key in a header rather than in the URL, so no credential is
+        # retained either way - but this is the pattern to copy, and the next
+        # provider added here will copy whatever is written.
+        failure: str | None = None
+        response: httpx.Response | None = None
+
         try:
-            response = client.post(_ENDPOINT, headers=headers, json=payload, timeout=self._timeout)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            raise RuntimeError(
-                f"anthropic returned {error.response.status_code} (headers REDACTED, key REDACTED)"
-            ) from None
-        except httpx.TimeoutException:
-            raise RuntimeError(
-                "anthropic request timed out (headers REDACTED, key REDACTED)"
-            ) from None
-        except httpx.ConnectError:
-            raise RuntimeError(
-                "anthropic connection failed (headers REDACTED, key REDACTED)"
-            ) from None
-        except httpx.HTTPError:
-            raise RuntimeError(
-                "anthropic request failed (headers REDACTED, key REDACTED)"
-            ) from None
+            try:
+                response = client.post(
+                    _ENDPOINT, headers=headers, json=payload, timeout=self._timeout
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                failure = (
+                    f"anthropic returned {error.response.status_code} "
+                    "(headers REDACTED, key REDACTED)"
+                )
+            except httpx.TimeoutException:
+                failure = "anthropic request timed out (headers REDACTED, key REDACTED)"
+            except httpx.ConnectError:
+                failure = "anthropic connection failed (headers REDACTED, key REDACTED)"
+            except httpx.HTTPError:
+                failure = "anthropic request failed (headers REDACTED, key REDACTED)"
         finally:
             if self._client is None:
                 client.close()
+
+        if failure is not None:
+            raise RuntimeError(failure)
+        if response is None:  # pragma: no cover - unreachable while failure is None
+            raise RuntimeError("anthropic returned no response (key REDACTED)")
 
         return _extract_text(response.json())
 

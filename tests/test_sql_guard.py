@@ -343,3 +343,81 @@ def test_a_cte_the_query_really_defines_is_still_allowed() -> None:
         "SELECT campaign_id FROM recent LIMIT 10"
     )
     assert "recent" in safe
+
+
+# Fix round 2. The parse-and-render rewrite closed three bypasses and opened a
+# worse one: sqlglot's renderer and Postgres disagreed about where a string
+# literal ends, so text classified as data came back out as SQL.
+
+
+def test_an_escape_string_that_re_parses_differently_is_refused() -> None:
+    """The regression: `E'\\'` renders as `e'\\'`, which Postgres reads as an
+    escaped quote rather than a terminator.
+
+    The literal's boundary moved between what was validated and what would
+    have executed. The rendered query re-parsed to `FROM model_artifacts`
+    with the row cap swallowed into a comment — the allowlist, the cap and
+    the comment rule all defeated by one payload.
+    """
+    refusal = _rejection(
+        "SELECT E'\\\\' AS a, ', b FROM model_artifacts --' AS c FROM dim_campaign"
+    )
+    assert refusal.rule in ("round_trip", "table_allowlist", "invalid_query")
+
+
+def test_a_cte_declared_inside_a_subquery_does_not_launder_the_outer_table() -> None:
+    """A CTE name is only a table within the scope that declares it."""
+    refusal = _rejection(
+        "SELECT * FROM model_artifacts WHERE 1 IN "
+        "(WITH model_artifacts AS (SELECT 1 AS x) SELECT x FROM model_artifacts)"
+    )
+    assert refusal.rule == "table_allowlist"
+    assert "model_artifacts" in refusal.reason
+
+
+def test_a_cte_declared_inside_a_derived_table_does_not_launder_a_join() -> None:
+    refusal = _rejection(
+        "SELECT * FROM (WITH model_artifacts AS (SELECT 1 AS x) SELECT x FROM model_artifacts) s "
+        "JOIN model_artifacts m ON true"
+    )
+    assert refusal.rule == "table_allowlist"
+
+
+def test_the_same_laundering_does_not_work_for_the_embedding_table() -> None:
+    refusal = _rejection(
+        "SELECT * FROM entity_embeddings WHERE 1 IN "
+        "(WITH entity_embeddings AS (SELECT 1 AS x) SELECT x FROM entity_embeddings)"
+    )
+    assert refusal.rule == "table_allowlist"
+
+
+def test_an_oversized_fetch_first_is_refused_like_an_oversized_limit() -> None:
+    """`FETCH FIRST n ROWS ONLY` is LIMIT in standard spelling.
+
+    The first parser version knew `Limit` and not `Fetch`, so this was
+    accepted and rendered uncapped — a rule that had been failing closed
+    (a syntax error) started failing open.
+    """
+    refusal = _rejection("SELECT campaign_id FROM dim_campaign FETCH FIRST 100000 ROWS ONLY")
+    assert refusal.rule == "row_limit"
+
+
+def test_a_small_fetch_first_is_accepted_and_still_bounded() -> None:
+    safe = validate_sql("SELECT campaign_id FROM dim_campaign FETCH FIRST 5 ROWS ONLY")
+    assert "5" in safe
+
+
+def test_validation_is_idempotent() -> None:
+    """Whatever comes out must validate to itself.
+
+    This is the invariant the escape-string regression broke: a validator
+    whose own output re-parses to something else has not finished its job.
+    """
+    for query in (
+        "SELECT campaign_id FROM dim_campaign",
+        "SELECT channel, SUM(spend) AS s FROM fct_campaign_daily GROUP BY channel",
+        "WITH recent AS (SELECT campaign_id FROM fct_campaign_daily) SELECT * FROM recent LIMIT 10",
+        "SELECT campaign_id FROM dim_campaign WHERE channel = 'search' LIMIT 5",
+    ):
+        once = validate_sql(query)
+        assert validate_sql(once) == once

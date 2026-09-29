@@ -145,10 +145,17 @@ Three independent controls replace it, and each is sufficient on its own.**
    executor. `tests/test_ask_reads.py` opens a connection with this role and
    issues `DROP TABLE dim_campaign` in an ordinary read-write transaction —
    no validator, no read-only transaction — and asserts Postgres refuses it.
-2. **A read-only transaction with a 5 s statement timeout.** Every execution
-   sets `SET LOCAL transaction_read_only = on` and `SET LOCAL
-   statement_timeout = '5s'`, so a write slips past nothing and a runaway
-   cross join dies on its own.
+2. **A read-only transaction with a 5 s statement timeout, on the extended
+   query protocol.** Every execution sets `SET LOCAL transaction_read_only =
+   on` and `SET LOCAL statement_timeout = '5s'`, so a write slips past
+   nothing and a runaway cross join dies on its own. The query is sent with
+   `prepare=True`, which forces psycopg onto the extended protocol: a
+   parameterless statement would otherwise go over the *simple* protocol,
+   where Postgres itself accepts several statements separated by semicolons.
+   On the extended protocol the server refuses multiple commands outright, so
+   stacking is impossible at the wire level rather than only by rule — and
+   Postgres parses the statement with its own grammar, which is the grammar
+   that ultimately matters.
 3. **A pure validator** (`warehouse/sql_guard.py`, no I/O). One statement
    only, opening with `SELECT` or `WITH`; no comments; no writing,
    administrative or catalog construct; no table outside the allowlist; a
@@ -167,6 +174,30 @@ Three independent controls replace it, and each is sufficient on its own.**
    from the parsed tree, so anything sqlglot did not model is absent from
    what reaches Postgres rather than passing through unexamined. `LIMIT ALL`
    is the concrete case: the scanner saw the word LIMIT and appended no cap.
+
+   **And the rendering is itself checked, because rendering was a hole.**
+   That reasoning holds in one direction only: sqlglot can *emit* something
+   it models differently from Postgres. Review found
+   `SELECT E'\' AS a, ', b FROM model_artifacts --' AS c FROM dim_campaign`
+   accepted, because sqlglot rendered the escape string as `e'\'`, where
+   Postgres reads `\'` as an escaped quote rather than a terminator — so the
+   literal's boundary moved between what was validated and what would have
+   run, and the rendered query re-parses to `FROM model_artifacts` with the
+   cap commented out. Every query is now validated **twice**, once as written
+   and once as rendered, and refused unless the two agree on their real table
+   set, their comment absence and their effective cap, with the rendering
+   required to be a fixed point.
+
+   **Table references are resolved per scope.** A `WITH` nested inside a
+   sub-select declares a name only for that sub-select; collecting CTE names
+   tree-wide let one launder the same name for the outer query. sqlglot's
+   scope machinery decides which references are real tables, and a reference
+   the analyser cannot classify is treated as a real table rather than
+   waved through.
+
+   **Both spellings of the row bound count.** `FETCH FIRST n ROWS ONLY` is
+   LIMIT in standard clothing; knowing only `Limit` turned a rule that had
+   been failing closed into one that failed open.
 
 **Control 1 is verified, not assumed.** `verify_readonly_dsn` runs before the
 first query on a DSN and refuses to serve `/ask` unless the connection is

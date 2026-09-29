@@ -3,8 +3,9 @@
 The API key travels as an `Authorization: Bearer` header rather than a query
 parameter, but a header value can still reach exception text, logs, and
 tracebacks depending on how errors are constructed — so every error path
-here is rewritten exactly as Gemini's is, and each is raised with `from None`
-so the original exception is not chained into the traceback.
+here is rewritten exactly as Gemini's is, and each is raised outside the
+`except` block that recorded it, so neither `__cause__` nor `__context__`
+links back to the httpx exception.
 """
 
 import httpx
@@ -41,22 +42,40 @@ class GroqProvider:
         headers = {"Authorization": f"Bearer {self._api_key}"}
         client = self._client or httpx.Client(timeout=self._timeout)
 
+        # The failure is recorded here and raised *below*, outside every
+        # `except` block. `raise ... from None` clears `__cause__` but leaves
+        # `__context__` pointing at the httpx exception, so the chain still
+        # reaches whatever that exception's text contains. This provider sends
+        # its key in a header rather than the URL, so no credential is retained
+        # either way - but the pattern is the one to copy, and the next
+        # provider added here will copy whatever is written.
+        failure: str | None = None
+        response: httpx.Response | None = None
+
         try:
-            response = client.post(_ENDPOINT, headers=headers, json=payload, timeout=self._timeout)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            raise RuntimeError(
-                f"groq returned {error.response.status_code} (headers REDACTED, key REDACTED)"
-            ) from None
-        except httpx.TimeoutException:
-            raise RuntimeError("groq request timed out (headers REDACTED, key REDACTED)") from None
-        except httpx.ConnectError:
-            raise RuntimeError("groq connection failed (headers REDACTED, key REDACTED)") from None
-        except httpx.HTTPError:
-            raise RuntimeError("groq request failed (headers REDACTED, key REDACTED)") from None
+            try:
+                response = client.post(
+                    _ENDPOINT, headers=headers, json=payload, timeout=self._timeout
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                failure = (
+                    f"groq returned {error.response.status_code} (headers REDACTED, key REDACTED)"
+                )
+            except httpx.TimeoutException:
+                failure = "groq request timed out (headers REDACTED, key REDACTED)"
+            except httpx.ConnectError:
+                failure = "groq connection failed (headers REDACTED, key REDACTED)"
+            except httpx.HTTPError:
+                failure = "groq request failed (headers REDACTED, key REDACTED)"
         finally:
             if self._client is None:
                 client.close()
+
+        if failure is not None:
+            raise RuntimeError(failure)
+        if response is None:  # pragma: no cover - unreachable while failure is None
+            raise RuntimeError("groq returned no response (key REDACTED)")
 
         return _extract_text(response.json())
 
