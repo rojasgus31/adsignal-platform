@@ -306,8 +306,9 @@ each sufficient on its own, none of which depends on the model behaving:**
    extended query protocol** — `SET LOCAL transaction_read_only = on`, so a
    runaway query dies on its own, `prepare=True` so Postgres refuses a
    stacked statement at the wire level instead of relying on our rule, and
-   `standard_conforming_strings`/`backslash_quote`/`search_path` pinned so
-   the server parses the approved query the way the validator read it, plus
+   `standard_conforming_strings`/`backslash_quote`/`search_path` (which lists
+   `pg_temp` last, the only thing that demotes it) pinned so the server
+   parses the approved query the way the validator read it, plus
    `DateStyle`/`TimeZone` so the same question does not get different numbers
    on a differently configured server. The answer is bounded by size as well
    as by row count, because one aggregate can build one very large value.

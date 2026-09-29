@@ -76,13 +76,19 @@ STATEMENT_TIMEOUT = "5s"
 # says: the validator refuses schema-qualified names, so every name it
 # approves is resolved by the search path, and leaving that to the role's
 # configuration would let `dim_campaign` mean a table in another schema.
-# `pg_catalog` is named explicitly because Postgres otherwise searches
-# `pg_temp` *first*, implicitly - and `adsignal_ro` can create temp tables,
-# since TEMPORARY is granted to PUBLIC by default. Nothing reaches that today
-# (`transaction_read_only` refuses `CREATE TEMP TABLE`, and each request is
-# its own transaction), but a pin that does not do what its comment says is
-# worth less than no pin. Deployments that want the hole closed at the source
-# should `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC`.
+# `pg_temp` is named explicitly, and last, because that is the only thing
+# that moves it. Postgres searches the temp schema *first* unless the search
+# path lists it, and `adsignal_ro` can create temp tables since TEMPORARY is
+# granted to PUBLIC by default - so a temp `dim_campaign` shadows the real
+# one. Naming `pg_catalog` alone does not help: measured against the server
+# with a temp `dim_campaign` present, `pg_catalog, public` resolves the name
+# to `pg_temp_3` exactly as bare `public` does, and only
+# `pg_catalog, public, pg_temp` resolves it to `public`. Nothing reaches this
+# through `/ask` (`transaction_read_only` refuses `CREATE TEMP TABLE`, and
+# each request is its own transaction), but a pin that does not do what its
+# comment says is worth less than no pin, and the previous value did not.
+# Deployments that want the hole closed at the source should
+# `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC`.
 #
 # `DateStyle` and `TimeZone` are pinned for a different reason: they change
 # the *answer*, not the meaning of the SQL. `'01/02/2024'::date` is a
@@ -110,7 +116,12 @@ STATEMENT_TIMEOUT = "5s"
 _PINNED_SETTINGS: tuple[tuple[str, sql.Composable], ...] = (
     ("standard_conforming_strings", sql.Literal("on")),
     ("backslash_quote", sql.Literal("off")),
-    ("search_path", sql.SQL(", ").join([sql.Identifier("pg_catalog"), sql.Identifier("public")])),
+    (
+        "search_path",
+        sql.SQL(", ").join(
+            [sql.Identifier("pg_catalog"), sql.Identifier("public"), sql.SQL("pg_temp")]
+        ),
+    ),
     ("DateStyle", sql.Literal("ISO, MDY")),
     ("TimeZone", sql.Literal("UTC")),
 )
@@ -124,6 +135,18 @@ _PINNED_SETTINGS: tuple[tuple[str, sql.Composable], ...] = (
 # third promise `sql_guard._ALLOWED_UNKNOWN_FUNCTIONS` makes - true rather
 # than aspirational. It bounds what is *served*, not what Postgres builds;
 # the statement timeout is what bounds the work.
+# Measured as encoded UTF-8 bytes, not characters. Summing `len(str(value))`
+# called itself a byte cap and counted characters, so `repeat('€', 900000)`
+# passed a "1 MB" limit and served 2.7 MB - a four-fold evasion for the price
+# of a non-ASCII character. The cap exists to bound what crosses the wire, so
+# it measures what crosses the wire.
+#
+# It runs *after* the rows are materialised, so it bounds what is **served**,
+# not what the API process allocates: a 60 MB value is built in memory and
+# then refused. Bounding allocation would mean streaming and measuring as
+# rows arrive, which this endpoint - capped at 200 rows and answering a
+# dashboard - does not justify. The statement timeout is what bounds the work
+# on the server side.
 MAX_RESULT_BYTES = 1_000_000
 
 # Revoked rather than merely left ungranted. A future `GRANT SELECT ON ALL
@@ -368,10 +391,13 @@ def run_readonly_query(
     below), so Postgres refuses a stacked statement before this module's
     rules are even consulted.
 
-    `max_rows` bounds the fetch itself. The validator already caps the outer
-    query, so this only bites when the validator was bypassed — which is the
-    one case this function is written to survive, and `fetchall()` on an
-    uncapped query is the API process's memory.
+    `max_rows` bounds the fetch itself — how many *rows* are materialised,
+    which is not the same as how much memory they occupy: one row can carry
+    an aggregate built from an entire table. `MAX_RESULT_BYTES` is what
+    bounds the size of the answer, and it does so after the fact. The
+    validator already caps the outer query, so `max_rows` only bites when the
+    validator was bypassed, which is the one case this function is written to
+    survive.
     """
     verify_readonly_dsn(readonly_dsn)
     try:
@@ -413,7 +439,7 @@ def _require_servable_size(rows: list[dict[str, Any]]) -> None:
     that looks right, and the whole point of showing the user the SQL is that
     they can trust the relationship between the query and the result.
     """
-    total = sum(len(str(value)) for row in rows for value in row.values())
+    total = sum(len(str(value).encode("utf-8")) for row in rows for value in row.values())
     if total > MAX_RESULT_BYTES:
         raise QueryRefused(
             "that answer is too large to return; ask for fewer columns or an aggregate",
@@ -465,6 +491,16 @@ def _jsonable(value: object) -> Any:
         return float(value)
     if isinstance(value, datetime | date):
         return value.isoformat()
+    if isinstance(value, list | tuple):
+        # Postgres arrays and `jsonb` arrive as real Python containers.
+        # Falling through to `str()` sent the client a Python repr —
+        # `['s', 'a']`, with single quotes — which is not JSON and which a
+        # hand-written client cannot parse. More visible since
+        # `regexp_split_to_array`, `regexp_matches` and `jsonb_agg` were
+        # admitted, because those return exactly these types.
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     return str(value)
 
 

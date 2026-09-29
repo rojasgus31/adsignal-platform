@@ -66,6 +66,21 @@ class _RedactedDsn(str):
         return "<readonly DSN, password redacted>"
 
 
+class _RedactedPassword(str):
+    """A password that prints as nothing useful, wherever pytest prints it.
+
+    `_RedactedDsn` covers the fixture-argument repr, but this value is a
+    direct test argument too, so a failing test printed it in every traceback
+    frame header. A `str` subclass is still a password everywhere psycopg
+    wants one.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<role password redacted>"
+
+
 @pytest.fixture(scope="module")
 def readonly_password() -> str:
     """The password this module's `adsignal_ro` is given.
@@ -76,7 +91,7 @@ def readonly_password() -> str:
     cluster-wide — a test that rotated it to a different value would break
     every direct `psycopg.connect` that ran after it.
     """
-    return secrets.token_urlsafe(24)
+    return _RedactedPassword(secrets.token_urlsafe(24))
 
 
 @pytest.fixture(scope="module")
@@ -91,6 +106,17 @@ def readonly_dsn(readonly_password: str) -> _RedactedDsn:
 
     ensure_readonly_role(ASK_TEST_DSN, readonly_password)
     return _RedactedDsn(readonly_dsn_for(ASK_TEST_DSN, readonly_password))
+
+
+def _password_of(dsn: str) -> str:
+    """The password inside `dsn`, for leak assertions that never print it.
+
+    Every caller reduces the result to a boolean before asserting; see
+    `test_a_refusal_carries_no_dsn_no_password_and_no_driver_text`.
+    """
+    password = psycopg.conninfo.conninfo_to_dict(dsn)["password"]
+    assert isinstance(password, str)
+    return password
 
 
 def _table_exists(table: str) -> bool:
@@ -226,9 +252,12 @@ def test_a_refusal_carries_no_dsn_no_password_and_no_driver_text(readonly_dsn: s
     with pytest.raises(QueryRefused) as refused:
         run_readonly_query(readonly_dsn, "DROP TABLE dim_campaign")
     text = f"{refused.value.reason} {refused.value.rule}"
-    password = psycopg.conninfo.conninfo_to_dict(readonly_dsn)["password"]
-    assert isinstance(password, str)
-    assert password not in text
+    # Reduced to a boolean *before* the assert. pytest's assertion rewriting
+    # prints the value of each operand in a failing comparison, not its
+    # repr, so `assert password not in text` would put the live password in
+    # the diff no matter how well the fixture redacts itself.
+    leaked = _password_of(readonly_dsn) in text
+    assert not leaked, "the refusal carried the role password"
     assert "postgresql://" not in text
     assert "localhost" not in text
     assert "psycopg" not in text
@@ -361,10 +390,8 @@ def test_the_verification_memo_does_not_retain_the_dsn(readonly_dsn: str) -> Non
     forget_verified_dsns()
     verify_readonly_dsn(readonly_dsn)
     remembered = " ".join(ask_reads._VERIFIED_DSNS)  # noqa: SLF001 - the point of the test
-    password = psycopg.conninfo.conninfo_to_dict(readonly_dsn)["password"]
-    assert isinstance(password, str)
-    assert password not in remembered
-    assert readonly_dsn not in remembered
+    leaked = _password_of(readonly_dsn) in remembered or str(readonly_dsn) in remembered
+    assert not leaked, "the memo retained the DSN or its password"
     assert "postgresql://" not in remembered
     assert remembered, "nothing was memoized, so the check was not exercised"
 
@@ -387,27 +414,11 @@ def test_the_parsing_settings_are_pinned_for_every_query(readonly_dsn: str) -> N
         {
             "scs": "on",
             "bq": "off",
-            "sp": "pg_catalog, public",
+            "sp": "pg_catalog, public, pg_temp",
             "ds": "ISO, MDY",
             "tz": "UTC",
         }
     ]
-
-
-def test_the_search_path_puts_pg_temp_last(readonly_dsn: str) -> None:
-    """Postgres searches `pg_temp` first unless `pg_catalog` is named explicitly.
-
-    `adsignal_ro` can create temp tables — TEMPORARY is granted to PUBLIC by
-    default — and a temp `dim_campaign` would shadow the real one. Nothing
-    reaches that through `/ask` (a read-only transaction refuses `CREATE TEMP
-    TABLE`, and each request is its own transaction), but the pin should do
-    what its comment says.
-    """
-    result = run_readonly_query(
-        readonly_dsn, "SELECT current_schemas(true) AS schemas FROM dim_campaign LIMIT 1"
-    )
-    schemas = str(result.rows[0]["schemas"])
-    assert "pg_temp" not in schemas or schemas.index("pg_temp") > schemas.index("public")
 
 
 def test_a_date_literal_means_the_same_day_whatever_the_server_prefers(
@@ -493,3 +504,64 @@ def test_a_backslash_literal_means_the_same_thing_to_postgres(readonly_dsn: str)
     result = run_readonly_query(readonly_dsn, approved)
     assert result.columns == ("a", "c")
     assert result.rows[0]["a"] == "\\"
+
+
+def test_the_search_path_actually_demotes_pg_temp(readonly_dsn: str) -> None:
+    """Measured with a temp table present, because that is the only real test.
+
+    Postgres searches the temp schema first unless the search path lists it,
+    so `pg_catalog, public` demotes nothing — with a temp `dim_campaign`
+    present it resolves the name to `pg_temp_N` exactly as bare `public`
+    does. The previous test passed only because the pooled connection had no
+    temp schema, so its `"pg_temp" not in schemas` clause short-circuited:
+    a test guarding a fix that did nothing.
+
+    This creates the temp table on the connection it then queries, so the
+    shadowing is really present.
+    """
+    from psycopg import sql as pgsql
+
+    from adsignal.warehouse.ask_reads import _PINNED_SETTINGS
+
+    with psycopg.connect(readonly_dsn, autocommit=True) as conn:
+        conn.execute("CREATE TEMP TABLE dim_campaign (x int)")
+        for name, value in _PINNED_SETTINGS:
+            conn.execute(
+                pgsql.SQL("SET {name} = {value}").format(name=pgsql.Identifier(name), value=value)
+            )
+        schema = conn.execute(
+            "SELECT n.nspname FROM pg_class r JOIN pg_namespace n ON n.oid = r.relnamespace "
+            "WHERE r.oid = 'dim_campaign'::regclass"
+        ).fetchone()
+    assert schema is not None
+    assert schema[0] == "public", f"a temp table shadowed the real one (resolved to {schema[0]})"
+
+
+def test_the_size_cap_counts_bytes_not_characters(readonly_dsn: str) -> None:
+    """`repeat('€', 900000)` is 900k characters and 2.7 MB on the wire.
+
+    Counting characters let it pass a cap named for bytes — a four-fold
+    evasion for the price of a non-ASCII character.
+    """
+    with pytest.raises(QueryRefused) as refused:
+        run_readonly_query(readonly_dsn, "SELECT repeat('\u20ac', 900000) AS big")
+    assert refused.value.rule == "result_too_large"
+
+
+def test_an_array_reaches_the_client_as_json_not_as_a_python_repr(readonly_dsn: str) -> None:
+    """`regexp_split_to_array` and `jsonb_agg` return real containers.
+
+    Falling through to `str()` sent `['s', 'a']` — a Python repr with single
+    quotes, which is not JSON and which a hand-written client cannot parse.
+    """
+    result = run_readonly_query(
+        readonly_dsn, "SELECT regexp_split_to_array('a,b', ',') AS parts FROM dim_campaign LIMIT 1"
+    )
+    assert result.rows[0]["parts"] == ["a", "b"]
+
+
+def test_a_jsonb_object_reaches_the_client_as_a_mapping(readonly_dsn: str) -> None:
+    result = run_readonly_query(
+        readonly_dsn, "SELECT jsonb_build_object('a', 1) AS obj FROM dim_campaign LIMIT 1"
+    )
+    assert result.rows[0]["obj"] == {"a": 1}

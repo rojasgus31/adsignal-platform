@@ -173,15 +173,21 @@ Three independent controls replace it, and each is sufficient on its own.**
    the validator refuses qualified names and would otherwise leave name
    resolution to the role's own configuration.
 
-   `search_path` names `pg_catalog` explicitly, because Postgres otherwise
-   searches `pg_temp` **first**, implicitly — and `adsignal_ro` can create
-   temp tables, since TEMPORARY is granted to PUBLIC by default, so a temp
-   `dim_campaign` would shadow the real one. Nothing reaches that through
-   `/ask` (a read-only transaction refuses `CREATE TEMP TABLE`, and each
-   request is its own transaction), but a pin that does not do what its
-   comment says is worth less than no pin. A deployment that wants the hole
-   closed at the source should `REVOKE TEMPORARY ON DATABASE <db> FROM
-   PUBLIC`; this project does not do that to someone else's database.
+   `search_path` is `pg_catalog, public, pg_temp`, and the last entry is the
+   one that does the work. Postgres searches the temp schema **first** unless
+   the path names it, and `adsignal_ro` can create temp tables since
+   TEMPORARY is granted to PUBLIC by default — so a temp `dim_campaign` would
+   shadow the real one. Naming `pg_catalog` alone does nothing: measured
+   against the server with a temp `dim_campaign` present, `pg_catalog,
+   public` resolves the name to `pg_temp_3` exactly as bare `public` does,
+   and only listing `pg_temp` last resolves it to `public`. Nothing reaches
+   this through `/ask` (a read-only transaction refuses `CREATE TEMP TABLE`,
+   and each request is its own transaction), but a pin that does not do what
+   its comment says is worth less than no pin — and the first version of this
+   one did not, with a test that passed vacuously because the pooled
+   connection had no temp schema. A deployment that wants the hole closed at
+   the source should `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC`; this
+   project does not do that to someone else's database.
 
    `DateStyle` and `TimeZone` are pinned too, for a different reason: they
    change the *answer* rather than the meaning. `'01/02/2024'::date` is a
@@ -200,8 +206,14 @@ Three independent controls replace it, and each is sufficient on its own.**
    `MAX_RESULT_BYTES` bounds the whole answer and refuses rather than
    truncating. A silently shortened answer is a wrong answer that looks
    right, which is the one thing showing the user the SQL is meant to
-   prevent. It bounds what is *served*, not what Postgres builds; the
-   statement timeout is what bounds the work.
+   prevent. It counts **encoded UTF-8 bytes**: the first version summed
+   `len(str(value))`, which is characters, so `repeat('€', 900000)` passed a
+   cap named for bytes and served 2.7 MB. It runs after the rows are
+   materialised, so it bounds what is *served*, not what the API process
+   allocates — a 60 MB value is built and then refused. Bounding allocation
+   would mean streaming and measuring as rows arrive, which an endpoint
+   capped at 200 rows does not justify; the statement timeout is what bounds
+   the work on the server.
 3. **A pure validator** (`warehouse/sql_guard.py`, no I/O). One statement
    only, opening with `SELECT` or `WITH`; no comments; no writing,
    administrative or catalog construct; no table outside the allowlist; a
@@ -318,6 +330,16 @@ current list from the ListModels endpoint.
 `rule: "not_configured"`, which the dashboard renders. The same is true when
 no read-only DSN is set. Neither is ever a 500, and neither is ever a
 fabricated answer.
+
+**The endpoint answers 200, 429 or 422, and nothing else.** A rate-limit
+refusal and a malformed body are the two status codes; every other outcome —
+a model failure, a refused query, a database error, and anything nobody
+anticipated — is a 200 carrying the same seven fields. That last clause needed
+a catch-all around the answer path to be true rather than aspirational, and
+the failure that proved it was an ordinary one: SQL truncated at a token
+limit raises `sqlglot.TokenError`, a *sibling* of `ParseError` rather than a
+subclass, which escaped the validator and became a 500. A deeply nested query
+raises `RecursionError`, which is not a sqlglot error at all.
 
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.

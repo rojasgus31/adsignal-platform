@@ -573,3 +573,51 @@ def test_a_schema_qualified_operator_is_refused() -> None:
 
 def test_an_ordinary_operator_still_works() -> None:
     assert validate_sql("SELECT channel || '!' FROM dim_campaign")
+
+
+# Fix round 5.
+
+
+def test_truncated_sql_is_a_refusal_not_an_exception() -> None:
+    """What a model emits when it hits its token limit.
+
+    `sqlglot.TokenError` is a *sibling* of `ParseError` — both descend
+    straight from `SqlglotError` — so catching `ParseError` missed it and it
+    escaped `validate_sql` entirely.
+    """
+    refusal = _rejection("SELECT * FROM dim_campaign WHERE channel = 'sea")
+    assert refusal.rule == "invalid_query"
+
+
+def test_an_unterminated_block_comment_is_a_refusal() -> None:
+    refusal = _rejection("SELECT campaign_id FROM dim_campaign /* unfinished")
+    assert refusal.rule in ("invalid_query", "no_comments")
+
+
+def test_a_string_literal_cannot_become_a_column_reference() -> None:
+    """The fail-open half of the `Var` class round 4 only half-fixed.
+
+    `date_bin('1 week', event_date, 'event_date')` parsed the origin into a
+    bare `Var` whose text *is* identifier-shaped, so the round-4 repair left
+    it alone and it rendered as `EVENT_DATE` — a column reference. Postgres
+    ran it and returned a row. Round-trip and fixed-point cannot see this:
+    the rendering is stable and the table set is unchanged.
+    """
+    safe = validate_sql(
+        "SELECT date_bin('1 week', event_date, 'event_date') AS binned FROM fct_campaign_daily"
+    )
+    assert "'EVENT_DATE'" in safe, "the literal became a column reference"
+
+
+def test_the_non_identifier_half_still_works() -> None:
+    safe = validate_sql(
+        "SELECT date_bin('1 week', event_date, '2024-01-01') FROM fct_campaign_daily"
+    )
+    assert "'2024-01-01'" in safe
+
+
+def test_a_genuine_unit_keyword_is_left_alone() -> None:
+    """`EXTRACT(week FROM …)` and `DATE_TRUNC('month', …)` must not be disturbed."""
+    assert "WEEK" in validate_sql("SELECT EXTRACT(week FROM event_date) FROM fct_campaign_daily")
+    trunc = validate_sql("SELECT date_trunc('month', event_date) FROM fct_campaign_daily")
+    assert "'MONTH'" in trunc

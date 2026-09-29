@@ -285,10 +285,30 @@ def _requoted(statement: exp.Query) -> exp.Query:
     refused it, correctly — but the query was ordinary and the renderer was
     at fault, so a refusal was the wrong answer to give the user.
 
-    A genuine `Var` is a bare SQL word (`week` in `EXTRACT(week FROM …)`) and
-    is always a valid identifier. One that is not can only have come from a
-    string literal, so it is put back as one. Narrow on purpose: this repairs
-    a rendering defect and must not become a general rewriting step.
+    Two cases, and the first version fixed only one of them.
+
+    **Not identifier-shaped** (`'2024-01-01'`): renders as the arithmetic
+    `2024 - 01 - 01`, so the round-trip check refused it. Fail-closed, and a
+    refusal was the wrong answer to an ordinary query.
+
+    **Identifier-shaped** (`'event_date'`): renders as the bare word
+    `EVENT_DATE`, which Postgres reads as a **column reference**. It ran and
+    returned a row. Round-trip and fixed-point cannot see this one — the
+    rendering is stable and the table set is unchanged — so it was fail-open,
+    and it is the reason this function is now positional rather than
+    shape-based.
+
+    `date_bin`'s third argument is an origin *timestamp*, never a bare word,
+    and `exp.DateBin` is the only node sqlglot renders a `Var` bare from
+    (`DATE_TRUNC` quotes its unit; `EXTRACT(week FROM …)` genuinely is a bare
+    word and is left alone). So a `Var` in that position is always a string
+    literal and is always put back as one.
+
+    **Case is not preserved**, and cannot be: sqlglot upper-cases the token
+    while tokenising, so the literal is gone before this runs. For the only
+    legal content of that argument — a date or timestamp — upper-casing
+    changes nothing, and anything else fails the cast at Postgres rather than
+    meaning something different.
 
     Applied inside `_analyse`, so both passes normalise identically —
     otherwise the rendering would be re-parsed back into a `Var` and the
@@ -296,7 +316,9 @@ def _requoted(statement: exp.Query) -> exp.Query:
     """
     for var in statement.find_all(exp.Var):
         name = var.name
-        if isinstance(name, str) and name and not name.isidentifier():
+        if not isinstance(name, str) or not name:
+            continue
+        if isinstance(var.parent, exp.DateBin) or not name.isidentifier():
             var.replace(exp.Literal.string(name))
     return statement
 
@@ -322,7 +344,13 @@ def _single_statement(text: str) -> exp.Expression:
     """
     try:
         parsed = sqlglot.parse(text, read=DIALECT)
-    except sqlglot.ParseError:
+    except sqlglot.errors.SqlglotError:
+        # `SqlglotError`, not `ParseError`. `TokenError` is a *sibling* of
+        # `ParseError` - both descend straight from `SqlglotError` - so
+        # catching the narrower type let an unterminated string literal
+        # escape `validate_sql` and become a 500 at the route. That is
+        # exactly what a model emits when it hits its token limit, which
+        # makes it one of the likelier inputs this endpoint sees.
         raise SqlRejected("that is not a query this endpoint can parse", "invalid_query") from None
 
     statements = [statement for statement in parsed if isinstance(statement, exp.Expression)]

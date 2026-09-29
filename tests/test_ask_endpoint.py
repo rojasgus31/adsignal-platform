@@ -218,3 +218,63 @@ def test_an_unrestricted_readonly_dsn_refuses_rather_than_running(ask_client) ->
     assert body["rule"] == "readonly_dsn_unverified"
     assert body["rows"] == []
     assert "postgresql://" not in body["refusal"]
+
+
+# Fix round 5. The contract is 200-or-429-or-422. Nothing else.
+
+
+def test_truncated_sql_from_the_model_is_a_refusal_not_a_500(ask_client) -> None:
+    """The likeliest real failure: the model hit its token limit mid-literal.
+
+    This returned a 500 before fix round 5, breaking both the seven-field
+    contract and the "never a 500" guarantee.
+    """
+    _install(ask_client, "SELECT * FROM dim_campaign WHERE channel = 'sea")
+    body = _ask(ask_client, "which channel?")
+    assert body["rule"] == "invalid_query"
+    assert body["rows"] == []
+    assert body["sql"] == "SELECT * FROM dim_campaign WHERE channel = 'sea"
+
+
+def test_an_unexpected_exception_is_still_a_two_hundred(ask_client) -> None:
+    """The catch-all, tested through something no rule anticipates."""
+
+    class _Exploding:
+        name = "stub"
+
+        def generate_sql(self, request: SqlQuestion) -> str:
+            raise MemoryError("not enough memory")
+
+    ask_client.app.state.sql_generator = SqlGenerator(_Exploding())
+    body = _ask(ask_client, "anything")
+    assert body["rule"] in ("generation_failed", "unexpected_error")
+    assert body["rows"] == []
+
+
+def test_a_deeply_nested_query_is_a_refusal_not_a_500(ask_client) -> None:
+    """Deep nesting raises `RecursionError`, which is not a sqlglot error."""
+    _install(ask_client, "SELECT " + "(" * 400 + "1" + ")" * 400 + " FROM dim_campaign")
+    body = _ask(ask_client, "deeply nested")
+    assert body["refusal"] is not None
+    assert body["rows"] == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM dim_campaign WHERE channel = 'sea",
+        "SELECT campaign_id FROM dim_campaign /* unfinished",
+        "",
+        "not sql at all",
+        "SELECT * FROM model_artifacts",
+        "DROP TABLE dim_campaign",
+        "SELECT " + "(" * 400 + "1" + ")" * 400,
+    ],
+)
+def test_every_malformed_answer_keeps_the_seven_field_contract(ask_client, sql: str) -> None:
+    _install(ask_client, sql)
+    response = ask_client.post("/ask", json={"question": f"q {len(sql)}"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body) == {"question", "sql", "columns", "rows", "provider", "refusal", "rule"}
+    assert body["refusal"] is not None

@@ -28,6 +28,14 @@ breach. `tests/test_ask_reads.py` proves the point by handing the executor a
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.
 
+**This endpoint answers 200 or it answers 429 or 422, and nothing else.** A
+rate-limit refusal and a malformed body are the two status codes; everything
+past that point — a model failure, a refused query, a database error, and
+anything nobody anticipated — is a 200 carrying the same seven fields. The
+catch-all around `_answer` is what makes that last clause true rather than
+aspirational, and it exists because the failure that broke it was a perfectly
+ordinary one: SQL truncated at a token limit.
+
 Rate limiting and caching are unchanged from the template version: a
 `TokenBucket` keyed per client IP (429 when refused) and a bounded TTL cache
 keyed on the question. A cache hit still costs a token — otherwise a burst of
@@ -72,6 +80,16 @@ ASK_CACHE_CAPACITY = 512
 # database configured. Distinct from every validator and database rule: it
 # says the endpoint is switched off, not that the question was bad.
 NOT_CONFIGURED_RULE = "not_configured"
+
+# The refusal reported when something raised that this module did not expect.
+# The endpoint's contract is that it always answers 200 with the same seven
+# fields, and a contract that holds only for the failures someone anticipated
+# is not a contract. A truncated query — what a model emits when it hits its
+# token limit — reached `sqlglot.TokenError`, which is a sibling of
+# `ParseError` rather than a subclass, and became a 500; a deeply nested one
+# raises `RecursionError`, which is not a sqlglot error at all. Both are now
+# refusals, and so is whatever the next one turns out to be.
+UNEXPECTED_RULE = "unexpected_error"
 
 
 class AskRequest(BaseModel):
@@ -207,6 +225,18 @@ def post_ask(
             question, "ask is not configured — no read-only database connection is available"
         )
 
-    response = _answer(question, generator, settings.postgres_readonly_dsn)
+    try:
+        response = _answer(question, generator, settings.postgres_readonly_dsn)
+    except Exception:  # noqa: BLE001 - the contract is "always 200"; see UNEXPECTED_RULE
+        # Deliberately says nothing about what raised. The exception's own
+        # text can carry a DSN, a driver message or the failing statement,
+        # and this response is rendered to whoever asked the question.
+        return _refused(
+            question,
+            None,
+            generator.name,
+            "something went wrong answering that; try rephrasing it",
+            UNEXPECTED_RULE,
+        )
     cache.put(cache_key, response)
     return response
