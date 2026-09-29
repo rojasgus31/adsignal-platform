@@ -17,6 +17,7 @@ from adsignal.api.model_loader import ScoringModelHolder
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
+from adsignal.narrative.sqlgen import SqlGenerator
 
 
 def get_settings(request: Request) -> Settings:
@@ -41,6 +42,19 @@ def get_ask_cache(request: Request) -> TtlCache[Any]:
     """Return the bounded response cache `/ask` answers from, for this app."""
     cache: TtlCache[Any] = request.app.state.ask_cache
     return cache
+
+
+def get_sql_generator(request: Request) -> SqlGenerator | None:
+    """Return this app's question-to-SQL generator, or `None` if none is configured.
+
+    `None` is the state a deployment with no `ADSIGNAL_GEMINI_API_KEY` is in,
+    and `/ask` reports it as such. It lives on `app.state` like the rate
+    limiters so a test can replace it with a stub provider, and so the
+    generator's circuit breaker is per-app rather than a module global shared
+    by every app in the process.
+    """
+    generator: SqlGenerator | None = request.app.state.sql_generator
+    return generator
 
 
 def get_search_rate_limiter(request: Request) -> TokenBucket:

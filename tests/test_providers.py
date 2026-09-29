@@ -3,7 +3,7 @@ from datetime import date
 import httpx
 import pytest
 
-from adsignal.config import Settings
+from adsignal.config import DEFAULT_GEMINI_MODEL, Settings
 from adsignal.narrative.build import build_chain
 from adsignal.narrative.prompt import build_prompt
 from adsignal.narrative.providers.anthropic import AnthropicProvider
@@ -13,6 +13,7 @@ from adsignal.narrative.providers.jev import JevProvider
 from adsignal.narrative.types import NarrativeRequest
 
 SECRET = "sk-super-secret-key-do-not-leak"
+MODEL = DEFAULT_GEMINI_MODEL
 
 REQUEST = NarrativeRequest(
     as_of=date(2024, 6, 1),
@@ -59,7 +60,7 @@ def test_gemini_returns_the_models_text() -> None:
             json={"candidates": [{"content": {"parts": [{"text": "all quiet"}]}}]},
         )
 
-    provider = GeminiProvider(api_key=SECRET, client=_client(handler))
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_client(handler))
     assert provider.generate(REQUEST) == "all quiet"
 
 
@@ -73,7 +74,7 @@ def test_gemini_error_never_contains_the_api_key() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"error": {"message": "bad key"}})
 
-    provider = GeminiProvider(api_key=SECRET, client=_client(handler))
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_client(handler))
     with pytest.raises(Exception) as excinfo:  # noqa: PT011 - any type; content is the point
         provider.generate(REQUEST)
 
@@ -84,7 +85,7 @@ def test_gemini_error_never_contains_the_api_key() -> None:
 
 def test_gemini_connection_error_never_contains_the_api_key() -> None:
     """The key is in the URL, so even a transport-level failure could leak it."""
-    provider = GeminiProvider(api_key=SECRET, client=_failing_client())
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_failing_client())
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
@@ -95,7 +96,7 @@ def test_gemini_connection_error_never_contains_the_api_key() -> None:
 
 def test_gemini_timeout_never_contains_the_api_key() -> None:
     """A timeout is a distinct failure category from a refused connection."""
-    provider = GeminiProvider(api_key=SECRET, client=_timing_out_client())
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_timing_out_client())
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
@@ -108,7 +109,7 @@ def test_gemini_raises_on_an_unexpected_payload_shape() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"unexpected": "shape"})
 
-    provider = GeminiProvider(api_key=SECRET, client=_client(handler))
+    provider = GeminiProvider(api_key=SECRET, model=MODEL, client=_client(handler))
     with pytest.raises(ValueError, match="unexpected response"):
         provider.generate(REQUEST)
 
@@ -290,9 +291,22 @@ def test_build_chain_includes_a_configured_provider_first() -> None:
     assert names[-1] == "stub"
 
 
+# Every key a deployment can configure, blanked. `Settings()` reads `.env`,
+# so a bare `Settings()` here builds whatever chain the developer's machine
+# happens to have keys for - and this test started calling the live Gemini
+# API, and failing, the moment a real key was added to `.env`. A test of
+# "what happens with no providers configured" has to say so explicitly.
+NO_KEYS = {
+    "gemini_api_key": "",
+    "groq_api_key": "",
+    "jev_api_key": "",
+    "anthropic_api_key": "",
+}
+
+
 def test_build_chain_always_ends_with_the_stub() -> None:
     """The chain must never be empty, so a keyless deployment still renders."""
-    chain = build_chain(Settings())
+    chain = build_chain(Settings(**NO_KEYS))
     result = chain.generate(REQUEST)
     assert result.provider == "stub"
 

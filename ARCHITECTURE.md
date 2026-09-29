@@ -125,35 +125,78 @@ that failure. Both floors run in `.github/workflows/eval.yml` via
 
 ---
 
-## 5. `/ask` selects a template; it does not generate SQL
+## 5. `/ask` generates SQL, and three controls contain it
 
-The spec calls `/ask` "natural language to SQL". This implementation does not
-generate SQL, and nothing generates it on the endpoint's behalf.
+`/ask` used to match a question against four named query templates. That
+design could not be injected into by construction — its selector emitted one
+of four fixed strings and never a query — and it could not answer anything
+its author had not thought of. The project owner asked for the second thing,
+so the first was given up deliberately.
 
-A keyword matcher (`_match_template` in `src/adsignal/api/routes/ask.py`)
-maps a question to the *name* of one of four templates declared in
-`src/adsignal/api/queries.py`. That name is validated against
-`QUERY_TEMPLATES` before anything runs; an unrecognised name is rejected with
-a 400 rather than executed. Each template's `sql` is a fixed literal with
-`%s` placeholders, and each declared parameter is validated by an `IntParam`
-with a minimum, a maximum and a default before it is bound. Executing a
-template is `warehouse/template_reads.run_template`'s job, so `api/` issues no
-SQL at all.
+The endpoint now sends the question and a description of seven tables to
+Gemini and runs the SQL that comes back. **The structural guarantee is gone.
+Three independent controls replace it, and each is sufficient on its own.**
 
-The security property here is **structural, not defensive**. This is not
-injection sanitisation applied after the fact. A selector whose entire output
-alphabet is four known strings cannot emit a query, so it cannot emit an
-injection — there is no string-building step for a malicious input to reach.
+1. **A read-only Postgres role.** `warehouse/ask_reads.ensure_readonly_role`
+   creates `adsignal_ro`: `LOGIN`, `SELECT` on the seven allowlisted tables,
+   ownership of nothing, and an explicit `REVOKE ALL` on `model_artifacts`
+   and `entity_embeddings`. Generated SQL runs only on
+   `ADSIGNAL_POSTGRES_READONLY_DSN`; the admin DSN is never passed to the
+   executor. `tests/test_ask_reads.py` opens a connection with this role and
+   issues `DROP TABLE dim_campaign` in an ordinary read-write transaction —
+   no validator, no read-only transaction — and asserts Postgres refuses it.
+2. **A read-only transaction with a 5 s statement timeout.** Every execution
+   sets `SET LOCAL transaction_read_only = on` and `SET LOCAL
+   statement_timeout = '5s'`, so a write slips past nothing and a runaway
+   cross join dies on its own.
+3. **A pure validator** (`warehouse/sql_guard.py`, no I/O, tested against
+   stacked statements, comment-hidden payloads, `UNION SELECT` against an
+   excluded table, `pg_read_file`, `LIMIT 100000`, fullwidth-Unicode
+   keywords and writing CTEs). One statement only, opening with `SELECT` or
+   `WITH`; no comments; no writing, administrative or catalog construct; no
+   table outside the allowlist; a `LIMIT` of 200 appended when absent and
+   refused when larger.
 
-**No model is involved in that selection today, in any configuration**, and
-the reason is a contract, not an oversight. The provider interface is
-`NarrativeProvider.generate(request: NarrativeRequest) -> str`
-(`src/adsignal/narrative/types.py`), where `NarrativeRequest` is a closed
-dataclass of precomputed statistics — campaign and anomaly counts, top
-causes. It has no field capable of carrying an arbitrary free-text question.
-Routing `/ask` through the narrative chain, as the plan's prose describes,
-would mean changing a contract that several earlier tasks already depend on.
-The keyword matcher is what ships.
+The allowlist is exactly `fct_campaign_daily`, `dim_campaign`,
+`anomaly_predictions`, `model_metrics`, `pipeline_runs`, `narrative_runs`
+and `drift_reports` (`warehouse/ask_schema.py`). `model_artifacts` and
+`entity_embeddings` are excluded: one holds pickled estimator bytes, the
+other raw vectors, neither can contribute to an answer, and either could
+return megabytes of binary.
+
+**The prompt is a quality measure, not a control.** It asks for the same
+shape the validator enforces, because a model that writes acceptable SQL
+produces answers rather than refusals. A model that ignores every word of it
+produces a refusal, not a breach. An LLM instructed to emit only SELECT is
+not a security control; a read-only database role is.
+
+Question-to-SQL is a **sibling** contract to `NarrativeProvider`, not an
+extension of it. `NarrativeRequest` is a closed dataclass of precomputed
+statistics, and its docstring gives the reason — the prompt is built from it,
+so nothing unexpected can reach a provider. A free-text question shares none
+of its fields, so widening it would have weakened that guarantee for the
+three providers that already implement it. `narrative/sqlgen.py` defines
+`SqlProvider` and `SqlQuestion` instead; the Gemini transport, the key
+redaction and the circuit breaker are shared.
+
+**The model name is a setting, not a literal.** `ADSIGNAL_GEMINI_MODEL`
+(`Settings.gemini_model`, default `gemini-3.5-flash`) is passed to both
+`GeminiProvider` and `GeminiSqlProvider`; neither carries a default of its
+own, so they cannot drift onto different models and neither holds a stale
+name. The previous hardcoded `gemini-2.0-flash` was retired by Google and
+answered 404 to a valid key — a hardcoded model name is a dated assertion
+about someone else's product. `config.py` records how to re-derive the
+current list from the ListModels endpoint.
+
+**No key configured is a state, not an error.** With
+`ADSIGNAL_GEMINI_API_KEY` unset — which is how this repository runs today —
+`/ask` answers 200 with `refusal: "ask is not configured …"` and
+`rule: "not_configured"`, which the dashboard renders. The same is true when
+no read-only DSN is set. Neither is ever a 500, and neither is ever a
+fabricated answer.
+
+The generated SQL is returned to the caller on purpose. A reader who can see
+the query can judge the answer; one who cannot has to trust it.
 
 ---
 
@@ -387,9 +430,11 @@ survive horizontal scaling without an external pooler.
 
 **Breaker state resets every night.** See §6.
 
-**`/ask` answers four questions.** The template registry has four entries.
-A question that matches no keyword rule returns "I don't have a named query
-that answers that question yet" rather than guessing.
+**`/ask` is only as good as one Gemini call.** There is no retry across
+providers, no repair loop on a refused query and no few-shot examples: a
+question the model answers with unacceptable SQL comes back as a refusal
+naming the rule, and the user rephrases. The refusal shows the rejected
+query, so rephrasing is informed rather than blind.
 
 **The models recover an encoded signal.** `anomaly_cause` is assigned by the
 synthetic generator from deterministic effect multipliers, so the classifier

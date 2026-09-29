@@ -28,7 +28,7 @@ from adsignal.ml.splits import temporal_split
 from adsignal.ml.training import BASELINE_WINDOW, HOLDOUT_FRACTION, train_and_evaluate
 from adsignal.ml.triage import TriageClassifier
 from adsignal.narrative.chain import AllProvidersFailed, NarrativeChain
-from adsignal.narrative.types import NarrativeRequest
+from adsignal.narrative.types import NarrativeRequest, NarrativeResult
 from adsignal.warehouse.artifact_store import write_artifacts
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import load_dim_campaign, load_mart_to_postgres
@@ -47,14 +47,23 @@ from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 @dataclass(slots=True)
 class _RunCounter:
-    """A mutable holder an asset can set `rows` on before returning.
+    """A mutable holder an asset can set `rows` and `detail` on before returning.
 
     `_record` needs a value to log after the asset body finishes (or raises),
     so the count has to live somewhere the asset can write to as it runs
     rather than as a return value the wrapper never sees.
+
+    `detail` is the same field a failure fills with an exception type name,
+    reused by a *succeeding* asset that has something a reader needs. Only
+    `daily_narrative` sets it today: a narrative written by the stub because
+    Gemini returned 404 is a success by every measure this table records,
+    and without this the row is indistinguishable from one where no key was
+    ever configured. A failure still overwrites it, because the reason a run
+    failed outranks anything it managed to note on the way.
     """
 
     rows: int = field(default=0)
+    detail: str = field(default="")
 
 
 @contextmanager
@@ -87,6 +96,7 @@ def _record(context: AssetExecutionContext, settings: Settings) -> Iterator[_Run
     status, detail = "succeeded", ""
     try:
         yield counter
+        detail = counter.detail
     except BaseException as error:  # not Exception - see docstring
         status, detail = "failed", type(error).__name__
         raise
@@ -467,12 +477,26 @@ def daily_narrative(context: AssetExecutionContext) -> None:
 
         write_narrative(settings.postgres_dsn, request.as_of, result)
         counter.rows = 1
+        # `result.skipped` holds provider names paired with exception TYPE
+        # names, composed by `NarrativeChain` precisely so nothing here can
+        # echo a key or a URL. Recording it is what makes "the stub wrote
+        # this" legible as "gemini failed first" rather than as "no provider
+        # was configured".
+        counter.detail = _narrative_detail(result)
         context.add_output_metadata(
             {
                 "provider": MetadataValue.text(result.provider),
                 "latency_ms": MetadataValue.float(result.latency_ms),
+                "skipped": MetadataValue.text(", ".join(result.skipped) or "none"),
             }
         )
+
+
+def _narrative_detail(result: NarrativeResult) -> str:
+    """Summarize which provider answered and which ones did not, for `pipeline_runs`."""
+    if not result.skipped:
+        return f"provider={result.provider}"
+    return f"provider={result.provider}; skipped={', '.join(result.skipped)}"
 
 
 def _build_narrative_request(dsn: str) -> NarrativeRequest | None:

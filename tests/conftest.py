@@ -1,5 +1,6 @@
 import os
 import platform
+import secrets
 import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from adsignal.ml.training import BASELINE_WINDOW, train_and_evaluate
 from adsignal.narrative.summary import summarize
 from adsignal.narrative.types import NarrativeRequest, NarrativeResult
 from adsignal.warehouse.artifact_store import ensure_artifact_schema, write_artifacts
+from adsignal.warehouse.ask_reads import ensure_readonly_role, readonly_dsn_for
 from adsignal.warehouse.duckdb_io import open_duckdb, register_sources, run_dbt
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.loader import load_dim_campaign, load_mart_to_postgres
@@ -147,12 +149,23 @@ DB_ONLY_TEST_DSN = os.environ.get(
 )
 
 
+# A seventh, separate database for `/ask`'s read-only role and executor
+# (`test_ask_reads.py`). Those tests fire `DROP TABLE` and `INSERT` at the
+# database on purpose, to prove the `adsignal_ro` role refuses them. If that
+# control ever regressed, the damage must land on a database nothing else
+# depends on rather than on the seeded `TEST_DSN`.
+ASK_TEST_DSN = os.environ.get(
+    "ADSIGNAL_ASK_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_ask",
+)
+
 _ensure_test_database(TEST_DSN)
 _ensure_test_database(EMPTY_TEST_DSN)
 _ensure_test_database(DROPPED_TEST_DSN)
 _ensure_test_database(CONCURRENCY_TEST_DSN)
 _ensure_test_database(DB_ONLY_TEST_DSN)
 _ensure_test_database(DIM_TEST_DSN)
+_ensure_test_database(ASK_TEST_DSN)
 
 
 def _postgres_available(dsn: str) -> bool:
@@ -664,6 +677,33 @@ def client(_api_seed: str):
 
 
 @pytest.fixture(scope="module")
+def ask_client(_api_seed: str):
+    """A `TestClient` whose `/ask` has a working read-only DSN.
+
+    The `client` fixture leaves `postgres_readonly_dsn` empty, which is the
+    unconfigured deployment `/ask` reports as such. This one creates the
+    `adsignal_ro` role against the seeded `TEST_DSN` and points the endpoint
+    at it, so a test can install a stub generator and exercise the whole
+    generate -> validate -> execute path against real rows.
+
+    The role's password is generated per run; nothing writes it down.
+    """
+    if not _postgres_available(TEST_DSN):
+        pytest.skip("Postgres not reachable")
+
+    password = secrets.token_urlsafe(24)
+    ensure_readonly_role(TEST_DSN, password)
+    app = create_app(
+        Settings(
+            postgres_dsn=TEST_DSN,
+            postgres_readonly_dsn=readonly_dsn_for(TEST_DSN, password),
+        )
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture(scope="module")
 def empty_client():
     """A `TestClient` against a database whose tables exist but hold no rows.
 
@@ -742,7 +782,13 @@ def dropped_tables_client():
 
 # Every fixture that hands a test a `TestClient`. `reset_ask_state` below
 # only materializes the ones the test already asked for.
-_CLIENT_FIXTURES = ("client", "empty_client", "dropped_tables_client", "db_only_client")
+_CLIENT_FIXTURES = (
+    "client",
+    "ask_client",
+    "empty_client",
+    "dropped_tables_client",
+    "db_only_client",
+)
 
 
 @pytest.fixture(autouse=True)

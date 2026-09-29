@@ -220,3 +220,39 @@ def test_every_http_provider_failing_still_yields_the_stub_narrative() -> None:
     result = chain.generate(REQUEST)
     assert result.provider == "stub"
     assert result.text == "placeholder narrative"
+
+
+def test_a_fallback_answer_carries_what_it_fell_back_from() -> None:
+    """ "The stub answered" and "gemini 404'd, then the stub answered" must differ.
+
+    Without this the dashboard and `pipeline_runs` show the same thing for a
+    deployment with no keys and for one whose paid provider has been failing
+    every night — which is exactly what a retired model name looks like.
+    """
+    chain = NarrativeChain(
+        [
+            StubProvider(fail_with=RuntimeError("gemini returned 404"), name="gemini"),
+            StubProvider("fallback text", name="stub"),
+        ]
+    )
+    result = chain.generate(REQUEST)
+    assert result.provider == "stub"
+    assert result.skipped == ("gemini (RuntimeError)",)
+
+
+def test_the_skipped_list_carries_no_provider_error_text() -> None:
+    """Only names and exception TYPES, because a message can echo a key."""
+    secret = "sk-super-secret-key-do-not-leak"
+    chain = NarrativeChain(
+        [
+            StubProvider(fail_with=RuntimeError(f"failed with key={secret}"), name="gemini"),
+            StubProvider("fallback text", name="stub"),
+        ]
+    )
+    result = chain.generate(REQUEST)
+    assert secret not in " ".join(result.skipped)
+
+
+def test_a_first_provider_that_answers_reports_nothing_skipped() -> None:
+    chain = NarrativeChain([StubProvider("first", name="a"), StubProvider("second", name="b")])
+    assert chain.generate(REQUEST).skipped == ()

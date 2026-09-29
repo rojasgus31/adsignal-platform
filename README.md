@@ -46,9 +46,9 @@ this repository — they exist for the planned dashboard's vertical filtering,
 so their absence of a consumer today is intentional, not dead code.
 
 The full architecture decision record — why two stores, why the pipeline is
-precomputed, why the release gate is AUC and not recall, why `/ask` selects
-templates rather than generating SQL, and what the circuit breakers do and do
-not protect in the deployed topology — is in
+precomputed, why the release gate is AUC and not recall, what contains the
+SQL `/ask` now generates, and what the circuit breakers do and do not
+protect in the deployed topology — is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Running the stack
@@ -234,7 +234,7 @@ pipeline writes.
 | `GET /benchmark` | Recent runs plus the most recently stored narrative: its prose, date, provider name and generation time (null before the narrative job has run) |
 | `POST /search` | Semantic search over stored entity embeddings |
 | `POST /score` | Score one campaign-day on demand, with the loaded models |
-| `POST /ask` | A natural-language question, answered from precomputed data |
+| `POST /ask` | A natural-language question, answered by generated SQL run under a read-only role (returns the SQL) |
 
 Run it with `docker compose up -d api`, or locally with
 `uv run uvicorn adsignal.api.app:create_app --factory --port 8000`. The
@@ -253,8 +253,8 @@ pipeline already computed and stored — visitor traffic against them
 triggers no inference and no external call, regardless of load. Those
 three are the exceptions: `/search` runs an ONNX embedding pass over the
 caller's text, `/score` builds one campaign-day's features and runs the
-fitted detector and triage models against them, and `/ask` resolves a
-template and runs one indexed query. All three are therefore rate-limited
+fitted detector and triage models against them, and `/ask` calls a language
+model and runs the query it wrote. All three are therefore rate-limited
 per caller IP, with separate budgets (`/score` tightest, then `/search`,
 since their calls cost inference), and `/ask` is additionally cached
 (below).
@@ -286,47 +286,70 @@ timeout does not bound the chain, and a provider that answers only after
 the budget has run out is recorded as a failure, so a merely-slow backend
 can open its breaker too.
 
-### `/ask`: named templates, not generated SQL
+### `/ask`: generated SQL in a hard sandbox
 
-The spec describes `/ask` as "natural language to SQL". This
-implementation deliberately does **not** generate SQL. A keyword
-matcher (or, in principle, a model) resolves the question to the
-*name* of one of a fixed, closed set of query templates declared in
-`adsignal/api/queries.py` — never to a query string. That name is
-validated against the known template set before anything runs, and
-rejected with a 400 if it does not match one exactly. Each template's
-own parameters (for example, a result `limit`) are validated and bound
-with `%s` placeholders; nothing a request supplies — not the template
-name, not a parameter, not a column, not an ORDER BY direction — is
-ever interpolated into SQL. A component that can only ever choose among
-a handful of known names cannot emit an injection: this is not
-SQL-injection sanitisation applied after the fact, it is a data path
-where no such string can exist in the first place.
+`/ask` used to resolve a question to one of four named query templates. It
+now asks Gemini for SQL and runs it. That trade is deliberate: the old
+design could not be injected into by construction, but it could only answer
+four questions. **The structural guarantee is replaced by three controls,
+each sufficient on its own, none of which depends on the model behaving:**
 
-Because `/ask` is one of the two endpoints that do live work per request,
-it is guarded by a per-IP `TokenBucket` (`adsignal/api/ratelimit.py`) — a
-token bucket refilled gradually over time, returning 429 once a
-caller's budget is exhausted — and identical questions are cached for a
-short TTL so a repeated question is answered once, not recomputed on
-every call. The rate limiter is checked on every request regardless of
-a cache hit, so a burst of one repeated question still trips the
-limiter; the cache only saves the downstream template resolution and
-database round-trip. Both are per-app collaborators built in
-`create_app` and injected through `api/deps.py`, and the cache is
-bounded (LRU, hard capacity) as well as TTL'd, because its key is
-caller-supplied free text. The limiter's own map of client keys is
-bounded the same way, for the same reason.
+1. **A read-only Postgres role, `adsignal_ro`** — `SELECT` on seven
+   allowlisted tables, ownership of nothing, `model_artifacts` and
+   `entity_embeddings` explicitly revoked. Generated SQL runs only on
+   `ADSIGNAL_POSTGRES_READONLY_DSN`, never on the admin DSN. The test that
+   matters hands a `DROP TABLE` straight to the executor, bypassing the
+   validator entirely, and asserts the database refuses it.
+2. **A read-only transaction with a 5 s statement timeout** — `SET LOCAL
+   transaction_read_only = on`, so a runaway query dies on its own.
+3. **A pure validator** (`adsignal/warehouse/sql_guard.py`) — one statement,
+   opening with `SELECT` or `WITH`, no comments, no writing or
+   administrative keyword, no `pg_*` identifier, no table outside the
+   allowlist, and a `LIMIT` of 200 appended when absent or refused when
+   larger.
 
-**Known gap:** the plan describes resolving a question to a template
-*via the narrative chain* when a provider key is configured. The
-existing `NarrativeProvider` contract is
-`generate(request: NarrativeRequest) -> str`, where `NarrativeRequest`
-is a closed dataclass of precomputed statistics (campaign/anomaly
-counts, top causes) — it has no field for an arbitrary question, and
-extending it would mean changing a contract several earlier tasks
-already depend on. `/ask` therefore resolves every question through the
-keyword matcher only, in every configuration; no provider is called
-from this endpoint today.
+The prompt asks for the same shape, but the prompt is a quality measure. An
+LLM told to emit only SELECT is not a security control; a read-only role is.
+
+The response returns the **generated SQL** alongside the rows, on purpose: a
+reader who can see the query can judge the answer. A refusal returns the
+same shape with the rejected SQL, a plain reason and the rule that rejected
+it — never a DSN, never a driver message, never a traceback.
+
+**The model name is configuration, not a literal.** `ADSIGNAL_GEMINI_MODEL`
+(default `gemini-3.5-flash`) selects which model both Gemini providers call.
+The previous default, `gemini-2.0-flash`, was hardcoded in the provider until
+Google retired it, after which a perfectly valid key returned HTTP 404 on
+every call — a failure that reads like a broken endpoint. To re-derive the
+current list for a key: `GET
+https://generativelanguage.googleapis.com/v1beta/models?key=...` and take a
+non-preview entry supporting `generateContent`.
+
+**A fallback narrative says what it fell back from.** When a provider fails,
+the chain carries the names and exception *types* of everything it skipped on
+the result that finally answered, and `daily_narrative` writes that into
+`pipeline_runs.detail` (`provider=stub; skipped=gemini (RuntimeError)`).
+Without it, "stub answered" looks identical whether no key was configured or
+the paid provider has been 404ing every night.
+
+**Not configured is a first-class state.** With `ADSIGNAL_GEMINI_API_KEY`
+unset (the default here), `/ask` answers 200 with
+`rule: "not_configured"` and an explanation the dashboard renders. It never
+500s and never invents an answer. To switch it on: set the key, run
+`ensure_readonly_role(admin_dsn, password)` once, and point
+`ADSIGNAL_POSTGRES_READONLY_DSN` at the resulting role.
+
+Because `/ask` does live work per request — now a model call as well as a
+query — it is guarded by a per-IP `TokenBucket`
+(`adsignal/api/ratelimit.py`), returning 429 once a caller's budget is
+exhausted, and identical questions are cached for a short TTL. The rate
+limiter is checked on every request regardless of a cache hit, so a burst of
+one repeated question still trips the limiter; the cache saves the model
+call and the database round trip. Both are per-app collaborators built in
+`create_app` and injected through `api/deps.py`, and the cache is bounded
+(LRU, hard capacity) as well as TTL'd, because its key is caller-supplied
+free text. The limiter's own map of client keys is bounded the same way, for
+the same reason.
 
 ## Deliberate cuts
 
@@ -334,13 +357,18 @@ Things this project knowingly does not do, gathered in one place. Each is
 explained where it is implemented and, for the larger ones, in
 `ARCHITECTURE.md`.
 
-- **`/ask` does not generate SQL.** A keyword matcher picks among four named
-  templates; an unrecognised name is rejected before execution. Structural,
-  not sanitised.
-- **No LLM is involved in `/ask`'s template selection, in any
-  configuration.** `NarrativeProvider.generate(request: NarrativeRequest)`
-  takes a closed dataclass of precomputed statistics with no field for free
-  text, and that contract predates this endpoint.
+- **`/ask` runs model-written SQL, and gives up a structural guarantee to do
+  it.** The old template matcher could not emit a query at all. The
+  replacement is three controls that hold against hostile SQL — a read-only
+  role, a read-only transaction with a timeout, and a validator — not a
+  better-worded prompt.
+- **`/ask` reads seven tables, not the whole database.** `model_artifacts`
+  and `entity_embeddings` are excluded from the allowlist and revoked from
+  the role, so no question can reach pickled estimators or raw vectors.
+- **`/ask` does nothing without a model key.** With
+  `ADSIGNAL_GEMINI_API_KEY` unset it answers 200 saying it is not
+  configured. There is no template fallback: answering a different question
+  from the one asked would be indistinguishable from a real answer.
 - **The release gate is triage macro F1 and detector ROC AUC — not recall.**
   Recall on this detector moves with the dataset's anomaly rate, so it is
   reported but never gated on.

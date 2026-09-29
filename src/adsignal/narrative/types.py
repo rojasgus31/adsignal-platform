@@ -27,6 +27,20 @@ class NarrativeResult:
     text: str
     provider: str
     latency_ms: float
+    skipped: tuple[str, ...] = ()
+    """Providers tried before this one, and why each did not answer.
+
+    Without this, "stub answered" is the only thing a reader ever sees, and
+    it looks identical whether no key was configured or a real provider
+    returned 404 on every call — which is exactly what a retired model
+    looks like. Each entry is the string `NarrativeChain` already composes:
+    a provider name plus an exception *type* or a chain reason, never an
+    exception's message, so it carries no key and no URL.
+
+    Defaulted so every existing construction of this dataclass — including
+    the stored-narrative read path, which has no attempts to report — stays
+    valid.
+    """
 
 
 @runtime_checkable

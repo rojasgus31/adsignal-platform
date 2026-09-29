@@ -1,0 +1,186 @@
+"""`POST /ask` end to end: the no-key state, an answer, and the refusals.
+
+The stub generator here stands in for Gemini. Its job in most of these tests
+is to be hostile — to return exactly the SQL a compromised or confused model
+would return — so that what is tested is the endpoint's behaviour when the
+model misbehaves, which is the only interesting case.
+"""
+
+import os
+from typing import Any
+
+import psycopg
+import pytest
+
+from adsignal.narrative.sqlgen import SqlGenerator, SqlQuestion
+
+# Same pattern as every other DSN-driven test module: the env var is an
+# override, not a requirement.
+TEST_DSN = os.environ.get(
+    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
+)
+
+SECRET = "sk-super-secret-key-do-not-leak"
+
+
+class _FixedProvider:
+    """A `SqlProvider` that returns whatever SQL the test names."""
+
+    def __init__(self, sql: str) -> None:
+        self.name = "stub"
+        self.sql = sql
+        self.calls = 0
+
+    def generate_sql(self, request: SqlQuestion) -> str:
+        self.calls += 1
+        return self.sql
+
+
+def _install(client: Any, sql: str) -> _FixedProvider:
+    """Point this app's `/ask` at a generator that always returns `sql`."""
+    provider = _FixedProvider(sql)
+    client.app.state.sql_generator = SqlGenerator(provider)
+    return provider
+
+
+def _ask(client: Any, question: str) -> dict[str, Any]:
+    response = client.post("/ask", json={"question": question})
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def test_no_model_configured_answers_two_hundred_and_says_so(client) -> None:
+    """The state this repository is in today: `ADSIGNAL_GEMINI_API_KEY` unset.
+
+    It must be a rendered sentence in the dashboard, not a 500 and not an
+    invented answer.
+    """
+    client.app.state.sql_generator = None
+    body = _ask(client, "how many anomalies were there?")
+    assert body["rule"] == "not_configured"
+    assert "not configured" in body["refusal"]
+    assert body["sql"] is None
+    assert body["provider"] is None
+    assert body["rows"] == []
+    assert body["columns"] == []
+
+
+def test_no_readonly_dsn_configured_also_degrades_honestly(client) -> None:
+    """A key but no read-only database is equally unconfigured, and says so."""
+    _install(client, "SELECT 1 FROM dim_campaign")
+    body = _ask(client, "anything at all")
+    assert body["rule"] == "not_configured"
+    assert "read-only" in body["refusal"]
+    assert body["rows"] == []
+
+
+def test_a_generated_query_is_run_and_shown(ask_client) -> None:
+    _install(ask_client, "SELECT campaign_id, channel FROM dim_campaign LIMIT 3")
+    body = _ask(ask_client, "list a few campaigns")
+    assert body["refusal"] is None
+    assert body["rule"] is None
+    assert body["provider"] == "stub"
+    assert body["sql"] == "SELECT campaign_id, channel FROM dim_campaign LIMIT 3"
+    assert body["columns"] == ["campaign_id", "channel"]
+    assert 0 < len(body["rows"]) <= 3
+    assert set(body["rows"][0]) == {"campaign_id", "channel"}
+
+
+def test_the_sql_shown_is_the_sql_that_ran(ask_client) -> None:
+    """The cap is appended before execution, so the user sees the real query."""
+    _install(ask_client, "SELECT campaign_id FROM dim_campaign")
+    body = _ask(ask_client, "every campaign")
+    assert body["sql"] == "SELECT campaign_id FROM dim_campaign LIMIT 200"
+    assert len(body["rows"]) <= 200
+
+
+def test_a_hostile_model_answer_is_refused_and_the_table_survives(ask_client) -> None:
+    """The endpoint's worst case: the model returns a stacked DROP."""
+    _install(ask_client, "SELECT 1 FROM dim_campaign; DROP TABLE dim_campaign")
+    body = _ask(ask_client, "drop everything")
+    assert body["rule"] == "single_statement"
+    assert body["sql"] == "SELECT 1 FROM dim_campaign; DROP TABLE dim_campaign"
+    assert body["rows"] == []
+
+    with psycopg.connect(TEST_DSN) as conn:
+        row = conn.execute("SELECT to_regclass('dim_campaign')").fetchone()
+    assert row is not None and row[0] is not None, "the table was dropped"
+
+
+def test_a_query_against_an_excluded_table_is_refused(ask_client) -> None:
+    _install(ask_client, "SELECT * FROM model_artifacts LIMIT 5")
+    body = _ask(ask_client, "show me the pickles")
+    assert body["rule"] == "table_allowlist"
+    assert "model_artifacts" in body["refusal"]
+
+
+def test_a_refused_query_is_still_shown_to_the_reader(ask_client) -> None:
+    """Seeing the rejected SQL is how a reader judges the refusal."""
+    _install(ask_client, "SELECT pg_read_file('/etc/passwd')")
+    body = _ask(ask_client, "read a file")
+    assert body["sql"] == "SELECT pg_read_file('/etc/passwd')"
+    assert body["rule"] == "forbidden_keyword"
+
+
+def test_a_model_failure_is_a_refusal_not_a_five_hundred(ask_client) -> None:
+    class _Broken:
+        name = "stub"
+
+        def generate_sql(self, request: SqlQuestion) -> str:
+            raise RuntimeError("gemini returned 503 (url REDACTED, key REDACTED)")
+
+    ask_client.app.state.sql_generator = SqlGenerator(_Broken())
+    body = _ask(ask_client, "anything")
+    assert body["rule"] == "generation_failed"
+    assert body["sql"] is None
+    assert body["provider"] == "stub"
+
+
+def test_a_refusal_never_leaks_a_dsn_or_a_key(ask_client) -> None:
+    _install(ask_client, "DELETE FROM dim_campaign")
+    response = ask_client.post("/ask", json={"question": "delete it all"})
+    assert response.status_code == 200
+    text = response.text
+    assert "postgresql://" not in text
+    assert "adsignal_ro" not in text
+    assert SECRET not in text
+    assert "Traceback" not in text
+
+
+def test_an_identical_question_is_served_from_the_cache(ask_client) -> None:
+    """The cache saves the model call, which is now the expensive part."""
+    provider = _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+    first = _ask(ask_client, "one campaign please")
+    second = _ask(ask_client, "One Campaign Please")
+    assert first == second
+    assert provider.calls == 1, "the second identical question called the model again"
+
+
+def test_ask_is_still_rate_limited_per_ip(ask_client) -> None:
+    _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+    statuses = [
+        ask_client.post("/ask", json={"question": f"question number {index}"}).status_code
+        for index in range(30)
+    ]
+    assert 429 in statuses, "no request was ever rate-limited"
+    assert statuses[0] == 200
+
+
+def test_a_blank_question_is_rejected_before_any_model_is_called(client) -> None:
+    provider = _install(client, "SELECT 1")
+    assert client.post("/ask", json={"question": "   "}).status_code == 422
+    assert provider.calls == 0
+
+
+def test_an_overlong_question_is_rejected(client) -> None:
+    assert client.post("/ask", json={"question": "x" * 5000}).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "field", ["question", "sql", "columns", "rows", "provider", "refusal", "rule"]
+)
+def test_every_documented_field_is_always_present(ask_client, field: str) -> None:
+    """The dashboard client is hand-written from this shape; it must not vary."""
+    _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+    assert field in _ask(ask_client, f"a question about {field}")

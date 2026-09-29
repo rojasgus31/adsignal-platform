@@ -1,18 +1,9 @@
-import os
-
-import psycopg
 from fastapi.testclient import TestClient
 
 from adsignal.warehouse.paging import (
     DEFAULT_RUN_PAGE_LIMIT,
     DEFAULT_SERVING_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
-)
-
-# Same pattern as every other DSN-driven test module: the env var is an
-# override, not a requirement.
-TEST_DSN = os.environ.get(
-    "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
 )
 
 
@@ -79,15 +70,15 @@ def test_endpoints_return_empty_not_error_with_no_tables_at_all(dropped_tables_c
     assert unknown_anomaly.status_code == 404
 
     # `/ask` is the first thing a visitor hits on a freshly deployed demo, so
-    # it must answer rather than 500 on a database with no tables at all.
-    # This runs last in the test because answering creates the empty tables.
+    # it must answer rather than 500. On this deployment no model key and no
+    # read-only DSN are configured, which it reports as a plain 200 with an
+    # explanation rather than an error or an invented answer.
     ask = dropped_tables_client.post("/ask", json={"question": "how many anomalies?"})
     assert ask.status_code == 200, ask.text
-    assert ask.json()["rows"] == [{"count": 0}]
-
-    ask_spend = dropped_tables_client.post("/ask", json={"question": "spend by channel?"})
-    assert ask_spend.status_code == 200, ask_spend.text
-    assert ask_spend.json()["rows"] == []
+    body = ask.json()
+    assert body["rule"] == "not_configured"
+    assert body["rows"] == []
+    assert body["sql"] is None
 
 
 def test_campaigns_lists_known_campaigns(client) -> None:
@@ -172,46 +163,19 @@ def test_no_endpoint_response_contains_a_secret(client) -> None:
         assert "api_key" not in client.get(path).text.lower()
 
 
-def test_ask_answers_a_known_question(client) -> None:
-    response = client.post("/ask", json={"question": "how many anomalies were there?"})
-    assert response.status_code == 200
-    body = response.json()
-    assert body["template"] in ("anomaly_count", "unknown")
-    assert "answer" in body
-
-
-def test_ask_rejects_a_template_it_does_not_know(client) -> None:
-    """Review Focus 5: only named templates may run. No free-form SQL exists."""
-    response = client.post(
-        "/ask", json={"question": "x", "template": "'; DROP TABLE fct_campaign_daily; --"}
-    )
-    assert response.status_code in (400, 422)
-
-    with psycopg.connect(TEST_DSN) as conn:
-        still_there = conn.execute("SELECT to_regclass('fct_campaign_daily')").fetchone()[0]
-    assert still_there is not None, "the table was dropped"
-
-
 def test_ask_is_rate_limited_per_ip(client) -> None:
-    """One of the two live paths must be bounded; `/search` is the other."""
+    """One of the two live paths must be bounded; `/search` is the other.
+
+    The limiter is checked before anything else, so it bounds the endpoint
+    whether or not a model is configured. Everything else about `/ask` —
+    generation, validation, execution and the refusals — lives in
+    `test_ask_endpoint.py`.
+    """
     statuses = [
-        client.post("/ask", json={"question": "how many anomalies?"}).status_code for _ in range(30)
+        client.post("/ask", json={"question": f"how many anomalies? {index}"}).status_code
+        for index in range(30)
     ]
     assert 429 in statuses, "no request was ever rate-limited"
-
-
-def test_ask_does_not_serve_one_parameter_set_from_anothers_cache(client) -> None:
-    """Two questions differing only in `parameters` are different questions."""
-    one = client.post("/ask", json={"question": "worst cpa", "parameters": {"limit": 1}})
-    five = client.post("/ask", json={"question": "worst cpa", "parameters": {"limit": 5}})
-    assert one.status_code == 200 and five.status_code == 200
-    assert len(five.json()["rows"]) > len(one.json()["rows"]), (
-        "the limit=5 request was served the limit=1 cached answer"
-    )
-
-
-def test_ask_rejects_a_blank_question(client) -> None:
-    assert client.post("/ask", json={"question": "   "}).status_code == 422
 
 
 def test_search_is_rate_limited_per_ip(client) -> None:
@@ -276,6 +240,11 @@ def test_the_collections_default_to_a_bounded_page(client) -> None:
 def test_two_forwarded_callers_do_not_share_a_rate_limit_budget(monkeypatch) -> None:
     """Review Focus 5, end to end. Behind a proxy each visitor needs its own budget."""
     monkeypatch.setenv("ADSIGNAL_TRUSTED_PROXY_HOPS", "1")
+    # This test builds its app from the environment, to exercise the setting
+    # it just set. A `.env` carrying a real `ADSIGNAL_GEMINI_API_KEY` would
+    # otherwise make every `/ask` below a live, billed model call; blanking
+    # it keeps the test about the rate limiter, which is all it asserts.
+    monkeypatch.setenv("ADSIGNAL_GEMINI_API_KEY", "")
     from adsignal.api.app import create_app
 
     with TestClient(create_app()) as proxied:

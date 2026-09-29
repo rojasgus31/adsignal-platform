@@ -29,7 +29,7 @@ def build_chain(settings: Settings) -> NarrativeChain:
     anthropic_key = settings.anthropic_api_key.get_secret_value()
 
     if gemini_key:
-        providers.append(GeminiProvider(gemini_key, timeout=timeout))
+        providers.append(GeminiProvider(gemini_key, model=settings.gemini_model, timeout=timeout))
     if groq_key:
         providers.append(GroqProvider(groq_key, timeout=timeout))
     if jev_key:

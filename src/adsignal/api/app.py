@@ -45,6 +45,7 @@ from adsignal.api.routes.search import (
 )
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
+from adsignal.narrative.sqlgen import build_sql_generator
 from adsignal.warehouse.pool import acquire_pool, release_pool
 
 API_TITLE = "AdSignal Serving API"
@@ -60,12 +61,18 @@ def install_request_runtime(app: FastAPI) -> None:
 
     Separate from `create_app` so the test suite can reset them between tests
     without rebuilding the whole app (and reloading the embedding model). All
-    three live on `app.state`, reached through `deps.py`, so two apps in one
+    of them live on `app.state`, reached through `deps.py`, so two apps in one
     process never share a budget or serve each other's cached answers.
 
     `/ask`, `/search` and `/score` get separate buckets: they cost very
     different amounts per call, so they are tuned independently.
+
+    `/ask`'s SQL generator is rebuilt here too, so each app gets its own
+    circuit breaker and a test gets one whose breaker is closed. It is
+    `None` when no model key is configured, which is a state `/ask` reports
+    rather than an error.
     """
+    app.state.sql_generator = build_sql_generator(app.state.settings)
     app.state.ask_rate_limiter = TokenBucket(
         capacity=ASK_RATE_LIMIT_CAPACITY,
         refill_per_second=ASK_RATE_LIMIT_REFILL_PER_SECOND,

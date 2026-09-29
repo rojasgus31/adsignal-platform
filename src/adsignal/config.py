@@ -38,6 +38,24 @@ def _mask_dsn_password(dsn: str) -> str:
     return urlunsplit(masked)
 
 
+# The Gemini model every provider in this project calls. A hardcoded model
+# name is a dated assertion about someone else's product: this project's
+# previous default, `gemini-2.0-flash`, was retired, after which every call
+# returned HTTP 404 with a perfectly valid key — a failure that reads like a
+# broken endpoint rather than a retired model.
+#
+# To re-derive the current list for a given key:
+#   GET https://generativelanguage.googleapis.com/v1beta/models?key=...
+# and take a non-preview entry whose supportedGenerationMethods include
+# `generateContent`. `gemini-3.5-flash` is the base stable release of the 3.x
+# flash line; the 3.6/3.7/3.8 point releases rotate faster.
+#
+# Declared here, once, and passed to the providers. Neither
+# `GeminiProvider` nor `GeminiSqlProvider` carries a model default of its
+# own, so this constant cannot fall out of step with a second copy.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+
+
 class Settings(BaseSettings):
     """Configuration for the AdSignal data platform."""
 
@@ -55,6 +73,14 @@ class Settings(BaseSettings):
     postgres_dsn: str = Field(
         default="postgresql://adsignal:adsignal@localhost:5432/adsignal", repr=False
     )
+    # The DSN generated `/ask` SQL runs on, and the only one it may ever run
+    # on. It names the `adsignal_ro` login role created by
+    # `warehouse.ask_reads.ensure_readonly_role`: SELECT on seven tables,
+    # ownership of nothing, `model_artifacts` and `entity_embeddings`
+    # revoked. Empty means `/ask` is not configured, which that endpoint
+    # reports as a plain 200 rather than failing. repr=False for the same
+    # reason as `postgres_dsn`: it carries a live credential.
+    postgres_readonly_dsn: str = Field(default="", repr=False)
     # `adsignal.warehouse.pool` reads these once, when it opens the first pool
     # for a DSN. Every API route is a sync `def`, so Starlette runs it in its
     # request threadpool (anyio's default capacity is 40); `pool_max_size=4`
@@ -79,6 +105,12 @@ class Settings(BaseSettings):
     groq_api_key: SecretStr = SecretStr("")
     jev_api_key: SecretStr = SecretStr("")
     anthropic_api_key: SecretStr = SecretStr("")
+    gemini_model: str = DEFAULT_GEMINI_MODEL
+    """Which Gemini model to call, overridable with ADSIGNAL_GEMINI_MODEL.
+
+    A setting rather than a literal so the next retirement is an environment
+    change on a running deployment, not a code edit and a rebuild.
+    """
     narrative_timeout_seconds: float = 20.0
     # The chain's total deadline across every provider, distinct from the
     # per-provider timeout above: four providers each allowed 20 s can stall
@@ -119,11 +151,13 @@ class Settings(BaseSettings):
             raise ValueError("cors_origins must not contain a wildcard; name each origin")
         return value
 
-    @field_serializer("postgres_dsn", when_used="always")
+    @field_serializer("postgres_dsn", "postgres_readonly_dsn", when_used="always")
     def _serialize_postgres_dsn(self, value: str) -> str:
         """Mask the password when this settings object is dumped or dumped to JSON.
 
-        Attribute access (`settings.postgres_dsn`) is untouched and keeps
+        Both DSNs go through this. Attribute access
+        (`settings.postgres_dsn`, `settings.postgres_readonly_dsn`) is
+        untouched and keeps
         returning the real, usable DSN for the dozens of call sites that
         connect with it — only `model_dump()`/`model_dump_json()` go through
         this.

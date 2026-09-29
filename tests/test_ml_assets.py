@@ -46,6 +46,15 @@ def settings(tmp_path_factory: pytest.TempPathFactory) -> Settings:
         duckdb_path=tmp_path / "ml.duckdb",
         postgres_dsn=DSN,
         mlflow_dir=tmp_path / "mlruns",
+        # Every provider key blanked. `Settings` reads `.env`, so without
+        # this the narrative asset calls whichever live model the developer's
+        # machine has a key for - a billed network round trip inside the test
+        # suite, and a `provider` this module's assertions cannot predict.
+        # The chain's terminal stub is what these tests are written against.
+        gemini_api_key="",
+        groq_api_key="",
+        jev_api_key="",
+        anthropic_api_key="",
     )
 
 
@@ -160,6 +169,46 @@ def test_narrative_asset_writes_a_row_with_provider_metadata(pipeline_run) -> No
     assert stored is not None
     assert stored.provider == "stub"
     assert stored.text
+
+
+def test_a_fallback_narrative_records_which_provider_failed(pipeline_run) -> None:
+    """A stub narrative must say what it stood in for, in `pipeline_runs.detail`.
+
+    "provider=stub" alone is what a deployment with no keys looks like and
+    what a deployment whose Gemini model was retired looks like. The run log
+    is where that difference has to be legible, since the dashboard reads it.
+    """
+    from datetime import UTC, datetime
+
+    from dagster import build_asset_context
+
+    from adsignal.narrative.chain import NarrativeChain
+    from adsignal.narrative.providers.stub import StubProvider
+    from adsignal.pipeline import assets as assets_module
+    from adsignal.warehouse.run_log import read_runs
+
+    _, settings = pipeline_run
+    marker = datetime.now(UTC)
+
+    chain = NarrativeChain(
+        [
+            StubProvider(fail_with=RuntimeError("gemini returned 404"), name="gemini"),
+            StubProvider("fallback text", name="stub"),
+        ]
+    )
+    context = build_asset_context(resources={"settings": settings, "narrative_chain": chain})
+    assets_module.daily_narrative(context)
+
+    rows = [
+        run
+        for run in read_runs(settings.postgres_dsn, limit=100, offset=0)
+        if run.asset == "daily_narrative" and run.started_at >= marker
+    ]
+    assert rows, "the narrative run was not recorded"
+    assert rows[0].status == "succeeded"
+    assert "provider=stub" in rows[0].detail
+    assert "gemini (RuntimeError)" in rows[0].detail
+    assert "404" not in rows[0].detail, "a provider message reached the run log"
 
 
 def test_narrative_asset_does_not_fail_the_pipeline_when_every_provider_fails(

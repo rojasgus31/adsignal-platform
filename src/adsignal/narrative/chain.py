@@ -16,6 +16,10 @@ value per phase: connect/read/write/pool, so four providers each allowed
 deadline. A provider that answers only after the budget has run out is
 recorded as a *failure*, so its breaker opens and later runs skip it.
 
+Every provider that failed or was skipped is reported on the result that
+finally succeeded (`NarrativeResult.skipped`), so a fallback answer carries
+the evidence of what it fell back *from*.
+
 The **terminal provider is exempt from the budget**. The last entry in the
 chain is the local stub: instant, free, and the reason a deployment with no
 keys still renders a dashboard instead of an error. Skipping it to save time
@@ -25,6 +29,7 @@ and its lateness is never held against it.
 
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 from adsignal.narrative.breaker import CircuitBreaker
 from adsignal.narrative.types import NarrativeProvider, NarrativeRequest, NarrativeResult
@@ -77,7 +82,11 @@ class NarrativeChain:
             provider_deadline = None if index == last_index else deadline
             result, reason = self._attempt(provider, request, provider_deadline)
             if result is not None:
-                return result
+                # The providers that did not answer travel with the one that
+                # did. A chain whose only visible output is the winner cannot
+                # tell a caller that its paid backend has been failing all
+                # week. See `NarrativeResult.skipped`.
+                return replace(result, skipped=tuple(attempted))
             attempted.append(reason)
 
         raise AllProvidersFailed(f"every provider failed: {', '.join(attempted)}")
