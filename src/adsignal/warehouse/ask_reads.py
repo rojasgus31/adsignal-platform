@@ -53,6 +53,35 @@ READONLY_ROLE = "adsignal_ro"
 # cannot hold a pooled connection while a dashboard waits on it.
 STATEMENT_TIMEOUT = "5s"
 
+# Server settings the validator's correctness silently depends on, pinned for
+# the duration of every query so that the SQL Postgres reads means what
+# `sql_guard` decided it means.
+#
+# `standard_conforming_strings` is the one that matters. With it `off`,
+# Postgres reads a backslash in an ordinary string literal as an escape, so
+# `SELECT '\' AS a, ', 1 AS z FROM model_artifacts --' AS c FROM
+# dim_campaign` - approved as reading `dim_campaign` - reads
+# `model_artifacts` instead. sqlglot's Postgres dialect always assumes `on`,
+# so the round-trip check structurally *cannot* see this divergence: both
+# parses agree with each other and disagree with the server. The default is
+# `on`, but `postgresql.conf` or `ALTER ROLE adsignal_ro SET ...` can change
+# it invisibly, and a control whose premise is unverified is the same defect
+# as a control nobody verifies.
+#
+# `backslash_quote = off` refuses `\'` as an escaped quote inside `E''`
+# strings outright. That is the exact construction behind the escape-string
+# regression, and nothing a question about campaign performance needs.
+#
+# `search_path = public` makes the table allowlist mean what it says: the
+# validator refuses schema-qualified names, so every name it approves is
+# resolved by the search path, and leaving that to the role's configuration
+# would let `dim_campaign` mean a table in some other schema.
+_PINNED_SETTINGS = (
+    ("standard_conforming_strings", "on"),
+    ("backslash_quote", "off"),
+    ("search_path", "public"),
+)
+
 # Revoked rather than merely left ungranted. A future `GRANT SELECT ON ALL
 # TABLES IN SCHEMA public` run by someone else would otherwise hand the role
 # pickled estimator bytes and raw embedding vectors.
@@ -282,9 +311,10 @@ def run_readonly_query(
     passed here, and `api.routes.ask` reads it from its own setting rather
     than deriving it. Inside the transaction, `SET LOCAL
     transaction_read_only = on` blocks writes even for a role that somehow
-    holds them, and `SET LOCAL statement_timeout` bounds the runtime. Both
-    are `LOCAL`, so they end with the transaction and cannot leak onto the
-    next caller of a pooled connection.
+    holds them, `SET LOCAL statement_timeout` bounds the runtime, and
+    `_PINNED_SETTINGS` fixes the parsing settings the validator assumed when
+    it approved the query. All are `LOCAL`, so they end with the transaction
+    and cannot leak onto the next caller of a pooled connection.
 
     This function does **not** validate `query`. Every caller in the
     application validates first; the tests deliberately do not, because a
@@ -306,6 +336,12 @@ def run_readonly_query(
             conn.execute(
                 sql.SQL("SET LOCAL statement_timeout = {}").format(sql.Literal(statement_timeout))
             )
+            for name, value in _PINNED_SETTINGS:
+                conn.execute(
+                    sql.SQL("SET LOCAL {name} = {value}").format(
+                        name=sql.Identifier(name), value=sql.Literal(value)
+                    )
+                )
             # `prepare=True` is what forces psycopg onto the **extended**
             # query protocol. Without it, a parameterless statement goes out
             # over the simple protocol, where Postgres itself accepts

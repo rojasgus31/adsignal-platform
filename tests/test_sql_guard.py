@@ -421,3 +421,87 @@ def test_validation_is_idempotent() -> None:
     ):
         once = validate_sql(query)
         assert validate_sql(once) == once
+
+
+# Fix round 3. Two ways the SQL Postgres executes could still differ in
+# meaning from the SQL that was approved.
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "query_to_xml('SELECT * FROM model_artifacts', true, true, '')",
+        "query_to_xmlschema('SELECT * FROM model_artifacts', true, true, '')",
+        "table_to_xml('model_artifacts', true, true, '')",
+        "schema_to_xml('public', true, true, '')",
+        "database_to_xml(true, true, '')",
+    ],
+)
+def test_a_function_that_takes_sql_as_a_string_is_refused(call: str) -> None:
+    """Second-order SQL: the validator sees one table, Postgres runs another query.
+
+    `query_to_xml` returns a single value containing an entire table, so it
+    defeats the row cap and the bounded fetch as well as the allowlist —
+    the reviewer's payload came back as one 8 MB value.
+    """
+    refusal = _rejection(f"SELECT {call} FROM dim_campaign")
+    assert refusal.rule == "forbidden_function"
+
+
+def test_an_unrecognised_function_is_refused_even_when_harmless() -> None:
+    """The control is an allow-list, so a benign unknown is refused too.
+
+    That is the point: a deny-list has to name `query_to_xml` before it can
+    refuse it, and nobody had. This refuses everything sqlglot does not
+    recognise as a standard function, so the next `*_to_xml`, the next
+    extension and the next catalog helper are all refused without anyone
+    having thought of them.
+    """
+    refusal = _rejection("SELECT age(now(), now()) FROM dim_campaign")
+    assert refusal.rule == "forbidden_function"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT SUM(spend), COUNT(*), AVG(cpa), MIN(spend), MAX(spend) FROM fct_campaign_daily",
+        "SELECT ROUND(AVG(cpa), 2), COALESCE(cpa, 0) FROM fct_campaign_daily",
+        "SELECT DATE_TRUNC('month', event_date) FROM fct_campaign_daily",
+        "SELECT EXTRACT(year FROM event_date) FROM fct_campaign_daily",
+        "SELECT ROW_NUMBER() OVER (ORDER BY spend DESC) FROM fct_campaign_daily",
+        "SELECT LOWER(channel), UPPER(channel), LENGTH(channel) FROM dim_campaign",
+        "SELECT to_char(event_date, 'YYYY-MM') FROM fct_campaign_daily",
+        "SELECT greatest(spend, revenue), abs(spend) FROM fct_campaign_daily",
+        "SELECT stddev(spend), corr(spend, revenue) FROM fct_campaign_daily",
+    ],
+)
+def test_the_functions_a_real_answer_needs_still_work(query: str) -> None:
+    """The allow-list has to leave the endpoint able to answer questions."""
+    assert validate_sql(query)
+
+
+def test_a_percent_row_bound_is_refused() -> None:
+    """`FETCH FIRST 50 PERCENT ROWS ONLY` is not a bound of 50 rows.
+
+    It was read as 50 and rendered with PERCENT intact, so Postgres rejected
+    it and it surfaced as `invalid_query` — fail-closed by accident. A bound
+    the validator cannot interpret as a row count is refused as one.
+    """
+    refusal = _rejection("SELECT campaign_id FROM dim_campaign FETCH FIRST 50 PERCENT ROWS ONLY")
+    assert refusal.rule == "row_limit"
+
+
+def test_a_backslash_literal_that_depends_on_a_server_setting_is_refused() -> None:
+    """The round-trip check cannot see this one, so the executor pins the GUC.
+
+    With `standard_conforming_strings = off` Postgres reads the `\\` as an
+    escape and the literal's boundary moves, exactly as it did for the
+    `E''` regression — but sqlglot's Postgres dialect always assumes `on`,
+    so re-parsing the rendered string can never reveal the difference.
+    `warehouse.ask_reads` pins the setting for every execution; this test
+    records that the validator alone does not decide this one.
+    """
+    approved = validate_sql(
+        "SELECT '\\' AS a, ', 1 AS z FROM model_artifacts --' AS c FROM dim_campaign"
+    )
+    assert "model_artifacts" in approved, "the literal is data under the pinned setting"

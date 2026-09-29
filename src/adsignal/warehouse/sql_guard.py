@@ -109,6 +109,13 @@ _BOUND_NODES = tuple(
     node for name in ("Limit", "Fetch") if (node := getattr(exp, name, None)) is not None
 )
 
+# Function names sqlglot does not recognise, which are nonetheless allowed.
+# Empty on purpose. Every entry here is a promise that the named function
+# cannot take SQL as an argument, cannot read outside the allowlisted tables
+# and cannot return an unbounded value; that is a promise worth making
+# deliberately and one at a time, not in advance.
+_ALLOWED_UNKNOWN_FUNCTIONS: frozenset[str] = frozenset()
+
 _FORBIDDEN_NAMES = frozenset({"information_schema", "dblink", "dblink_connect", "dblink_exec"})
 _FORBIDDEN_PREFIX = "pg_"
 
@@ -139,13 +146,18 @@ class SqlRejected(ValueError):
 class _Shape:
     """What a query does, reduced to the things the round-trip must preserve.
 
-    The real tables it reads (CTE names resolved away), whether it carries a
-    comment, and the row bound it will actually be subject to. Two parses of
-    what should be the same query must agree on all three.
+    The real tables it reads (CTE names resolved away) and the row bound it
+    will actually be subject to. Two parses of what should be the same query
+    must agree on both.
+
+    Comment absence is deliberately *not* a field here. It was, and the field
+    was a lie: `_reject_comments` raises, so it could only ever hold `False`,
+    and the round-trip clause comparing it was dead code asserting a live
+    guarantee. What actually protects the rendered form is that `_analyse`
+    runs `_reject_comments` on it too, and raises.
     """
 
     tables: frozenset[str]
-    has_comment: bool
     row_bound: int | None
 
 
@@ -177,13 +189,14 @@ def _analyse(text: str) -> tuple[exp.Query, _Shape]:
     cheaper summary of the first.
     """
     statement = _single_statement(text)
-    has_comment = _reject_comments(statement)
+    _reject_comments(statement)
     query = _require_read_root(statement)
     _reject_forbidden_nodes(query)
     _reject_forbidden_names(query)
+    _require_known_functions(query)
     tables = _require_allowlisted_tables(query)
     bound = _row_bound(query)
-    return query, _Shape(tables=tables, has_comment=has_comment, row_bound=bound)
+    return query, _Shape(tables=tables, row_bound=bound)
 
 
 def _require_round_trip(rendered: str, original: _Shape) -> None:
@@ -195,6 +208,10 @@ def _require_round_trip(rendered: str, original: _Shape) -> None:
     or rendering it again produces different text (so there is no stable
     string to reason about at all). The refusal deliberately does not explain
     which, because the query that produced it is not one to iterate against.
+
+    Every other rule is enforced on the rendered form too, by `_analyse`
+    itself raising — comment absence among them, which is why there is no
+    comment field on `_Shape` to compare.
     """
     try:
         rendered_query, rendered_shape = _analyse(rendered)
@@ -207,7 +224,6 @@ def _require_round_trip(rendered: str, original: _Shape) -> None:
     bound = rendered_shape.row_bound
     if (
         rendered_shape.tables != original.tables
-        or rendered_shape.has_comment
         or bound is None
         or bound > MAX_ROWS
         or rendered_query.sql(dialect=DIALECT) != rendered
@@ -250,7 +266,7 @@ def _single_statement(text: str) -> exp.Expression:
     return statements[0]
 
 
-def _reject_comments(statement: exp.Expression) -> bool:
+def _reject_comments(statement: exp.Expression) -> None:
     """Refuse SQL comments, in either syntax, anywhere in the tree.
 
     Read off the parsed nodes rather than by scanning for `--` and `/*`, so a
@@ -261,7 +277,6 @@ def _reject_comments(statement: exp.Expression) -> bool:
     for node in statement.walk():
         if node.comments:
             raise SqlRejected("SQL comments are not allowed", "no_comments")
-    return False
 
 
 def _require_read_root(statement: exp.Expression) -> exp.Query:
@@ -304,6 +319,44 @@ def _reject_forbidden_names(statement: exp.Query) -> None:
                 f"{name} is not allowed; only the documented tables may be read",
                 "forbidden_keyword",
             )
+
+
+def _require_known_functions(statement: exp.Query) -> None:
+    """Refuse every function sqlglot does not recognise as a standard one.
+
+    **This is an allow-list, and the shape matters more than the list.** The
+    rule used to be a deny-list — `pg_*`, `information_schema`, `dblink` —
+    and review walked straight past it with `query_to_xml('SELECT * FROM
+    model_artifacts', …)`, which matches none of those patterns, takes SQL
+    as a *string argument*, and returns an entire table as one value. The
+    validator saw `FROM dim_campaign`, appended `LIMIT 200`, and Postgres
+    executed a second query the validator never read. The reviewer's payload
+    came back as a single 8 MB value, so the row cap and the bounded fetch
+    were defeated along with the allowlist.
+
+    A deny-list has to name a function before it can refuse it, and the set
+    of things to name is not knowable: `table_to_xml`, `schema_to_xml`,
+    `database_to_xml` and `query_to_xmlschema` are the same hazard in four
+    more spellings, and the next extension installed on the server adds more.
+
+    sqlglot parses a function it models into a typed node (`exp.Sum`,
+    `exp.DateTrunc`, `exp.Rank`) and everything else into `exp.Anonymous`.
+    Refusing `Anonymous` therefore says: *if this is not a standard function
+    the parser recognises, it does not run.* The permitted set is bounded by
+    sqlglot's own function registry rather than by what anyone here thought
+    of, and every future `*_to_xml`, catalog helper and extension function is
+    refused without being named.
+
+    The cost is honest and small: a legitimate Postgres-specific function
+    that sqlglot does not model — `age(...)` is one — is refused, and the
+    question has to be rephrased. Refusing a working query is a worse answer;
+    running one nobody validated is a worse outcome.
+    """
+    for call in statement.find_all(exp.Anonymous):
+        name = call.name
+        if isinstance(name, str) and name.lower() in _ALLOWED_UNKNOWN_FUNCTIONS:
+            continue
+        raise SqlRejected(f"{name}() is not a function this endpoint runs", "forbidden_function")
 
 
 def _name_of(node: object) -> str | None:
@@ -417,6 +470,17 @@ def _bound_value(node: exp.Expression) -> int:
     under the same `limit` key as a `Limit`, so reading only the expression
     made every `FETCH FIRST n ROWS ONLY` look like a non-numeric bound.
     """
+    if isinstance(node, exp.Fetch):
+        options = node.args.get("limit_options")
+        if options is not None and options.args.get("percent"):
+            # `FETCH FIRST 50 PERCENT ROWS ONLY` is not a bound of 50 rows.
+            # It used to be read as 50 and rendered with PERCENT intact, so
+            # Postgres rejected the result and it surfaced as a parse
+            # failure - fail-closed by accident rather than by rule.
+            raise SqlRejected(
+                f"a row limit must be a plain number of rows, no greater than {MAX_ROWS}",
+                "row_limit",
+            )
     value = node.args.get("count") if isinstance(node, exp.Fetch) else node.expression
     if isinstance(value, str):
         # Some sqlglot versions keep the count as a plain string.

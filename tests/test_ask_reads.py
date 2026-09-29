@@ -30,6 +30,7 @@ from adsignal.warehouse.ask_reads import (
 )
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
+from adsignal.warehouse.sql_guard import validate_sql
 
 # The same database `conftest.py` creates under this name; every DSN-driven
 # test module in this suite reads its own DSN from the environment this way.
@@ -350,3 +351,61 @@ def test_the_verification_memo_does_not_retain_the_dsn(readonly_dsn: str) -> Non
     assert readonly_dsn not in remembered
     assert "postgresql://" not in remembered
     assert remembered, "nothing was memoized, so the check was not exercised"
+
+
+# Fix round 3. The validator's correctness depends on settings it never
+# checked, so the executor pins them.
+
+
+def test_the_parsing_settings_are_pinned_for_every_query(readonly_dsn: str) -> None:
+    """The three GUCs `sql_guard` silently assumes are true when the query runs."""
+    result = run_readonly_query(
+        readonly_dsn,
+        "SELECT current_setting('standard_conforming_strings') AS scs, "
+        "current_setting('backslash_quote') AS bq, "
+        "current_setting('search_path') AS sp",
+    )
+    assert result.rows == [{"scs": "on", "bq": "off", "sp": "public"}]
+
+
+def test_the_pinned_settings_override_a_role_configured_otherwise(readonly_dsn: str) -> None:
+    """`ALTER ROLE adsignal_ro SET standard_conforming_strings = off` must not bite.
+
+    This is the scenario the pin exists for: the setting is changed somewhere
+    nobody looks, and the validator keeps approving queries on a premise that
+    is no longer true. sqlglot always assumes `on`, so the round-trip check
+    cannot detect it — only pinning can.
+    """
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        conn.execute(
+            f"ALTER ROLE {READONLY_ROLE} SET standard_conforming_strings = off"  # noqa: S608
+        )
+        conn.commit()
+    try:
+        result = run_readonly_query(
+            readonly_dsn,
+            "SELECT current_setting('standard_conforming_strings') AS scs",
+        )
+        assert result.rows == [{"scs": "on"}], "a role setting defeated the pin"
+    finally:
+        with psycopg.connect(ASK_TEST_DSN) as conn:
+            conn.execute(
+                f"ALTER ROLE {READONLY_ROLE} RESET standard_conforming_strings"  # noqa: S608
+            )
+            conn.commit()
+
+
+def test_a_backslash_literal_means_the_same_thing_to_postgres(readonly_dsn: str) -> None:
+    """End to end: the literal the validator read as data stays data.
+
+    The approved query names `model_artifacts` *inside a string literal*.
+    Under the pinned setting Postgres agrees it is a literal, so the query
+    reads `dim_campaign` and returns rows; under `standard_conforming_strings
+    = off` it would read `model_artifacts` and be refused by the role.
+    """
+    approved = validate_sql(
+        "SELECT '\\' AS a, ', 1 AS z FROM model_artifacts --' AS c FROM dim_campaign"
+    )
+    result = run_readonly_query(readonly_dsn, approved)
+    assert result.columns == ("a", "c")
+    assert result.rows[0]["a"] == "\\"

@@ -304,8 +304,10 @@ each sufficient on its own, none of which depends on the model behaving:**
    validator entirely, and asserts the database refuses it.
 2. **A read-only transaction with a 5 s statement timeout, sent on the
    extended query protocol** — `SET LOCAL transaction_read_only = on`, so a
-   runaway query dies on its own, and `prepare=True` so Postgres refuses a
-   stacked statement at the wire level instead of relying on our rule.
+   runaway query dies on its own, `prepare=True` so Postgres refuses a
+   stacked statement at the wire level instead of relying on our rule, and
+   `standard_conforming_strings`/`backslash_quote`/`search_path` pinned so
+   the server parses the approved query the way the validator read it.
 3. **A pure validator** (`adsignal/warehouse/sql_guard.py`) — one statement,
    opening with `SELECT` or `WITH`, no comments, no writing or
    administrative keyword, no `pg_*` identifier, no table outside the
@@ -320,6 +322,10 @@ each sufficient on its own, none of which depends on the model behaving:**
    past the renderer too, with an escape string that sqlglot and Postgres
    disagreed about the end of. Table references are resolved per scope, so a
    `WITH` inside a sub-select cannot launder a name for the outer query.
+   Functions are an **allow-list**: if sqlglot does not recognise it as a
+   standard function it does not run, because a deny-list has to name
+   `query_to_xml('SELECT * FROM model_artifacts', …)` before it can refuse
+   it, and nobody had.
 
 The prompt asks for the same shape, but the prompt is a quality measure. An
 LLM told to emit only SELECT is not a security control; a read-only role is.

@@ -145,8 +145,8 @@ Three independent controls replace it, and each is sufficient on its own.**
    executor. `tests/test_ask_reads.py` opens a connection with this role and
    issues `DROP TABLE dim_campaign` in an ordinary read-write transaction —
    no validator, no read-only transaction — and asserts Postgres refuses it.
-2. **A read-only transaction with a 5 s statement timeout, on the extended
-   query protocol.** Every execution sets `SET LOCAL transaction_read_only =
+2. **A read-only transaction with a 5 s statement timeout, pinned parsing
+   settings, and the extended query protocol.** Every execution sets `SET LOCAL transaction_read_only =
    on` and `SET LOCAL statement_timeout = '5s'`, so a write slips past
    nothing and a runaway cross join dies on its own. The query is sent with
    `prepare=True`, which forces psycopg onto the extended protocol: a
@@ -156,6 +156,28 @@ Three independent controls replace it, and each is sufficient on its own.**
    stacking is impossible at the wire level rather than only by rule — and
    Postgres parses the statement with its own grammar, which is the grammar
    that ultimately matters.
+
+   Three settings are pinned for the duration of every query, because the
+   validator's correctness silently depends on them.
+   `standard_conforming_strings = on` is the one that matters: with it off,
+   Postgres reads a backslash in an ordinary literal as an escape, so
+   `SELECT '\' AS a, ', 1 AS z FROM model_artifacts --' AS c FROM
+   dim_campaign` — approved as reading `dim_campaign` — reads
+   `model_artifacts` instead. sqlglot's Postgres dialect always assumes `on`,
+   so the round-trip check *structurally cannot* see this: both parses agree
+   with each other and disagree with the server. The default is `on`, but
+   `postgresql.conf` or `ALTER ROLE adsignal_ro SET …` can change it where
+   nobody is looking. `backslash_quote = off` refuses `\'` inside `E''`
+   strings, the exact construction behind the escape-string regression.
+   `search_path = public` makes the table allowlist mean what it says, since
+   the validator refuses qualified names and would otherwise leave name
+   resolution to the role's own configuration.
+
+   Settings deliberately **not** pinned: `DateStyle`, `IntervalStyle`,
+   `TimeZone`, `bytea_output` and the `lc_*` family change how a value is
+   *rendered*, not what the SQL *means*, and psycopg returns typed Python
+   objects that `_jsonable` converts itself, so none of them can move the
+   boundary between what was approved and what runs.
 3. **A pure validator** (`warehouse/sql_guard.py`, no I/O). One statement
    only, opening with `SELECT` or `WITH`; no comments; no writing,
    administrative or catalog construct; no table outside the allowlist; a
@@ -197,7 +219,28 @@ Three independent controls replace it, and each is sufficient on its own.**
 
    **Both spellings of the row bound count.** `FETCH FIRST n ROWS ONLY` is
    LIMIT in standard clothing; knowing only `Limit` turned a rule that had
-   been failing closed into one that failed open.
+   been failing closed into one that failed open. A bound that is not a plain
+   number of rows — `FETCH FIRST 50 PERCENT ROWS ONLY` — is refused as a
+   `row_limit` rather than left to fail as a parse error at the server.
+
+   **Functions are an allow-list, and that shape is the lesson.** The rule
+   was a deny-list — `pg_*`, `information_schema`, `dblink` — and review
+   walked past it with `query_to_xml('SELECT * FROM model_artifacts', …)`,
+   which matches none of those patterns, takes SQL as a *string argument*,
+   and returns a whole table as a single value. The approved table set said
+   `dim_campaign`; Postgres executed a second query nobody had read, and the
+   result was one 8 MB value, so the row cap and the bounded fetch fell along
+   with the allowlist. `table_to_xml`, `schema_to_xml`, `database_to_xml` and
+   `query_to_xmlschema` are the same hazard in four more spellings, and the
+   next extension installed adds more — a deny-list must name a thing before
+   it can refuse it, and that set is not knowable.
+
+   sqlglot parses a function it models into a typed node and everything else
+   into `Anonymous`, so the rule is now: **if the parser does not recognise
+   it as a standard function, it does not run.** The permitted set is bounded
+   by sqlglot's own registry rather than by anyone's imagination. The cost is
+   that a legitimate Postgres-specific function sqlglot does not model
+   (`age(...)`) is refused and the question has to be rephrased.
 
 **Control 1 is verified, not assumed.** `verify_readonly_dsn` runs before the
 first query on a DSN and refuses to serve `/ask` unless the connection is
@@ -248,7 +291,11 @@ fabricated answer.
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.
 
-**What these controls do not cover.** Two residual exposures, both accepted:
+**What these controls do not cover.** Three residual exposures, all accepted:
+the class of defect behind the pinned settings is open-ended — a future
+Postgres or sqlglot version could introduce another setting the parser
+assumes, and nothing here detects that automatically, only the three known
+ones are pinned. And two of longer standing:
 `psycopg_pool` logs a failing connection's host, port and database user (never
 the password), so an operator's log can name the read-only role and the host
 it reached; and `ensure_readonly_role` must send the role's password to
