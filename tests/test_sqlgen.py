@@ -19,6 +19,7 @@ from adsignal.narrative.sqlgen import (
     build_sql_prompt,
     extract_sql,
 )
+from adsignal.narrative.types import ProviderUnavailable
 
 SECRET = "sk-super-secret-key-do-not-leak"
 MODEL = DEFAULT_GEMINI_MODEL
@@ -222,3 +223,82 @@ def test_the_shipped_model_default_is_current() -> None:
     """The retired name must not come back by copy-paste."""
     assert DEFAULT_GEMINI_MODEL != "gemini-2.0-flash"
     assert Settings().gemini_model == DEFAULT_GEMINI_MODEL
+
+
+# --- what a refusal is allowed to say about why ----------------------------
+#
+# The defect: `SqlGenerator` reported the exception's *type name*, so a
+# transient 503, a rate limit, an expired key and a retired model all reached
+# the user as "gemini could not answer (RuntimeError)". `generate_text`
+# composes those messages with the URL and the key already replaced by the
+# word REDACTED, and `ProviderUnavailable` is how it says so.
+
+
+def test_a_redacted_provider_message_reaches_the_user_whole() -> None:
+    error = ProviderUnavailable("gemini returned 503 (url REDACTED, key REDACTED)")
+    generator = SqlGenerator(_StubProvider(error=error))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    assert str(failed.value) == "gemini returned 503 (url REDACTED, key REDACTED)"
+
+
+def test_the_status_code_is_what_distinguishes_one_outage_from_another() -> None:
+    """503 and 401 are different problems and must not read identically."""
+    transient = SqlGenerator(_StubProvider(error=ProviderUnavailable("gemini returned 503 (x)")))
+    expired = SqlGenerator(_StubProvider(error=ProviderUnavailable("gemini returned 401 (x)")))
+    with pytest.raises(SqlGenerationFailed) as first:
+        transient.generate(QUESTION)
+    with pytest.raises(SqlGenerationFailed) as second:
+        expired.generate(QUESTION)
+    assert str(first.value) != str(second.value)
+
+
+def test_an_ordinary_exceptions_text_is_never_passed_through() -> None:
+    """The constraint the fix must not break: only messages proven redacted.
+
+    A `psycopg` error, a driver message or a stray `RuntimeError` can carry a
+    DSN. None of them is a `ProviderUnavailable`, so none of them contributes
+    anything but a type name.
+    """
+    dsn = f"postgresql://adsignal:{SECRET}@db.internal:5432/adsignal"
+    generator = SqlGenerator(_StubProvider(error=RuntimeError(f"connection to {dsn} failed")))
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    message = _chain(failed.value)
+    assert SECRET not in message
+    assert "postgresql://" not in message
+    assert "db.internal" not in message
+    assert str(failed.value) == "stub could not answer (RuntimeError)"
+
+
+def test_a_real_gemini_outage_names_its_status_and_still_hides_the_key() -> None:
+    """End to end through the transport: the 503 survives, the URL and key do not."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": {"message": "backend overloaded"}})
+
+    generator = SqlGenerator(
+        GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    )
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    assert "503" in str(failed.value)
+    message = _chain(failed.value)
+    assert SECRET not in message
+    assert "key=" not in message
+    assert "generativelanguage" not in message
+    assert "https://" not in message
+
+
+def test_a_provider_error_the_model_layer_did_not_write_is_still_typed_only() -> None:
+    """A malformed Gemini body raises `ValueError`, which is not passed through."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"nothing": "useful"})
+
+    generator = SqlGenerator(
+        GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
+    )
+    with pytest.raises(SqlGenerationFailed) as failed:
+        generator.generate(QUESTION)
+    assert str(failed.value) == "gemini could not answer (ValueError)"

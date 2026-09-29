@@ -354,7 +354,7 @@ fabricated answer.
 **The endpoint answers 200, 429 or 422, and nothing else.** A rate-limit
 refusal and a malformed body are the two status codes; every other outcome —
 a model failure, a refused query, a database error, and anything nobody
-anticipated — is a 200 carrying the same seven fields. That last clause needed
+anticipated — is a 200 carrying the same eight fields. That last clause needed
 a catch-all around the answer path to be true rather than aspirational, and
 the failure that proved it was an ordinary one: SQL truncated at a token
 limit raises `sqlglot.TokenError`, a *sibling* of `ParseError` rather than a

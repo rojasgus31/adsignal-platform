@@ -23,7 +23,7 @@ or a response, and each is raised with `from None` so the original exception
 import httpx
 
 from adsignal.narrative.prompt import build_prompt
-from adsignal.narrative.types import NarrativeRequest
+from adsignal.narrative.types import NarrativeRequest, ProviderUnavailable
 
 _ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -37,11 +37,18 @@ def generate_text(
 ) -> str:
     """POST `prompt` to Gemini and return the text, with the key redacted on failure.
 
-    Every exception raised here is a fresh `RuntimeError` raised outside the
-    `except` block that recorded it, so neither `__cause__` nor `__context__`
-    links back to the httpx exception. httpx puts the request URL in its own
-    exception text and the key travels in that URL as a query parameter, so
-    an exception chain that reaches it is an exception chain that leaks it.
+    Every exception raised here is a fresh `ProviderUnavailable` raised
+    outside the `except` block that recorded it, so neither `__cause__` nor
+    `__context__` links back to the httpx exception. httpx puts the request
+    URL in its own exception text and the key travels in that URL as a query
+    parameter, so an exception chain that reaches it is an exception chain
+    that leaks it.
+
+    The type, rather than a bare `RuntimeError`, is what lets a caller show
+    the message: the four strings below name a status code or a transport
+    failure and nothing else, and `narrative.types.ProviderUnavailable` says
+    so. Before it, `SqlGenerator` could only report `RuntimeError`, so a
+    transient 503 and an expired key reached the user identically.
     """
     url = _ENDPOINT.format(model=model)
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -75,9 +82,9 @@ def generate_text(
             http.close()
 
     if failure is not None:
-        raise RuntimeError(failure)
+        raise ProviderUnavailable(failure)
     if response is None:  # pragma: no cover - unreachable while failure is None
-        raise RuntimeError("gemini returned no response (url REDACTED, key REDACTED)")
+        raise ProviderUnavailable("gemini returned no response (url REDACTED, key REDACTED)")
 
     return _extract_text(response.json())
 

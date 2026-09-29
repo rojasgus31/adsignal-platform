@@ -7,18 +7,26 @@ model misbehaves, which is the only interesting case.
 """
 
 import os
+import re
 from typing import Any
 
 import psycopg
 import pytest
 
 from adsignal.narrative.sqlgen import SqlGenerator, SqlQuestion
+from adsignal.narrative.types import ProviderUnavailable
 
 # Same pattern as every other DSN-driven test module: the env var is an
 # override, not a requirement.
 TEST_DSN = os.environ.get(
     "ADSIGNAL_TEST_DSN", "postgresql://adsignal:adsignal@localhost:5432/adsignal_test"
 )
+
+# The role `conftest.ask_client` really configures this app with, which is
+# the name a refusal must not echo. Declared the same way, and with the same
+# override, as in `tests/conftest.py`; `tests/test_role_isolation.py` asserts
+# every declaration agrees and that none of them is the deployment's role.
+TEST_READONLY_ROLE = os.environ.get("ADSIGNAL_TEST_READONLY_ROLE", "adsignal_ro_test")
 
 SECRET = "sk-super-secret-key-do-not-leak"
 
@@ -30,9 +38,13 @@ class _FixedProvider:
         self.name = "stub"
         self.sql = sql
         self.calls = 0
+        self.seen: SqlQuestion | None = None
 
     def generate_sql(self, request: SqlQuestion) -> str:
         self.calls += 1
+        # Kept so a test can assert on what the model was actually told;
+        # see `test_the_prompt_is_grounded_in_the_warehouses_own_dates`.
+        self.seen = request
         return self.sql
 
 
@@ -143,7 +155,7 @@ def test_a_refusal_never_leaks_a_dsn_or_a_key(ask_client) -> None:
     assert response.status_code == 200
     text = response.text
     assert "postgresql://" not in text
-    assert "adsignal_ro" not in text
+    assert TEST_READONLY_ROLE not in text
     assert SECRET not in text
 
     # The key this app is really configured with (`conftest.ask_client` gives
@@ -187,7 +199,7 @@ def test_an_overlong_question_is_rejected(client) -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["question", "sql", "columns", "rows", "provider", "refusal", "rule"]
+    "field", ["question", "sql", "columns", "rows", "provider", "refusal", "rule", "notice"]
 )
 def test_every_documented_field_is_always_present(ask_client, field: str) -> None:
     """The dashboard client is hand-written from this shape; it must not vary."""
@@ -226,7 +238,7 @@ def test_an_unrestricted_readonly_dsn_refuses_rather_than_running(ask_client) ->
 def test_truncated_sql_from_the_model_is_a_refusal_not_a_500(ask_client) -> None:
     """The likeliest real failure: the model hit its token limit mid-literal.
 
-    This returned a 500 before fix round 5, breaking both the seven-field
+    This returned a 500 before fix round 5, breaking both the fixed-field
     contract and the "never a 500" guarantee.
     """
     _install(ask_client, "SELECT * FROM dim_campaign WHERE channel = 'sea")
@@ -292,10 +304,97 @@ def test_a_deeply_nested_query_is_a_refusal_not_a_500(ask_client) -> None:
         "SELECT " + "(" * 400 + "1" + ")" * 400,
     ],
 )
-def test_every_malformed_answer_keeps_the_seven_field_contract(ask_client, sql: str) -> None:
+def test_every_malformed_answer_keeps_the_field_contract(ask_client, sql: str) -> None:
     _install(ask_client, sql)
     response = ask_client.post("/ask", json={"question": f"q {len(sql)}"})
     assert response.status_code == 200, response.text
     body = response.json()
-    assert set(body) == {"question", "sql", "columns", "rows", "provider", "refusal", "rule"}
+    assert set(body) == {
+        "question",
+        "sql",
+        "columns",
+        "rows",
+        "provider",
+        "refusal",
+        "rule",
+        "notice",
+    }
     assert body["refusal"] is not None
+
+
+# --- the period the data covers --------------------------------------------
+#
+# The owner clicked the tab's own suggestion, "which channel spent the most
+# last month?". Gemini wrote a correct `CURRENT_DATE`-relative query; the
+# warehouse ends in the past, so it matched nothing.
+
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def test_the_prompt_is_grounded_in_the_warehouses_own_dates(ask_client) -> None:
+    """What the model sees must name the period the data covers."""
+    provider = _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+    _ask(ask_client, "anything at all")
+
+    assert provider.seen is not None
+    described = provider.seen.schema_description
+    assert "fct_campaign_daily" in described
+    assert len(_ISO_DATE_RE.findall(described)) >= 2, "no date range reached the model"
+    assert "CURRENT_DATE" in described, "the model is not told to avoid CURRENT_DATE"
+
+
+def test_a_date_filter_outside_the_corpus_is_explained_not_just_empty(ask_client) -> None:
+    """The defect's user-visible half: zero rows for a date nobody has data for."""
+    _install(
+        ask_client,
+        "SELECT channel FROM fct_campaign_daily WHERE event_date >= DATE '2099-01-01' LIMIT 5",
+    )
+    body = _ask(ask_client, "which channel spent the most last month?")
+    assert body["rows"] == []
+    assert body["refusal"] is None, "an empty answer is not a refusal"
+    assert body["rule"] is None
+    assert body["notice"] is not None
+    assert "fct_campaign_daily" in body["notice"]
+    assert len(_ISO_DATE_RE.findall(body["notice"])) == 2
+
+
+def test_an_empty_answer_without_a_date_filter_carries_no_notice(ask_client) -> None:
+    _install(
+        ask_client,
+        "SELECT campaign_id FROM dim_campaign WHERE campaign_id = 'no_such_campaign' LIMIT 5",
+    )
+    body = _ask(ask_client, "tell me about a campaign that does not exist")
+    assert body["rows"] == []
+    assert body["notice"] is None
+
+
+def test_an_answer_with_rows_carries_no_notice(ask_client) -> None:
+    _install(ask_client, "SELECT event_date FROM fct_campaign_daily LIMIT 3")
+    body = _ask(ask_client, "some days")
+    assert body["rows"], "the fixture seeded no rows to answer with"
+    assert body["notice"] is None
+
+
+def test_every_response_carries_the_notice_field(ask_client) -> None:
+    """The contract is one shape: `notice` is present on a refusal too."""
+    _install(ask_client, "DROP TABLE dim_campaign")
+    body = _ask(ask_client, "drop it")
+    assert "notice" in body
+    assert body["notice"] is None
+
+
+def test_a_provider_outage_reports_its_status_rather_than_its_type(ask_client) -> None:
+    """The second defect, end to end: `RuntimeError` told the owner nothing."""
+
+    class _Unavailable:
+        name = "stub"
+
+        def generate_sql(self, request: SqlQuestion) -> str:
+            raise ProviderUnavailable("gemini returned 503 (url REDACTED, key REDACTED)")
+
+    ask_client.app.state.sql_generator = SqlGenerator(_Unavailable())
+    body = _ask(ask_client, "anything")
+    assert body["rule"] == "generation_failed", "the rule taxonomy must not change"
+    assert "503" in body["refusal"]
+    assert "REDACTED" in body["refusal"]
+    assert SECRET not in body["refusal"]

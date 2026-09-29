@@ -14,7 +14,11 @@ Three things live here, in the order they matter:
    the connection really is restricted — not a superuser, unable to write to
    an allowlisted table, unable to read an excluded one. Without it, an admin
    DSN pasted into the read-only setting would delete control 1 in silence.
-4. `QueryRefused` is how any database failure reaches the caller: a short
+4. `load_date_coverage` reads the first and last `event_date` the warehouse
+   actually holds, so the prompt can tell the model which period the data
+   covers. Derived from the table rather than from `config`, cached per DSN,
+   and `None` whenever there is nothing to report.
+5. `QueryRefused` is how any database failure reaches the caller: a short
    reason and a rule name, never a DSN, a password or driver text.
 
 Nothing here validates SQL — `warehouse.sql_guard` does that, and
@@ -35,7 +39,7 @@ import psycopg
 from psycopg import sql
 
 from adsignal.warehouse.artifact_store import ensure_artifact_schema
-from adsignal.warehouse.ask_schema import ALLOWED_TABLES
+from adsignal.warehouse.ask_schema import ALLOWED_TABLES, DateCoverage
 from adsignal.warehouse.loader import ensure_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 from adsignal.warehouse.narrative_store import ensure_narrative_schema
@@ -386,6 +390,91 @@ def forget_verified_dsns() -> None:
     """
     with _VERIFY_LOCK:
         _VERIFIED_DSNS.clear()
+
+
+# The whole of `/ask`'s date grounding, as one aggregate. A literal, and not
+# composed from `ask_schema`'s constants at runtime, for the reason every
+# other statement in this module is a literal: the string that reaches
+# Postgres is the string a reader can see. The names are asserted against
+# those constants in `tests/test_ask_reads.py` instead, so the two cannot
+# drift apart without a test going red.
+_COVERAGE_SQL = "SELECT MIN(event_date), MAX(event_date) FROM fct_campaign_daily"
+
+# Coverage already read, keyed by DSN digest exactly as `_VERIFIED_DSNS` is
+# and for the same reason: a DSN carries the role's password, and this map
+# lives for the life of the process.
+#
+# **Only a non-empty range is remembered.** An empty warehouse is a state a
+# deployment grows out of - the first pipeline run fills it - and a cached
+# "no rows" would outlive that load until the next restart. Re-reading it is
+# an aggregate over an empty table, which costs nothing.
+_COVERAGE_BY_DSN: dict[str, DateCoverage] = {}
+_COVERAGE_LOCK = threading.Lock()
+
+
+def load_date_coverage(readonly_dsn: str) -> DateCoverage | None:
+    """The first and last `event_date` in `fct_campaign_daily`, or `None`.
+
+    `None` means there is nothing to report: an empty table, a table that
+    does not exist yet, or a database that refused the read. All three are
+    states `/ask` must still answer in, so none of them raises - the prompt
+    gets the empty-warehouse paragraph and the endpoint runs as before.
+
+    Read once per DSN per process (see `_COVERAGE_BY_DSN`), so grounding the
+    model costs no round trip per question.
+
+    This is not model-written SQL: `_COVERAGE_SQL` is a literal aggregate
+    over an allowlisted table, so it goes to the database without the
+    validator and without `verify_readonly_dsn`. The generated query that
+    follows it in `api.routes.ask` still gets both.
+    """
+    key = _dsn_fingerprint(readonly_dsn)
+    with _COVERAGE_LOCK:
+        cached = _COVERAGE_BY_DSN.get(key)
+    if cached is not None:
+        return cached
+
+    coverage = _read_date_coverage(readonly_dsn)
+    if coverage is None:
+        return None
+    with _COVERAGE_LOCK:
+        _COVERAGE_BY_DSN[key] = coverage
+    return coverage
+
+
+def _read_date_coverage(readonly_dsn: str) -> DateCoverage | None:
+    """Run the aggregate, returning `None` for every way it can fail to answer.
+
+    The `psycopg.Error` is swallowed rather than converted to a
+    `QueryRefused`: a warehouse whose range cannot be read is a warehouse the
+    model is told nothing about, not a question the endpoint refuses. The
+    error's text is not carried anywhere, so nothing it holds - the failing
+    statement, the connection's parameters - can reach a caller.
+    """
+    try:
+        with connection(readonly_dsn) as conn, conn.transaction():
+            conn.execute("SET LOCAL transaction_read_only = on")
+            row = conn.execute(_COVERAGE_SQL, prepare=True).fetchone()
+    except psycopg.Error:
+        return None
+    if row is None:
+        return None
+    first, last = row
+    # `MIN`/`MAX` over an empty table are NULL, which is the empty-warehouse
+    # case and the reason this returns an optional at all.
+    if not isinstance(first, date) or not isinstance(last, date):
+        return None
+    return DateCoverage(first_date=first, last_date=last)
+
+
+def forget_date_coverage() -> None:
+    """Forget every remembered date range. Test-only.
+
+    A test that changes what `fct_campaign_daily` holds needs the next call
+    to re-read rather than trust a range taken before the change.
+    """
+    with _COVERAGE_LOCK:
+        _COVERAGE_BY_DSN.clear()
 
 
 def run_readonly_query(

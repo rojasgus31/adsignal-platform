@@ -8,7 +8,7 @@ deployment created the role's DSN, passed the privilege probe, and then hit
 `rule: "database_permission"` on every query.
 
 The missing assertion is this one: start from a database in that exact state
-— tables present, `adsignal_ro` present as a login role, no grants — run
+— tables present, the read-only role present as a login, no grants — run
 only what `README.md`'s deployment section tells a deployer to run, and ask
 a question. The suite is not allowed to do the granting on the deployment's
 behalf anywhere in this module.
@@ -27,7 +27,6 @@ from adsignal.cli.bootstrap_readonly_role import main
 from adsignal.config import Settings, get_settings
 from adsignal.narrative.sqlgen import SqlGenerator, SqlQuestion
 from adsignal.warehouse.ask_reads import (
-    READONLY_ROLE,
     forget_verified_dsns,
     readonly_dsn_for,
 )
@@ -37,6 +36,12 @@ BOOTSTRAP_DSN = os.environ.get(
     "ADSIGNAL_BOOTSTRAP_TEST_DSN",
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_bootstrap",
 )
+
+# The suite's own read-only role, never the deployment's. This module strips
+# every privilege off it with `DROP OWNED BY`; doing that to a running
+# deployment's role revokes the grants `/ask` needs. See `tests/conftest.py`
+# for the full reason, and `tests/test_role_isolation.py` for the guard.
+TEST_READONLY_ROLE = os.environ.get("ADSIGNAL_TEST_READONLY_ROLE", "adsignal_ro_test")
 
 # The role's password in this module. Not a credential: it reaches only a
 # local test database, and it is written down here so that the "no secret is
@@ -74,7 +79,7 @@ def _reset_to_pre_bootstrap_state() -> None:
 
     Three things are true afterwards, and they are what `f65d139` produced on
     Render: the serving tables exist (the nightly load creates them), one row
-    is loadable (the nightly load writes them), and `adsignal_ro` exists as a
+    is loadable (the nightly load writes them), and the read-only role exists as a
     login role holding no grant on anything (`ADSIGNAL_POSTGRES_READONLY_DSN`
     was set by hand, and nothing ever ran `ensure_readonly_role`).
 
@@ -89,20 +94,20 @@ def _reset_to_pre_bootstrap_state() -> None:
             ("cmp_test_0001", "Spring Brand Lift", "adv_0001", "Northwind", "search"),
         )
         exists = conn.execute(
-            "SELECT 1 FROM pg_roles WHERE rolname = %s", (READONLY_ROLE,)
+            "SELECT 1 FROM pg_roles WHERE rolname = %s", (TEST_READONLY_ROLE,)
         ).fetchone()
         verb = "CREATE ROLE"
         if exists is not None:
             # Strips every grant the role holds in this database and leaves
             # the login, which is the state this module needs.
-            conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(READONLY_ROLE)))
+            conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(TEST_READONLY_ROLE)))
             verb = "ALTER ROLE"
         # A password cannot be a bound parameter in role DDL, so it is
         # composed as a literal — the same thing `ensure_readonly_role` does.
         conn.execute(
             sql.SQL("{verb} {role} WITH LOGIN PASSWORD {password}").format(
                 verb=sql.SQL(verb),
-                role=sql.Identifier(READONLY_ROLE),
+                role=sql.Identifier(TEST_READONLY_ROLE),
                 password=sql.Literal(RO_PASSWORD),
             )
         )
@@ -129,7 +134,7 @@ def deployment_environment(monkeypatch: pytest.MonkeyPatch) -> str:
     and on the way out; otherwise this module's DSNs would leak into every
     later test that reads settings from the environment.
     """
-    readonly_dsn = readonly_dsn_for(BOOTSTRAP_DSN, RO_PASSWORD)
+    readonly_dsn = readonly_dsn_for(BOOTSTRAP_DSN, RO_PASSWORD, TEST_READONLY_ROLE)
     monkeypatch.setenv("ADSIGNAL_POSTGRES_DSN", BOOTSTRAP_DSN)
     monkeypatch.setenv("ADSIGNAL_POSTGRES_READONLY_DSN", readonly_dsn)
     get_settings.cache_clear()

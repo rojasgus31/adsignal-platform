@@ -18,18 +18,20 @@ import psycopg
 import pytest
 
 from adsignal.warehouse.artifact_store import ensure_artifact_schema
+from adsignal.warehouse.ask_reads import _COVERAGE_SQL as COVERAGE_SQL
 from adsignal.warehouse.ask_reads import (
     MAX_RESULT_BYTES,
-    READONLY_ROLE,
     STATEMENT_TIMEOUT,
     QueryRefused,
     ensure_readonly_role,
+    forget_date_coverage,
     forget_verified_dsns,
+    load_date_coverage,
     readonly_dsn_for,
     run_readonly_query,
     verify_readonly_dsn,
 )
-from adsignal.warehouse.ask_schema import ALLOWED_TABLES
+from adsignal.warehouse.ask_schema import ALLOWED_TABLES, COVERAGE_TABLE, DATE_COLUMN
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 from adsignal.warehouse.sql_guard import validate_sql
@@ -40,6 +42,11 @@ ASK_TEST_DSN = os.environ.get(
     "ADSIGNAL_ASK_TEST_DSN",
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_ask",
 )
+
+# The suite's own read-only role, never the deployment's. See the same
+# constant in `tests/conftest.py` for why a shared role is a live hazard;
+# `tests/test_role_isolation.py` asserts every declaration agrees.
+TEST_READONLY_ROLE = os.environ.get("ADSIGNAL_TEST_READONLY_ROLE", "adsignal_ro_test")
 
 pytestmark = pytest.mark.usefixtures("readonly_dsn")
 
@@ -84,7 +91,7 @@ class _RedactedPassword(str):
 
 @pytest.fixture(scope="module")
 def readonly_password() -> str:
-    """The password this module's `adsignal_ro` is given.
+    """The password this module's test read-only role is given.
 
     Generated per run rather than written down anywhere: the role is a local
     test artefact, and a literal in the repository would be a credential in
@@ -97,7 +104,7 @@ def readonly_password() -> str:
 
 @pytest.fixture(scope="module")
 def readonly_dsn(readonly_password: str) -> _RedactedDsn:
-    """Create `adsignal_ro` against `ASK_TEST_DSN` and return its DSN."""
+    """Create `TEST_READONLY_ROLE` against `ASK_TEST_DSN` and return its DSN."""
     if not _postgres_available(ASK_TEST_DSN):
         pytest.skip("Postgres not reachable")
 
@@ -105,8 +112,8 @@ def readonly_dsn(readonly_password: str) -> _RedactedDsn:
     ensure_ml_schema(ASK_TEST_DSN)
     ensure_artifact_schema(ASK_TEST_DSN)
 
-    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
-    return _RedactedDsn(readonly_dsn_for(ASK_TEST_DSN, readonly_password))
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password, TEST_READONLY_ROLE)
+    return _RedactedDsn(readonly_dsn_for(ASK_TEST_DSN, readonly_password, TEST_READONLY_ROLE))
 
 
 def _password_of(dsn: str) -> str:
@@ -134,7 +141,7 @@ def _table_exists(table: str) -> bool:
 def test_the_role_itself_refuses_a_drop(readonly_dsn: str) -> None:
     """Control 1, on its own: no validator, no read-only transaction, just the role.
 
-    This connects with `adsignal_ro` directly and issues `DROP TABLE` in an
+    This connects with the read-only role directly and issues `DROP TABLE` in an
     ordinary read-write transaction. The role holds SELECT on seven tables
     and owns nothing, so Postgres refuses it. This is the test that says the
     guarantee lives in the database rather than in a string scanner.
@@ -273,7 +280,7 @@ def test_a_refusal_carries_no_dsn_no_password_and_no_driver_text(readonly_dsn: s
 def test_ensure_readonly_role_is_idempotent(readonly_password: str) -> None:
     """Running it twice, as every deploy does, must succeed and leave it usable.
 
-    Deliberately the module's own password, not a fresh one: `adsignal_ro` is
+    Deliberately the module's own password, not a fresh one: the role is
     cluster-wide, so rotating it here would invalidate the DSN every other
     test in this module holds — which is exactly what happened, and was only
     visible once a later test opened a direct connection instead of reusing
@@ -281,10 +288,10 @@ def test_ensure_readonly_role_is_idempotent(readonly_password: str) -> None:
     """
     if not _postgres_available(ASK_TEST_DSN):
         pytest.skip("Postgres not reachable")
-    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
-    ensure_readonly_role(ASK_TEST_DSN, readonly_password)
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password, TEST_READONLY_ROLE)
+    ensure_readonly_role(ASK_TEST_DSN, readonly_password, TEST_READONLY_ROLE)
     result = run_readonly_query(
-        readonly_dsn_for(ASK_TEST_DSN, readonly_password),
+        readonly_dsn_for(ASK_TEST_DSN, readonly_password, TEST_READONLY_ROLE),
         "SELECT 1 AS one FROM dim_campaign LIMIT 1",
     )
     assert result.columns == ("one",)
@@ -305,7 +312,7 @@ def test_the_role_has_select_on_exactly_the_allowlisted_tables(readonly_dsn: str
             for row in conn.execute(
                 "SELECT table_name FROM information_schema.role_table_grants "
                 "WHERE grantee = %s AND privilege_type = 'SELECT'",
-                (READONLY_ROLE,),
+                (TEST_READONLY_ROLE,),
             ).fetchall()
         }
     # Exactly the allowlist, not a superset: a grant the allowlist does not
@@ -435,14 +442,14 @@ def test_a_date_literal_means_the_same_day_whatever_the_server_prefers(
     whatever the role, the database or `postgresql.conf` prefers.
     """
     with psycopg.connect(ASK_TEST_DSN) as conn:
-        conn.execute(f"ALTER ROLE {READONLY_ROLE} SET DateStyle = 'ISO, DMY'")  # noqa: S608
+        conn.execute(f"ALTER ROLE {TEST_READONLY_ROLE} SET DateStyle = 'ISO, DMY'")  # noqa: S608
         conn.commit()
     try:
         result = run_readonly_query(readonly_dsn, "SELECT '01/02/2024'::date AS d")
         assert result.rows == [{"d": "2024-01-02"}], "a role setting moved the answer"
     finally:
         with psycopg.connect(ASK_TEST_DSN) as conn:
-            conn.execute(f"ALTER ROLE {READONLY_ROLE} RESET DateStyle")  # noqa: S608
+            conn.execute(f"ALTER ROLE {TEST_READONLY_ROLE} RESET DateStyle")  # noqa: S608
             conn.commit()
 
 
@@ -469,7 +476,7 @@ def test_an_ordinary_answer_is_not_refused_for_size(readonly_dsn: str) -> None:
 
 
 def test_the_pinned_settings_override_a_role_configured_otherwise(readonly_dsn: str) -> None:
-    """`ALTER ROLE adsignal_ro SET standard_conforming_strings = off` must not bite.
+    """`ALTER ROLE <ro> SET standard_conforming_strings = off` must not bite.
 
     This is the scenario the pin exists for: the setting is changed somewhere
     nobody looks, and the validator keeps approving queries on a premise that
@@ -478,7 +485,7 @@ def test_the_pinned_settings_override_a_role_configured_otherwise(readonly_dsn: 
     """
     with psycopg.connect(ASK_TEST_DSN) as conn:
         conn.execute(
-            f"ALTER ROLE {READONLY_ROLE} SET standard_conforming_strings = off"  # noqa: S608
+            f"ALTER ROLE {TEST_READONLY_ROLE} SET standard_conforming_strings = off"  # noqa: S608
         )
         conn.commit()
     try:
@@ -490,7 +497,7 @@ def test_the_pinned_settings_override_a_role_configured_otherwise(readonly_dsn: 
     finally:
         with psycopg.connect(ASK_TEST_DSN) as conn:
             conn.execute(
-                f"ALTER ROLE {READONLY_ROLE} RESET standard_conforming_strings"  # noqa: S608
+                f"ALTER ROLE {TEST_READONLY_ROLE} RESET standard_conforming_strings"  # noqa: S608
             )
             conn.commit()
 
@@ -630,3 +637,101 @@ def test_a_bare_column_date_bin_origin_is_refused_by_the_database(readonly_dsn: 
     with pytest.raises(QueryRefused) as refused:
         run_readonly_query(readonly_dsn, approved)
     assert refused.value.rule in ("invalid_query", "database_error", "undefined")
+
+
+# --- the date range the model is grounded on -------------------------------
+#
+# These own `fct_campaign_daily` in this database: each one empties it first
+# and puts back exactly the rows it is asserting about. Every other test in
+# this module that touches the table inserts its own row before reading it
+# (`ON CONFLICT DO NOTHING`), so leaving it empty afterwards breaks nothing.
+
+_COVERAGE_CAMPAIGN = "cmp_coverage_test"
+
+
+def _replace_fact_rows(*days: date) -> None:
+    """Make `fct_campaign_daily` hold exactly one row per named day."""
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        conn.execute("DELETE FROM fct_campaign_daily")
+        for day in days:
+            conn.execute(
+                "INSERT INTO fct_campaign_daily (event_date, campaign_id, advertiser_id, "
+                "channel, impressions, clicks, conversions, spend, revenue, is_anomaly) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (day, _COVERAGE_CAMPAIGN, "adv_ro", "search", 1, 1, 1, 1.0, 1.0, False),
+            )
+        conn.commit()
+    forget_date_coverage()
+
+
+def test_the_coverage_statement_names_the_table_and_column_the_prompt_does() -> None:
+    """The literal SQL and `ask_schema`'s constants must describe the same column.
+
+    `_COVERAGE_SQL` is a literal so a reader can see what reaches Postgres;
+    this is what stops that literal drifting from the names the prompt uses.
+    """
+    assert COVERAGE_TABLE in COVERAGE_SQL
+    assert COVERAGE_SQL.count(DATE_COLUMN) == 2, "MIN and MAX must both read the date column"
+
+
+def test_the_coverage_is_the_first_and_last_day_in_the_table(readonly_dsn: str) -> None:
+    _replace_fact_rows(date(2024, 3, 4), date(2024, 7, 9), date(2025, 11, 30))
+    coverage = load_date_coverage(readonly_dsn)
+    assert coverage is not None
+    assert coverage.first_date == date(2024, 3, 4)
+    assert coverage.last_date == date(2025, 11, 30)
+
+
+def test_an_empty_table_reports_no_coverage_rather_than_raising(readonly_dsn: str) -> None:
+    """The empty-warehouse case: `/ask` must still answer, so this must not raise."""
+    _replace_fact_rows()
+    assert load_date_coverage(readonly_dsn) is None
+
+
+def test_an_empty_table_is_re_read_rather_than_remembered(readonly_dsn: str) -> None:
+    """A deployment grows out of "no rows"; a cached `None` would outlive the load."""
+    _replace_fact_rows()
+    assert load_date_coverage(readonly_dsn) is None
+
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        conn.execute(
+            "INSERT INTO fct_campaign_daily (event_date, campaign_id, advertiser_id, "
+            "channel, impressions, clicks, conversions, spend, revenue, is_anomaly) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (date(2025, 2, 2), _COVERAGE_CAMPAIGN, "adv_ro", "search", 1, 1, 1, 1.0, 1.0, False),
+        )
+        conn.commit()
+
+    coverage = load_date_coverage(readonly_dsn)
+    assert coverage is not None, "an empty answer was cached and outlived the load"
+    assert coverage.last_date == date(2025, 2, 2)
+
+
+def test_a_known_range_is_read_once_per_process(readonly_dsn: str) -> None:
+    """Grounding the prompt must not cost a round trip per question."""
+    _replace_fact_rows(date(2024, 3, 4))
+    first = load_date_coverage(readonly_dsn)
+    assert first is not None and first.last_date == date(2024, 3, 4)
+
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        conn.execute(
+            "INSERT INTO fct_campaign_daily (event_date, campaign_id, advertiser_id, "
+            "channel, impressions, clicks, conversions, spend, revenue, is_anomaly) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (date(2025, 9, 9), _COVERAGE_CAMPAIGN, "adv_ro", "search", 1, 1, 1, 1.0, 1.0, False),
+        )
+        conn.commit()
+
+    cached = load_date_coverage(readonly_dsn)
+    assert cached is not None and cached.last_date == date(2024, 3, 4), "it queried again"
+
+    forget_date_coverage()
+    reread = load_date_coverage(readonly_dsn)
+    assert reread is not None and reread.last_date == date(2025, 9, 9)
+
+
+def test_a_database_that_cannot_answer_reports_no_coverage(readonly_dsn: str) -> None:
+    """A refused or unreachable read is "nothing to say", not a broken endpoint."""
+    forget_date_coverage()
+    unreachable = "postgresql://nobody@127.0.0.1:1/definitely_not_there?connect_timeout=1"
+    assert load_date_coverage(unreachable) is None

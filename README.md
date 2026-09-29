@@ -104,6 +104,35 @@ starts cleanly and then refuses every question with
 `rule: "database_permission"` — the role exists and connects, but holds no
 grant on anything.
 
+**Check the model actually answers, after any deploy that changes its
+name.** A model name is a claim about someone else's service, and this
+project has shipped two wrong ones: `gemini-2.0-flash` was retired and
+answered 404, and `gemini-3.5-flash` — read straight out of a live
+`ListModels` response — answered **503 on every call** while three of its
+siblings answered fine. Both passed the whole test suite, because every test
+that touched a model name used a mocked transport. The default is now
+`gemini-3.6-flash`, verified by a live sweep.
+
+```bash
+ADSIGNAL_GEMINI_API_KEY=<key> python -m adsignal.cli.check_model
+```
+
+One real request with the configured key. Exit 0 and `model … answered`, or
+exit 1 and the provider's own redacted reason (`gemini returned 503 (url
+REDACTED, key REDACTED)`), which is what tells a 503 apart from an expired
+key. It makes a billed call, which is exactly why it is a command a person
+runs and not something the API or the suite does. Exit 2 means no key is
+configured, so nothing was checked.
+
+**Running the tests does not disturb a configured deployment.** A Postgres
+role is cluster-wide, unlike the suite's databases, and `ensure_readonly_role`
+resets the password every time it runs — so the suite used to invalidate
+whatever `ADSIGNAL_POSTGRES_READONLY_DSN` a developer had configured, leaving
+`/ask` answering `rule: "readonly_dsn_unverified"` until the bootstrap was run
+again. The suite now creates its own role, `adsignal_ro_test`
+(`ADSIGNAL_TEST_READONLY_ROLE` overrides it), and `tests/test_role_isolation.py`
+fails if any test reaches for the deployment's.
+
 Set `ADSIGNAL_TRUSTED_PROXY_HOPS=1` behind Render's edge (it terminates TLS
 and appends the peer it saw to `X-Forwarded-For`). Leave it at `0` anywhere
 the API is reached directly — too high lets a caller forge an address and
@@ -377,6 +406,35 @@ the result that finally answered, and `daily_narrative` writes that into
 `pipeline_runs.detail` (`provider=stub; skipped=gemini (RuntimeError)`).
 Without it, "stub answered" looks identical whether no key was configured or
 the paid provider has been 404ing every night.
+
+**The model is told what period the data covers.** `fct_campaign_daily`
+holds 2024-01-01 to 2025-12-31, and the prompt used to name tables and
+columns only — so "which channel spent the most last month?", the tab's own
+suggestion, produced a correct `CURRENT_DATE`-relative query and zero rows.
+The range now goes into the prompt, read from `MIN`/`MAX` of the table itself
+rather than from `ADSIGNAL_START_DATE`/`ADSIGNAL_END_DATE` (config says what
+was *requested*; the table says what *exists*), cached per DSN so it costs no
+round trip per question. The prompt says the corpus is historical and that
+relative expressions must be anchored to the latest date present. An empty
+warehouse gets a paragraph saying so, and still answers.
+
+The same range explains an empty answer after the fact. When a query returns
+no rows **and** its SQL mentions `event_date`, the response carries
+`notice: "fct_campaign_daily covers 2024-01-01 to 2025-12-31; an event_date
+filter outside that range matches nothing."` It is an eighth field, always
+present and `null` on every other response; it is **not** a refusal, and a
+client that renders refusals as errors must not render it as one.
+
+**A provider failure says what the provider said.** A Gemini outage used to
+reach the user as `gemini could not answer (RuntimeError)` — indistinguishable
+from a rate limit, an expired key or a retired model. `generate_text` builds
+its failure strings with the URL and the key already replaced by the word
+REDACTED, and now raises them as `ProviderUnavailable`, which is the marker
+that says the message is safe to show. `SqlGenerator` passes that message
+through whole (`gemini returned 503 (url REDACTED, key REDACTED)`) and
+contributes only a type name for anything else, because no other exception's
+text has been proven free of a key or a DSN. The `rule` is still
+`generation_failed`.
 
 **Not configured is a first-class state.** With `ADSIGNAL_GEMINI_API_KEY`
 unset (the default here), `/ask` answers 200 with

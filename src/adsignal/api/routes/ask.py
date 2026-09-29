@@ -28,10 +28,17 @@ breach. `tests/test_ask_reads.py` proves the point by handing the executor a
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.
 
+The prompt also carries the period the warehouse covers, read off
+`fct_campaign_daily` by `warehouse.ask_reads.load_date_coverage`. Without it
+the model anchored "last month" to `CURRENT_DATE` and filtered a corpus that
+ends in the past down to nothing — a correct query and an empty answer to an
+ordinary question. The same range explains an empty answer after the fact,
+through `AskResponse.notice`.
+
 **This endpoint answers 200 or it answers 429 or 422, and nothing else.** A
 rate-limit refusal and a malformed body are the two status codes; everything
 past that point — a model failure, a refused query, a database error, and
-anything nobody anticipated — is a 200 carrying the same seven fields. The
+anything nobody anticipated — is a 200 carrying the same eight fields. The
 catch-all around `_answer` is what makes that last clause true rather than
 aspirational, and it exists because the failure that broke it was a perfectly
 ordinary one: SQL truncated at a token limit.
@@ -59,8 +66,8 @@ from adsignal.api.deps import (
 from adsignal.api.ratelimit import TokenBucket
 from adsignal.config import Settings
 from adsignal.narrative.sqlgen import SqlGenerationFailed, SqlGenerator, SqlQuestion
-from adsignal.warehouse.ask_reads import QueryRefused, run_readonly_query
-from adsignal.warehouse.ask_schema import SCHEMA_DESCRIPTION
+from adsignal.warehouse.ask_reads import QueryRefused, load_date_coverage, run_readonly_query
+from adsignal.warehouse.ask_schema import describe_schema, empty_result_notice
 from adsignal.warehouse.sql_guard import SqlRejected, validate_sql
 
 router = APIRouter(tags=["ask"])
@@ -82,7 +89,7 @@ ASK_CACHE_CAPACITY = 512
 NOT_CONFIGURED_RULE = "not_configured"
 
 # The refusal reported when something raised that this module did not expect.
-# The endpoint's contract is that it always answers 200 with the same seven
+# The endpoint's contract is that it always answers 200 with the same eight
 # fields, and a contract that holds only for the failures someone anticipated
 # is not a contract. A truncated query — what a model emits when it hits its
 # token limit — reached `sqlglot.TokenError`, which is a sibling of
@@ -118,7 +125,8 @@ class AskResponse(BaseModel):
     table when it is not, and never has to branch on a status code. `sql` is
     populated whenever a query was generated — including when it was then
     refused, because seeing the rejected query is how a reader judges the
-    refusal.
+    refusal. `notice` is the one field that is neither an answer nor a
+    refusal; see its own docstring.
     """
 
     question: str
@@ -128,6 +136,23 @@ class AskResponse(BaseModel):
     provider: str | None
     refusal: str | None
     rule: str | None
+    notice: str | None = None
+    """Context for an answer that is correct but unhelpful on its own.
+
+    Present today for exactly one case: a query that filtered on
+    `event_date` and matched nothing, where the reason is very often that the
+    filter fell outside what the warehouse holds. `rows: []` is true and
+    tells a reader nothing; this says what the data actually covers.
+
+    It belongs here rather than in the dashboard because the API is the side
+    that knows: it has just read the range off the warehouse to ground the
+    prompt, and a client would otherwise need a second endpoint and a second
+    round trip to say the same sentence. It is deliberately **not** a
+    `refusal` - nothing was refused, and a client that renders refusals as
+    errors must not render this as one.
+
+    Defaulted to `None` so every refusal path constructs unchanged.
+    """
 
 
 def _not_configured(question: str, reason: str) -> AskResponse:
@@ -169,9 +194,15 @@ def _answer(question: str, generator: SqlGenerator, readonly_dsn: str) -> AskRes
     database — `validate_sql` returns what may run, so the query a reader
     sees and the query that ran cannot differ.
     """
+    # Read before the model is called, because it is what the model is told:
+    # without it Gemini writes correct `CURRENT_DATE`-relative SQL over a
+    # corpus that ended in the past. Cached per DSN inside `load_date_coverage`,
+    # so this is not a round trip per question.
+    coverage = load_date_coverage(readonly_dsn)
+
     try:
         generated = generator.generate(
-            SqlQuestion(question=question, schema_description=SCHEMA_DESCRIPTION)
+            SqlQuestion(question=question, schema_description=describe_schema(coverage))
         )
     except SqlGenerationFailed as failure:
         return _refused(question, None, generator.name, str(failure), "generation_failed")
@@ -196,6 +227,7 @@ def _answer(question: str, generator: SqlGenerator, readonly_dsn: str) -> AskRes
         provider=generated.provider,
         refusal=None,
         rule=None,
+        notice=None if result.rows else empty_result_notice(safe_sql, coverage),
     )
 
 

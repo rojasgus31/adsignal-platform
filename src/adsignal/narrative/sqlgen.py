@@ -23,6 +23,7 @@ from typing import Protocol, runtime_checkable
 
 from adsignal.config import Settings
 from adsignal.narrative.breaker import CircuitBreaker
+from adsignal.narrative.types import ProviderUnavailable
 
 # The model is asked for the same shape the validator accepts. This is a
 # quality measure, not a control: every rule named here is independently
@@ -79,10 +80,10 @@ class SqlProvider(Protocol):
 class SqlGenerationFailed(RuntimeError):
     """The configured provider could not produce a query.
 
-    Carries a short reason only. The provider layer has already redacted the
-    key out of whatever it raised; this type exists so `api.routes.ask` can
-    tell "the model failed" from "the query was refused" without inspecting
-    exception text.
+    Carries a short reason only, composed by `_failure_reason`: either the
+    provider's own redacted message or, for anything else, an exception type
+    name. This type exists so `api.routes.ask` can tell "the model failed"
+    from "the query was refused" without inspecting exception text.
     """
 
 
@@ -113,18 +114,52 @@ class SqlGenerator:
         return self._provider.name
 
     def generate(self, request: SqlQuestion) -> GeneratedSql:
-        """Return candidate SQL, or raise `SqlGenerationFailed`."""
+        """Return candidate SQL, or raise `SqlGenerationFailed`.
+
+        The failure is composed inside the `except` block and raised *below*
+        it, the same discipline `providers.gemini.generate_text` follows and
+        for the same reason: `raise ... from None` clears `__cause__` but
+        leaves `__context__` pointing at the provider's own exception, and a
+        structured logger or an error reporter walks that chain. The
+        provider's exception can be an httpx error carrying the key in a URL
+        or a driver error carrying a DSN, so the only chain safe to hand on
+        is no chain at all. Raising with nothing being handled is what makes
+        `__context__` genuinely `None`.
+        """
         if self._breaker.is_open():
             raise SqlGenerationFailed(f"{self._provider.name} is unavailable")
+
+        failure: str | None = None
+        sql = ""
         try:
             sql = self._provider.generate_sql(request)
         except Exception as error:  # noqa: BLE001 - any provider failure is one failure
             self._breaker.record_failure()
-            raise SqlGenerationFailed(
-                f"{self._provider.name} could not answer ({type(error).__name__})"
-            ) from None
+            failure = _failure_reason(self._provider.name, error)
+
+        if failure is not None:
+            raise SqlGenerationFailed(failure)
         self._breaker.record_success()
         return GeneratedSql(sql=sql, provider=self._provider.name)
+
+
+def _failure_reason(provider_name: str, error: Exception) -> str:
+    """What a user is told when a provider did not produce a query.
+
+    A `ProviderUnavailable` is passed through whole. Its message was composed
+    by the provider with the URL and the key already replaced by the word
+    REDACTED (see `narrative.types.ProviderUnavailable`), so it can name the
+    status code — and a transient 503, a rate limit, an expired key and a
+    retired model are four different problems that used to reach the user as
+    the single word "RuntimeError".
+
+    Anything else contributes its type name and nothing more. No other
+    exception in this process has had its text proven free of a key, a DSN or
+    a URL, and an httpx error carries the request URL with the key inside it.
+    """
+    if isinstance(error, ProviderUnavailable):
+        return str(error)
+    return f"{provider_name} could not answer ({type(error).__name__})"
 
 
 def build_sql_generator(settings: Settings) -> SqlGenerator | None:

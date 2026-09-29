@@ -44,16 +44,31 @@ def _mask_dsn_password(dsn: str) -> str:
 # returned HTTP 404 with a perfectly valid key — a failure that reads like a
 # broken endpoint rather than a retired model.
 #
-# To re-derive the current list for a given key:
-#   GET https://generativelanguage.googleapis.com/v1beta/models?key=...
-# and take a non-preview entry whose supportedGenerationMethods include
-# `generateContent`. `gemini-3.5-flash` is the base stable release of the 3.x
-# flash line; the 3.6/3.7/3.8 point releases rotate faster.
+# **A name from ListModels is not a working model.** `gemini-3.5-flash` was
+# picked that way - a non-preview entry whose supportedGenerationMethods
+# include `generateContent`, the base stable release of the 3.x flash line -
+# and it answered 503 to every single call against a real key. It shipped as
+# the default anyway, because every test that touched it used a mocked
+# transport, so nothing in this repository had ever called it.
+#
+# A live sweep of the five models one key lists found availability uneven and
+# patternless: 3.5-flash and 3.7-flash returned 503 on every attempt, while
+# 3.5-flash-lite, 3.6-flash and 3.8-flash answered. The default is now
+# `gemini-3.6-flash`, one of the three that answered.
+#
+# **Re-check by calling it, not by reading a list:**
+#
+#     python -m adsignal.cli.check_model
+#
+# makes one real request with the configured key and reports whether the
+# model answers. A model name is a claim about someone else's service, and
+# the only way to know a claim like that is true is to execute it - so do
+# that after changing this constant, and after any 503 or 404 from `/ask`.
 #
 # Declared here, once, and passed to the providers. Neither
 # `GeminiProvider` nor `GeminiSqlProvider` carries a model default of its
 # own, so this constant cannot fall out of step with a second copy.
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 
 class Settings(BaseSettings):

@@ -52,3 +52,22 @@ class NarrativeProvider(Protocol):
     def generate(self, request: NarrativeRequest) -> str:
         """Return narrative text, or raise if this provider cannot."""
         ...
+
+
+class ProviderUnavailable(RuntimeError):
+    """A provider failure whose message was written to be shown to a user.
+
+    `narrative.providers.gemini.generate_text` composes every one of its
+    failure strings itself — a status code or a transport verb, with the URL
+    and the key replaced by the literal word REDACTED — precisely so they can
+    be surfaced. This type is how a caller tells those strings apart from an
+    arbitrary exception's text, which is never safe: an httpx error carries
+    the request URL, and the key travels in that URL.
+
+    `narrative.sqlgen.SqlGenerator` surfaces the message of this type and the
+    *type name* of everything else, so raising it is a claim that the message
+    was redacted by construction. Nothing else in the project raises it.
+
+    A `RuntimeError` subclass, so every existing `except RuntimeError` and
+    every catch-all still behaves exactly as it did.
+    """

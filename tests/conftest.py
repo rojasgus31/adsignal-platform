@@ -216,6 +216,23 @@ _ensure_test_database(BOOTSTRAP_TEST_DSN)
 _UNCONFIGURED_ASK = ""
 
 
+# The read-only role the *suite* creates, grants to and rotates the password
+# of. Never `warehouse.ask_reads.READONLY_ROLE`.
+#
+# A Postgres role is cluster-wide, unlike the databases above. The suite calls
+# `ensure_readonly_role` from fixtures and rotates the password outright in
+# `test_ensure_readonly_role_is_idempotent`, so running it against the
+# deployment's role silently invalidates whatever
+# `ADSIGNAL_POSTGRES_READONLY_DSN` a developer has configured: `/ask` then
+# answers `rule: "readonly_dsn_unverified"` to every question until someone
+# re-runs the bootstrap. That cost the project owner real time, twice in one
+# day, before the suite was given a role of its own.
+#
+# Overridable the same way every test DSN is, for a cluster where this name is
+# taken. `tests/test_role_isolation.py` is what stops it drifting back.
+TEST_READONLY_ROLE = os.environ.get("ADSIGNAL_TEST_READONLY_ROLE", "adsignal_ro_test")
+
+
 def _postgres_available(dsn: str) -> bool:
     try:
         with psycopg.connect(dsn, connect_timeout=2):
@@ -732,7 +749,8 @@ def ask_client(_api_seed: str):
 
     The `client` fixture leaves `postgres_readonly_dsn` empty, which is the
     unconfigured deployment `/ask` reports as such. This one creates the
-    `adsignal_ro` role against the seeded `TEST_DSN` and points the endpoint
+    `TEST_READONLY_ROLE` role against the seeded `TEST_DSN` and points the
+    endpoint
     at it, so a test can install a stub generator and exercise the whole
     generate -> validate -> execute path against real rows.
 
@@ -742,11 +760,11 @@ def ask_client(_api_seed: str):
         pytest.skip("Postgres not reachable")
 
     password = secrets.token_urlsafe(24)
-    ensure_readonly_role(TEST_DSN, password)
+    ensure_readonly_role(TEST_DSN, password, TEST_READONLY_ROLE)
     app = create_app(
         Settings(
             postgres_dsn=TEST_DSN,
-            postgres_readonly_dsn=readonly_dsn_for(TEST_DSN, password),
+            postgres_readonly_dsn=readonly_dsn_for(TEST_DSN, password, TEST_READONLY_ROLE),
             # A configured key, so `test_a_refusal_never_leaks_a_dsn_or_a_key`
             # is checking a key the app really holds rather than a string it
             # was never given. Every test on this client installs its own
