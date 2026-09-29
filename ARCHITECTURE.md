@@ -173,11 +173,35 @@ Three independent controls replace it, and each is sufficient on its own.**
    the validator refuses qualified names and would otherwise leave name
    resolution to the role's own configuration.
 
-   Settings deliberately **not** pinned: `DateStyle`, `IntervalStyle`,
-   `TimeZone`, `bytea_output` and the `lc_*` family change how a value is
-   *rendered*, not what the SQL *means*, and psycopg returns typed Python
-   objects that `_jsonable` converts itself, so none of them can move the
-   boundary between what was approved and what runs.
+   `search_path` names `pg_catalog` explicitly, because Postgres otherwise
+   searches `pg_temp` **first**, implicitly — and `adsignal_ro` can create
+   temp tables, since TEMPORARY is granted to PUBLIC by default, so a temp
+   `dim_campaign` would shadow the real one. Nothing reaches that through
+   `/ask` (a read-only transaction refuses `CREATE TEMP TABLE`, and each
+   request is its own transaction), but a pin that does not do what its
+   comment says is worth less than no pin. A deployment that wants the hole
+   closed at the source should `REVOKE TEMPORARY ON DATABASE <db> FROM
+   PUBLIC`; this project does not do that to someone else's database.
+
+   `DateStyle` and `TimeZone` are pinned too, for a different reason: they
+   change the *answer* rather than the meaning. `'01/02/2024'::date` is a
+   different day under `DMY`, and `TimeZone` moves `CURRENT_DATE`, `now()`
+   and every `timestamptz` comparison, so the same approved query returns
+   different rows on a differently configured server. `ISO, MDY` is
+   Postgres's own default, so pinning it changes nothing on a default server.
+
+   Settings deliberately **not** pinned: `bytea_output` and the `lc_*` family
+   change how a value is *rendered*, not which rows come back, and psycopg
+   returns typed Python objects that `_jsonable` converts itself.
+
+   **The row cap is not a size cap.** An aggregate builds one value from
+   every row — `query_to_xml` returned 8 MB in a single column, and
+   `jsonb_agg`, `array_agg` and `string_agg` can all do it legitimately — so
+   `MAX_RESULT_BYTES` bounds the whole answer and refuses rather than
+   truncating. A silently shortened answer is a wrong answer that looks
+   right, which is the one thing showing the user the SQL is meant to
+   prevent. It bounds what is *served*, not what Postgres builds; the
+   statement timeout is what bounds the work.
 3. **A pure validator** (`warehouse/sql_guard.py`, no I/O). One statement
    only, opening with `SELECT` or `WITH`; no comments; no writing,
    administrative or catalog construct; no table outside the allowlist; a
@@ -238,9 +262,16 @@ Three independent controls replace it, and each is sufficient on its own.**
    sqlglot parses a function it models into a typed node and everything else
    into `Anonymous`, so the rule is now: **if the parser does not recognise
    it as a standard function, it does not run.** The permitted set is bounded
-   by sqlglot's own registry rather than by anyone's imagination. The cost is
-   that a legitimate Postgres-specific function sqlglot does not model
-   (`age(...)`) is refused and the question has to be rephrased.
+   by sqlglot's own registry rather than by anyone's imagination.
+
+   That shape is right, and its first cost estimate was wrong. "Only
+   `age(...)`" was understated: review measured **eighteen** legitimate
+   functions refused — roughly one in five of what a model emits for an
+   ordinary question — clustered exactly where questions cluster, in dates
+   and JSON. Seventeen are now named in `_ALLOWED_UNKNOWN_FUNCTIONS`, each
+   checked against the three promises that list makes; `setseed` stays
+   refused because it mutates session state and answers no question here. An
+   allow-list is only honest if entries get added as they surface.
 
 **Control 1 is verified, not assumed.** `verify_readonly_dsn` runs before the
 first query on a DSN and refuses to serve `/ask` unless the connection is
@@ -291,11 +322,15 @@ fabricated answer.
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.
 
-**What these controls do not cover.** Three residual exposures, all accepted:
-the class of defect behind the pinned settings is open-ended — a future
+**What these controls do not cover.** Four residual exposures, all accepted.
+The class of defect behind the pinned settings is open-ended: a future
 Postgres or sqlglot version could introduce another setting the parser
-assumes, and nothing here detects that automatically, only the three known
-ones are pinned. And two of longer standing:
+assumes, and nothing here detects that automatically — only the five known
+ones are pinned. `FETCH FIRST n ROWS WITH TIES` is accepted with its bound
+read as `n` and can return more than `n` rows, since ties are returned in
+full; `fetchmany` still stops at 200 and `MAX_RESULT_BYTES` still bounds the
+answer, so the effect is that "at most n" is really "at most 200". And two of
+longer standing:
 `psycopg_pool` logs a failing connection's host, port and database user (never
 the password), so an operator's log can name the read-only role and the host
 it reached; and `ensure_readonly_role` must send the role's password to

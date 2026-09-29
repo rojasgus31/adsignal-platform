@@ -19,6 +19,7 @@ import pytest
 
 from adsignal.warehouse.artifact_store import ensure_artifact_schema
 from adsignal.warehouse.ask_reads import (
+    MAX_RESULT_BYTES,
     READONLY_ROLE,
     STATEMENT_TIMEOUT,
     QueryRefused,
@@ -50,6 +51,21 @@ def _postgres_available(dsn: str) -> bool:
         return False
 
 
+class _RedactedDsn(str):
+    """A DSN that does not print its password when pytest reports a failure.
+
+    Every test here takes `readonly_dsn` as an argument, and pytest prints
+    each argument's `repr` in a failure report — so one failing assertion put
+    a live (if throwaway) password into the terminal and would put it into CI
+    output. A `str` subclass is still a DSN everywhere psycopg wants one.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<readonly DSN, password redacted>"
+
+
 @pytest.fixture(scope="module")
 def readonly_password() -> str:
     """The password this module's `adsignal_ro` is given.
@@ -64,7 +80,7 @@ def readonly_password() -> str:
 
 
 @pytest.fixture(scope="module")
-def readonly_dsn(readonly_password: str) -> str:
+def readonly_dsn(readonly_password: str) -> _RedactedDsn:
     """Create `adsignal_ro` against `ASK_TEST_DSN` and return its DSN."""
     if not _postgres_available(ASK_TEST_DSN):
         pytest.skip("Postgres not reachable")
@@ -74,7 +90,7 @@ def readonly_dsn(readonly_password: str) -> str:
     ensure_artifact_schema(ASK_TEST_DSN)
 
     ensure_readonly_role(ASK_TEST_DSN, readonly_password)
-    return readonly_dsn_for(ASK_TEST_DSN, readonly_password)
+    return _RedactedDsn(readonly_dsn_for(ASK_TEST_DSN, readonly_password))
 
 
 def _table_exists(table: str) -> bool:
@@ -358,14 +374,82 @@ def test_the_verification_memo_does_not_retain_the_dsn(readonly_dsn: str) -> Non
 
 
 def test_the_parsing_settings_are_pinned_for_every_query(readonly_dsn: str) -> None:
-    """The three GUCs `sql_guard` silently assumes are true when the query runs."""
+    """The settings `sql_guard` assumes, and the two that change the answer."""
     result = run_readonly_query(
         readonly_dsn,
         "SELECT current_setting('standard_conforming_strings') AS scs, "
         "current_setting('backslash_quote') AS bq, "
-        "current_setting('search_path') AS sp",
+        "current_setting('search_path') AS sp, "
+        "current_setting('DateStyle') AS ds, "
+        "current_setting('TimeZone') AS tz",
     )
-    assert result.rows == [{"scs": "on", "bq": "off", "sp": "public"}]
+    assert result.rows == [
+        {
+            "scs": "on",
+            "bq": "off",
+            "sp": "pg_catalog, public",
+            "ds": "ISO, MDY",
+            "tz": "UTC",
+        }
+    ]
+
+
+def test_the_search_path_puts_pg_temp_last(readonly_dsn: str) -> None:
+    """Postgres searches `pg_temp` first unless `pg_catalog` is named explicitly.
+
+    `adsignal_ro` can create temp tables — TEMPORARY is granted to PUBLIC by
+    default — and a temp `dim_campaign` would shadow the real one. Nothing
+    reaches that through `/ask` (a read-only transaction refuses `CREATE TEMP
+    TABLE`, and each request is its own transaction), but the pin should do
+    what its comment says.
+    """
+    result = run_readonly_query(
+        readonly_dsn, "SELECT current_schemas(true) AS schemas FROM dim_campaign LIMIT 1"
+    )
+    schemas = str(result.rows[0]["schemas"])
+    assert "pg_temp" not in schemas or schemas.index("pg_temp") > schemas.index("public")
+
+
+def test_a_date_literal_means_the_same_day_whatever_the_server_prefers(
+    readonly_dsn: str,
+) -> None:
+    """`'01/02/2024'::date` is a different day under DMY. The answer must not move.
+
+    Pinned to `ISO, MDY` — Postgres's own default — so this reads as 2 January
+    whatever the role, the database or `postgresql.conf` prefers.
+    """
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        conn.execute(f"ALTER ROLE {READONLY_ROLE} SET DateStyle = 'ISO, DMY'")  # noqa: S608
+        conn.commit()
+    try:
+        result = run_readonly_query(readonly_dsn, "SELECT '01/02/2024'::date AS d")
+        assert result.rows == [{"d": "2024-01-02"}], "a role setting moved the answer"
+    finally:
+        with psycopg.connect(ASK_TEST_DSN) as conn:
+            conn.execute(f"ALTER ROLE {READONLY_ROLE} RESET DateStyle")  # noqa: S608
+            conn.commit()
+
+
+def test_an_answer_too_large_to_serve_is_refused(readonly_dsn: str) -> None:
+    """The row cap bounds how many rows come back, not how big one is.
+
+    An aggregate can build a single value out of an entire table — which is
+    how `query_to_xml` returned 8 MB in one column, and what `jsonb_agg`,
+    `array_agg` and `string_agg` can all do legitimately. This is the bound
+    that makes "cannot return an unbounded value" true.
+    """
+    with pytest.raises(QueryRefused) as refused:
+        run_readonly_query(
+            readonly_dsn,
+            f"SELECT repeat('x', {MAX_RESULT_BYTES + 1000}) AS big",
+        )
+    assert refused.value.rule == "result_too_large"
+    assert str(MAX_RESULT_BYTES) not in refused.value.reason
+
+
+def test_an_ordinary_answer_is_not_refused_for_size(readonly_dsn: str) -> None:
+    result = run_readonly_query(readonly_dsn, "SELECT campaign_id FROM dim_campaign LIMIT 5")
+    assert result.rows
 
 
 def test_the_pinned_settings_override_a_role_configured_otherwise(readonly_dsn: str) -> None:

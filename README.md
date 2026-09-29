@@ -307,11 +307,16 @@ each sufficient on its own, none of which depends on the model behaving:**
    runaway query dies on its own, `prepare=True` so Postgres refuses a
    stacked statement at the wire level instead of relying on our rule, and
    `standard_conforming_strings`/`backslash_quote`/`search_path` pinned so
-   the server parses the approved query the way the validator read it.
+   the server parses the approved query the way the validator read it, plus
+   `DateStyle`/`TimeZone` so the same question does not get different numbers
+   on a differently configured server. The answer is bounded by size as well
+   as by row count, because one aggregate can build one very large value.
 3. **A pure validator** (`adsignal/warehouse/sql_guard.py`) — one statement,
    opening with `SELECT` or `WITH`, no comments, no writing or
    administrative keyword, no `pg_*` identifier, no table outside the
-   allowlist, and a row bound of 200 on the outermost query in either
+   allowlist (no `pg_*` identifier, including one hidden in an
+   `OPERATOR(pg_catalog.…)` qualifier), and a row bound of 200 on the
+   outermost query in either
    spelling (`LIMIT` or `FETCH FIRST`). It **parses** the SQL with sqlglot
    rather than matching patterns against it: the first version was a regex
    scanner, and review got past it three ways — a quoted identifier, a
@@ -325,7 +330,9 @@ each sufficient on its own, none of which depends on the model behaving:**
    Functions are an **allow-list**: if sqlglot does not recognise it as a
    standard function it does not run, because a deny-list has to name
    `query_to_xml('SELECT * FROM model_artifacts', …)` before it can refuse
-   it, and nobody had.
+   it, and nobody had. Seventeen Postgres-specific functions that a model
+   reaches for — the date and JSON families — are named explicitly, each
+   checked against what the list promises.
 
 The prompt asks for the same shape, but the prompt is a quality measure. An
 LLM told to emit only SELECT is not a security control; a read-only role is.

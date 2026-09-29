@@ -110,11 +110,53 @@ _BOUND_NODES = tuple(
 )
 
 # Function names sqlglot does not recognise, which are nonetheless allowed.
-# Empty on purpose. Every entry here is a promise that the named function
-# cannot take SQL as an argument, cannot read outside the allowlisted tables
-# and cannot return an unbounded value; that is a promise worth making
-# deliberately and one at a time, not in advance.
-_ALLOWED_UNKNOWN_FUNCTIONS: frozenset[str] = frozenset()
+#
+# Every entry is a promise about the named function: it cannot take SQL as an
+# argument, it cannot read outside the allowlisted tables, and it cannot
+# return an unbounded value. The list started empty on the principle that
+# each promise should be made deliberately and one at a time. Review then
+# measured what that cost: **eighteen** legitimate functions were refused,
+# roughly one in five of what a language model emits for an ordinary
+# question, and they clustered exactly where questions cluster — dates and
+# JSON. "Empty by default" is only honest if entries get added as they
+# surface, and these surfaced.
+#
+# Each was checked against all three promises; the per-function reasoning is
+# in the task report. `setseed` is deliberately absent: it mutates session
+# state and answers no question about campaign performance.
+#
+# The third promise is the weakest and is worth naming here rather than
+# leaving implied. `jsonb_agg` and `row_to_json` can build one value out of
+# every row in a table — and so can `array_agg` and `string_agg`, which
+# sqlglot models and which this list therefore never had a say over. What
+# actually bounds the size of an answer is `ask_reads.MAX_RESULT_BYTES`, not
+# this list.
+_ALLOWED_UNKNOWN_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        # Dates and times: scalar in, scalar out.
+        "age",
+        "make_date",
+        "isfinite",
+        "clock_timestamp",
+        "statement_timestamp",
+        "timezone",
+        # Scalar helpers over values the query already has.
+        "num_nonnulls",
+        "cardinality",
+        "quote_literal",
+        "regexp_matches",
+        "regexp_split_to_array",
+        # Aggregates over allowlisted rows.
+        "every",
+        # JSON construction. Builds a value from columns already selected;
+        # reaches nothing the query could not already read.
+        "to_json",
+        "row_to_json",
+        "json_build_object",
+        "jsonb_build_object",
+        "jsonb_agg",
+    }
+)
 
 _FORBIDDEN_NAMES = frozenset({"information_schema", "dblink", "dblink_connect", "dblink_exec"})
 _FORBIDDEN_PREFIX = "pg_"
@@ -190,7 +232,7 @@ def _analyse(text: str) -> tuple[exp.Query, _Shape]:
     """
     statement = _single_statement(text)
     _reject_comments(statement)
-    query = _require_read_root(statement)
+    query = _requoted(_require_read_root(statement))
     _reject_forbidden_nodes(query)
     _reject_forbidden_names(query)
     _require_known_functions(query)
@@ -232,6 +274,31 @@ def _require_round_trip(rendered: str, original: _Shape) -> None:
             "that query does not survive being read back, so it will not be run",
             "round_trip",
         )
+
+
+def _requoted(statement: exp.Query) -> exp.Query:
+    """Restore string literals sqlglot parsed into bare `Var` nodes.
+
+    `date_bin('1 week', event_date, '2024-01-01')` parses its origin as a
+    `Var` named `2024-01-01` and renders it unquoted, so the rendering
+    re-parses as the arithmetic `2024 - 01 - 01`. The round-trip check
+    refused it, correctly — but the query was ordinary and the renderer was
+    at fault, so a refusal was the wrong answer to give the user.
+
+    A genuine `Var` is a bare SQL word (`week` in `EXTRACT(week FROM …)`) and
+    is always a valid identifier. One that is not can only have come from a
+    string literal, so it is put back as one. Narrow on purpose: this repairs
+    a rendering defect and must not become a general rewriting step.
+
+    Applied inside `_analyse`, so both passes normalise identically —
+    otherwise the rendering would be re-parsed back into a `Var` and the
+    fixed-point clause would refuse the repair itself.
+    """
+    for var in statement.find_all(exp.Var):
+        name = var.name
+        if isinstance(name, str) and name and not name.isidentifier():
+            var.replace(exp.Literal.string(name))
+    return statement
 
 
 def _reject_unsupported_characters(text: str) -> None:
@@ -310,15 +377,13 @@ def _reject_forbidden_names(statement: exp.Query) -> None:
     qualifier, a column or a call.
     """
     for node in statement.walk():
-        name = _name_of(node)
-        if name is None:
-            continue
-        lowered = name.lower()
-        if lowered.startswith(_FORBIDDEN_PREFIX) or lowered in _FORBIDDEN_NAMES:
-            raise SqlRejected(
-                f"{name} is not allowed; only the documented tables may be read",
-                "forbidden_keyword",
-            )
+        for name in _names_of(node):
+            lowered = name.lower()
+            if lowered.startswith(_FORBIDDEN_PREFIX) or lowered in _FORBIDDEN_NAMES:
+                raise SqlRejected(
+                    f"{name} is not allowed; only the documented tables may be read",
+                    "forbidden_keyword",
+                )
 
 
 def _require_known_functions(statement: exp.Query) -> None:
@@ -359,12 +424,25 @@ def _require_known_functions(statement: exp.Query) -> None:
         raise SqlRejected(f"{name}() is not a function this endpoint runs", "forbidden_function")
 
 
-def _name_of(node: object) -> str | None:
-    """The identifier or function name `node` carries, if it carries one."""
+def _names_of(node: object) -> tuple[str, ...]:
+    """Every identifier-ish name `node` carries.
+
+    Operators are the reason this returns a tuple rather than one name.
+    `OPERATOR(pg_catalog.||)` keeps its qualifier in a plain string argument
+    rather than in an `Identifier`, so scanning identifiers alone let a
+    `pg_catalog`-qualified operator through. No core operator takes SQL or
+    touches the filesystem, so nothing was exploitable — but the README says
+    no `pg_*` identifier reaches the database, and that sentence should be
+    true rather than nearly true.
+    """
     if isinstance(node, exp.Identifier | exp.Anonymous):
         name = node.name
-        return name if isinstance(name, str) and name else None
-    return None
+        return (name,) if isinstance(name, str) and name else ()
+    if isinstance(node, exp.Operator):
+        operator = node.args.get("operator")
+        if isinstance(operator, str) and operator:
+            return tuple(part for part in operator.split(".") if part)
+    return ()
 
 
 def _require_allowlisted_tables(statement: exp.Query) -> frozenset[str]:

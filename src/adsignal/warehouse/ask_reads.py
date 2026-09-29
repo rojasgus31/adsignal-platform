@@ -72,15 +72,59 @@ STATEMENT_TIMEOUT = "5s"
 # strings outright. That is the exact construction behind the escape-string
 # regression, and nothing a question about campaign performance needs.
 #
-# `search_path = public` makes the table allowlist mean what it says: the
-# validator refuses schema-qualified names, so every name it approves is
-# resolved by the search path, and leaving that to the role's configuration
-# would let `dim_campaign` mean a table in some other schema.
-_PINNED_SETTINGS = (
-    ("standard_conforming_strings", "on"),
-    ("backslash_quote", "off"),
-    ("search_path", "public"),
+# `search_path = pg_catalog, public` makes the table allowlist mean what it
+# says: the validator refuses schema-qualified names, so every name it
+# approves is resolved by the search path, and leaving that to the role's
+# configuration would let `dim_campaign` mean a table in another schema.
+# `pg_catalog` is named explicitly because Postgres otherwise searches
+# `pg_temp` *first*, implicitly - and `adsignal_ro` can create temp tables,
+# since TEMPORARY is granted to PUBLIC by default. Nothing reaches that today
+# (`transaction_read_only` refuses `CREATE TEMP TABLE`, and each request is
+# its own transaction), but a pin that does not do what its comment says is
+# worth less than no pin. Deployments that want the hole closed at the source
+# should `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC`.
+#
+# `DateStyle` and `TimeZone` are pinned for a different reason: they change
+# the *answer*, not the meaning of the SQL. `'01/02/2024'::date` is a
+# different day under `DMY`, and `TimeZone` moves `CURRENT_DATE`, `now()` and
+# every `timestamptz` comparison — so the same approved query returns
+# different rows on a differently configured server. A dashboard whose
+# numbers depend on a session setting is the same class of problem as a
+# control whose premise is unverified.
+#
+# `ISO, MDY` rather than `ISO, YMD`: MDY is Postgres's own default, so
+# pinning it changes nothing on a default server, while YMD *rejects*
+# `'01/02/2024'` outright rather than reading it consistently. The setting
+# only decides ambiguous slash-separated literals; an ISO one
+# (`'2024-01-02'`) means the same day under every value, which is what the
+# prompt asks the model for anyway.
+#
+# Still not pinned: `bytea_output` and the `lc_*` family, which change how a
+# value is rendered on the wire and not which rows come back — and psycopg
+# hands back typed Python objects that `_jsonable` converts itself.
+# Each value is already composed, because the two kinds are not
+# interchangeable: `search_path` takes a list of *identifiers*, while the
+# rest take string literals. Passing `'pg_catalog, public'` as one literal
+# sets the search path to a single schema whose name contains a comma, and
+# every table then stops resolving.
+_PINNED_SETTINGS: tuple[tuple[str, sql.Composable], ...] = (
+    ("standard_conforming_strings", sql.Literal("on")),
+    ("backslash_quote", sql.Literal("off")),
+    ("search_path", sql.SQL(", ").join([sql.Identifier("pg_catalog"), sql.Identifier("public")])),
+    ("DateStyle", sql.Literal("ISO, MDY")),
+    ("TimeZone", sql.Literal("UTC")),
 )
+
+# The largest answer this endpoint will serve, measured across every value in
+# every row. The row cap bounds how many rows come back and says nothing
+# about how big one is: an aggregate can build a single value out of an
+# entire table, which is how `query_to_xml` returned 8 MB in one column, and
+# `jsonb_agg`, `array_agg` and `string_agg` can all do the same thing
+# legitimately. This is what makes "cannot return an unbounded value" - the
+# third promise `sql_guard._ALLOWED_UNKNOWN_FUNCTIONS` makes - true rather
+# than aspirational. It bounds what is *served*, not what Postgres builds;
+# the statement timeout is what bounds the work.
+MAX_RESULT_BYTES = 1_000_000
 
 # Revoked rather than merely left ungranted. A future `GRANT SELECT ON ALL
 # TABLES IN SCHEMA public` run by someone else would otherwise hand the role
@@ -339,7 +383,7 @@ def run_readonly_query(
             for name, value in _PINNED_SETTINGS:
                 conn.execute(
                     sql.SQL("SET LOCAL {name} = {value}").format(
-                        name=sql.Identifier(name), value=sql.Literal(value)
+                        name=sql.Identifier(name), value=value
                     )
                 )
             # `prepare=True` is what forces psycopg onto the **extended**
@@ -357,7 +401,24 @@ def run_readonly_query(
             fetched = cursor.fetchmany(max_rows)
     except psycopg.Error as error:
         raise _refusal(error, statement_timeout) from None
-    return QueryResult(columns=columns, rows=[_row_to_dict(columns, row) for row in fetched])
+    rows = [_row_to_dict(columns, row) for row in fetched]
+    _require_servable_size(rows)
+    return QueryResult(columns=columns, rows=rows)
+
+
+def _require_servable_size(rows: list[dict[str, Any]]) -> None:
+    """Refuse an answer too large to serve, rather than serving it.
+
+    Refusing beats truncating: a silently shortened answer is a wrong answer
+    that looks right, and the whole point of showing the user the SQL is that
+    they can trust the relationship between the query and the result.
+    """
+    total = sum(len(str(value)) for row in rows for value in row.values())
+    if total > MAX_RESULT_BYTES:
+        raise QueryRefused(
+            "that answer is too large to return; ask for fewer columns or an aggregate",
+            "result_too_large",
+        )
 
 
 def _refusal(error: psycopg.Error, statement_timeout: str) -> QueryRefused:

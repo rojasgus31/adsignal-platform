@@ -457,7 +457,7 @@ def test_an_unrecognised_function_is_refused_even_when_harmless() -> None:
     extension and the next catalog helper are all refused without anyone
     having thought of them.
     """
-    refusal = _rejection("SELECT age(now(), now()) FROM dim_campaign")
+    refusal = _rejection("SELECT txid_current() FROM dim_campaign")
     assert refusal.rule == "forbidden_function"
 
 
@@ -505,3 +505,71 @@ def test_a_backslash_literal_that_depends_on_a_server_setting_is_refused() -> No
         "SELECT '\\' AS a, ', 1 AS z FROM model_artifacts --' AS c FROM dim_campaign"
     )
     assert "model_artifacts" in approved, "the literal is data under the pinned setting"
+
+
+# Fix round 4. The allow-list was too tight: 18 legitimate functions were
+# refused, and they were exactly the ones a model emits for ordinary
+# questions. Each admitted one is proved against the three promises in
+# `_ALLOWED_UNKNOWN_FUNCTIONS`'s own comment; the proofs are in the report.
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT age(now(), event_date) FROM fct_campaign_daily",
+        "SELECT make_date(2024, 1, 1) FROM dim_campaign",
+        "SELECT num_nonnulls(cpa, roas) FROM fct_campaign_daily",
+        "SELECT isfinite(event_date) FROM fct_campaign_daily",
+        "SELECT clock_timestamp() FROM dim_campaign",
+        "SELECT statement_timestamp() FROM dim_campaign",
+        "SELECT timezone('UTC', now()) FROM dim_campaign",
+        "SELECT every(is_anomaly) FROM fct_campaign_daily",
+        "SELECT cardinality(ARRAY[1, 2]) FROM dim_campaign",
+        "SELECT quote_literal(channel) FROM dim_campaign",
+        "SELECT regexp_matches(channel, '^s') FROM dim_campaign",
+        "SELECT regexp_split_to_array(channel, '_') FROM dim_campaign",
+        "SELECT to_json(channel) FROM dim_campaign",
+        "SELECT json_build_object('c', channel) FROM dim_campaign",
+        "SELECT jsonb_build_object('c', channel) FROM dim_campaign",
+        "SELECT jsonb_agg(channel) FROM dim_campaign",
+        "SELECT row_to_json(d) FROM dim_campaign d",
+    ],
+)
+def test_the_admitted_functions_are_accepted(query: str) -> None:
+    """One test per admitted entry, so removing one is visible."""
+    assert validate_sql(query)
+
+
+def test_setseed_stays_refused() -> None:
+    """It mutates session state and answers no question about campaigns."""
+    refusal = _rejection("SELECT setseed(0.5) FROM dim_campaign")
+    assert refusal.rule == "forbidden_function"
+
+
+def test_date_bin_with_a_literal_origin_is_accepted() -> None:
+    """sqlglot parsed the origin as a bare `Var` and rendered it unquoted.
+
+    `'2024-01-01'` came back as `2024-01-01`, which re-parses as arithmetic,
+    so the round-trip check refused a perfectly ordinary query. The renderer
+    is the thing at fault, and a `Var` whose text is not a valid identifier
+    can only have come from a string literal.
+    """
+    safe = validate_sql(
+        "SELECT date_bin('1 week', event_date, '2024-01-01') FROM fct_campaign_daily"
+    )
+    assert "'2024-01-01'" in safe
+
+
+def test_a_schema_qualified_operator_is_refused() -> None:
+    """`OPERATOR(pg_catalog.||)` carries its qualifier outside any identifier.
+
+    No core operator takes SQL or touches the filesystem, so this is not
+    exploitable — but the README says no `pg_*` identifier reaches the
+    database, and that sentence should be true.
+    """
+    refusal = _rejection("SELECT 'a' OPERATOR(pg_catalog.||) 'b' FROM dim_campaign")
+    assert refusal.rule == "forbidden_keyword"
+
+
+def test_an_ordinary_operator_still_works() -> None:
+    assert validate_sql("SELECT channel || '!' FROM dim_campaign")
