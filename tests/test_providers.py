@@ -24,6 +24,25 @@ REQUEST = NarrativeRequest(
 )
 
 
+def _chain(error: BaseException) -> str:
+    """Every message reachable from `error`, following both exception links.
+
+    `raise ... from None` suppresses `__cause__` but leaves `__context__`
+    pointing at the exception being handled — for these providers, the httpx
+    error whose text contains the request URL, with the key in it as a query
+    parameter. A leak test that reads only `__cause__` cannot fail, so these
+    walk both links.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{current!r}")
+        current = current.__cause__ or current.__context__
+    return " ".join(parts)
+
+
 def _client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
@@ -78,7 +97,7 @@ def test_gemini_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011 - any type; content is the point
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "REDACTED" in message or "401" in message
 
@@ -89,7 +108,7 @@ def test_gemini_connection_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "connection" in message.lower()
 
@@ -100,7 +119,7 @@ def test_gemini_timeout_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "timed out" in message.lower()
 
@@ -135,7 +154,7 @@ def test_groq_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "REDACTED" in message or "401" in message
 
@@ -145,7 +164,7 @@ def test_groq_connection_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "connection" in message.lower()
 
@@ -155,7 +174,7 @@ def test_groq_timeout_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "timed out" in message.lower()
 
@@ -188,7 +207,7 @@ def test_jev_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "REDACTED" in message or "401" in message
 
@@ -198,7 +217,7 @@ def test_jev_connection_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "connection" in message.lower()
 
@@ -208,7 +227,7 @@ def test_jev_timeout_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "timed out" in message.lower()
 
@@ -243,7 +262,7 @@ def test_anthropic_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "REDACTED" in message or "401" in message
 
@@ -253,7 +272,7 @@ def test_anthropic_connection_error_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "connection" in message.lower()
 
@@ -263,7 +282,7 @@ def test_anthropic_timeout_never_contains_the_api_key() -> None:
     with pytest.raises(Exception) as excinfo:  # noqa: PT011
         provider.generate(REQUEST)
 
-    message = f"{excinfo.value}{excinfo.value.__cause__ or ''}"
+    message = _chain(excinfo.value)
     assert SECRET not in message, "the API key leaked into the error message"
     assert "timed out" in message.lower()
 
@@ -332,3 +351,24 @@ def test_build_chain_has_no_duplicate_provider_names() -> None:
     )
     names = [provider.name for provider in chain._providers]  # noqa: SLF001
     assert len(names) == len(set(names))
+
+
+def test_no_provider_key_is_visible_to_the_suite() -> None:
+    """Fix round 1, finding 4: no test may call a live, billed model.
+
+    `Settings` reads `.env`, and `install_request_runtime` builds a real
+    provider from it before every single test. `conftest.py` blanks every
+    provider key at import time; this is the assertion that says so out loud,
+    so the protection cannot be deleted without a test going red.
+
+    It reports only the *names* of any configured keys — a failure message
+    that printed the value would put a live key in CI output, which is the
+    same class of leak the redaction work exists to prevent.
+    """
+    settings = Settings()
+    configured = [
+        name
+        for name in ("gemini_api_key", "groq_api_key", "jev_api_key", "anthropic_api_key")
+        if getattr(settings, name).get_secret_value()
+    ]
+    assert configured == [], f"provider keys reached the suite: {configured}"

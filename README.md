@@ -297,7 +297,9 @@ each sufficient on its own, none of which depends on the model behaving:**
 1. **A read-only Postgres role, `adsignal_ro`** — `SELECT` on seven
    allowlisted tables, ownership of nothing, `model_artifacts` and
    `entity_embeddings` explicitly revoked. Generated SQL runs only on
-   `ADSIGNAL_POSTGRES_READONLY_DSN`, never on the admin DSN. The test that
+   `ADSIGNAL_POSTGRES_READONLY_DSN`, never on the admin DSN, and the
+   connection is *checked* before the first query runs on it: not a
+   superuser, cannot write, cannot read an excluded table. The test that
    matters hands a `DROP TABLE` straight to the executor, bypassing the
    validator entirely, and asserts the database refuses it.
 2. **A read-only transaction with a 5 s statement timeout** — `SET LOCAL
@@ -305,8 +307,13 @@ each sufficient on its own, none of which depends on the model behaving:**
 3. **A pure validator** (`adsignal/warehouse/sql_guard.py`) — one statement,
    opening with `SELECT` or `WITH`, no comments, no writing or
    administrative keyword, no `pg_*` identifier, no table outside the
-   allowlist, and a `LIMIT` of 200 appended when absent or refused when
-   larger.
+   allowlist, and a `LIMIT` of 200 on the outermost query. It **parses** the
+   SQL with sqlglot rather than matching patterns against it: the first
+   version was a regex scanner, and review got past it three ways — a quoted
+   identifier, a comma-joined table, and a table name hidden in a string
+   literal that the scanner read as a CTE. What runs is rendered back from
+   the parsed tree, so anything the validator did not understand never
+   reaches Postgres.
 
 The prompt asks for the same shape, but the prompt is a quality measure. An
 LLM told to emit only SELECT is not a security control; a read-only role is.

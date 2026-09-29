@@ -145,6 +145,15 @@ def test_a_refusal_never_leaks_a_dsn_or_a_key(ask_client) -> None:
     assert "postgresql://" not in text
     assert "adsignal_ro" not in text
     assert SECRET not in text
+
+    # The key this app is really configured with (`conftest.ask_client` gives
+    # it a sentinel). Asserting only against a `SECRET` the app was never
+    # given is an assertion that cannot fail, which is what this test did
+    # before fix round 1. If the fixture ever stops configuring a key this
+    # line fails loudly rather than passing vacuously, because `"" not in
+    # text` is never true.
+    configured = ask_client.app.state.settings.gemini_api_key.get_secret_value()
+    assert configured not in text
     assert "Traceback" not in text
 
 
@@ -184,3 +193,28 @@ def test_every_documented_field_is_always_present(ask_client, field: str) -> Non
     """The dashboard client is hand-written from this shape; it must not vary."""
     _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
     assert field in _ask(ask_client, f"a question about {field}")
+
+
+def test_an_unrestricted_readonly_dsn_refuses_rather_than_running(ask_client) -> None:
+    """Fix round 1, finding 3, through the endpoint.
+
+    Pointing `postgres_readonly_dsn` at the admin DSN is the misconfiguration
+    that silently deletes control 1. `/ask` must refuse to answer at all
+    rather than run generated SQL as an unrestricted role.
+    """
+    from adsignal.warehouse.ask_reads import forget_verified_dsns
+
+    settings = ask_client.app.state.settings
+    original = settings.postgres_readonly_dsn
+    settings.postgres_readonly_dsn = settings.postgres_dsn
+    forget_verified_dsns()
+    try:
+        _install(ask_client, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+        body = _ask(ask_client, "anything at all")
+    finally:
+        settings.postgres_readonly_dsn = original
+        forget_verified_dsns()
+
+    assert body["rule"] == "readonly_dsn_unverified"
+    assert body["rows"] == []
+    assert "postgresql://" not in body["refusal"]

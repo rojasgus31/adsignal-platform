@@ -23,6 +23,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "psycopg-pool>=3.2",
+    # `/ask` parses model-written SQL before it runs (see
+    # `warehouse/sql_guard.py`). It arrived transitively through dbt, but a
+    # security control must not depend on another package's pin.
+    "sqlglot>=25",
 ]
 
 [dependency-groups]

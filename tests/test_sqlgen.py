@@ -29,6 +29,24 @@ QUESTION = SqlQuestion(
 )
 
 
+def _chain(error: BaseException) -> str:
+    """Every message reachable from `error`, following both exception links.
+
+    `raise ... from None` suppresses `__cause__` but leaves `__context__`
+    pointing at the exception being handled — here, the httpx error whose
+    text contains the request URL, and the key travels in that URL as a query
+    parameter. A leak test that reads only `__cause__` cannot fail.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        parts.append(f"{current!r}")
+        current = current.__cause__ or current.__context__
+    return " ".join(parts)
+
+
 def _client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
@@ -138,7 +156,9 @@ def test_a_generation_failure_never_carries_the_key() -> None:
     )
     with pytest.raises(SqlGenerationFailed) as failed:
         generator.generate(QUESTION)
-    message = f"{failed.value}{failed.value.__cause__ or ''}"
+    # `from None` clears `__cause__` but NOT `__context__`, which still holds
+    # the httpx exception whose URL carries the key. Both have to be clean.
+    message = _chain(failed.value)
     assert SECRET not in message
     assert "key=" not in message
 
@@ -172,7 +192,7 @@ def test_a_timeout_is_reported_without_the_url() -> None:
     provider = GeminiSqlProvider(api_key=SECRET, model=MODEL, client=_client(handler))
     with pytest.raises(RuntimeError) as failed:
         provider.generate_sql(QUESTION)
-    message = f"{failed.value}{failed.value.__cause__ or ''}"
+    message = _chain(failed.value)
     assert SECRET not in message
     assert "generativelanguage" not in message
 

@@ -56,8 +56,19 @@ def test_a_trailing_semicolon_alone_is_not_a_second_statement() -> None:
 
 
 def test_a_comment_hiding_a_drop_is_rejected() -> None:
-    """Comments exist here only to smuggle payloads, so they are banned outright."""
+    """Comments exist here only to smuggle payloads, so they are banned outright.
+
+    The parser reads the `--` to end of line and then finds a bare `DROP`
+    where nothing may follow, so this is refused before the comment rule is
+    reached. Either refusal is correct; what matters is that it is refused.
+    """
     refusal = _rejection("SELECT 1 FROM dim_campaign --\nDROP TABLE dim_campaign")
+    assert refusal.rule in ("no_comments", "single_statement", "invalid_query")
+
+
+def test_a_line_comment_on_an_otherwise_valid_query_is_rejected() -> None:
+    """The comment rule itself, on a query that parses cleanly without it."""
+    refusal = _rejection("SELECT campaign_id FROM dim_campaign LIMIT 5 -- trust me")
     assert refusal.rule == "no_comments"
 
 
@@ -70,7 +81,7 @@ def test_a_block_comment_is_rejected() -> None:
 def test_a_keyword_split_by_a_block_comment_is_rejected() -> None:
     """`DR/**/OP` reads as DROP to Postgres and as nothing to a substring scan."""
     refusal = _rejection("SELECT 1 FROM dim_campaign; DR/**/OP TABLE dim_campaign")
-    assert refusal.rule in ("no_comments", "single_statement")
+    assert refusal.rule in ("no_comments", "single_statement", "invalid_query")
 
 
 def test_a_query_that_does_not_start_with_select_or_with_is_rejected() -> None:
@@ -102,8 +113,14 @@ def test_a_query_that_does_not_start_with_select_or_with_is_rejected() -> None:
     ],
 )
 def test_every_writing_or_administrative_statement_is_rejected(statement: str) -> None:
+    """Each is refused: as a non-query root, as a forbidden node, or as unparseable.
+
+    `invalid_query` is in the list because a statement the parser cannot even
+    model never produces a tree for the later rules to inspect — and a query
+    this endpoint cannot parse is one it will not run.
+    """
     refusal = _rejection(statement)
-    assert refusal.rule in ("select_only", "forbidden_keyword")
+    assert refusal.rule in ("select_only", "forbidden_keyword", "invalid_query")
 
 
 def test_a_writing_cte_is_rejected() -> None:
@@ -183,10 +200,17 @@ def test_an_oversized_limit_in_a_subquery_is_rejected() -> None:
     assert refusal.rule == "row_limit"
 
 
-def test_limit_all_is_rejected() -> None:
-    """`LIMIT ALL` is Postgres for "no limit", which is what the cap forbids."""
-    refusal = _rejection("SELECT campaign_id FROM dim_campaign LIMIT ALL")
-    assert refusal.rule == "row_limit"
+def test_limit_all_does_not_escape_the_cap() -> None:
+    """`LIMIT ALL` is Postgres for "no limit". It must not become one.
+
+    The scanner this module used to be saw the word LIMIT, concluded the
+    query was already bounded, and appended nothing. The parser drops
+    `LIMIT ALL` entirely, so the outer cap is applied — and because what runs
+    is rendered from the tree, the `LIMIT ALL` never reaches Postgres either.
+    """
+    safe = validate_sql("SELECT campaign_id FROM dim_campaign LIMIT ALL")
+    assert safe.rstrip().upper().endswith(f"LIMIT {MAX_ROWS}")
+    assert "ALL" not in safe.upper()
 
 
 def test_a_limit_at_the_cap_is_accepted_unchanged() -> None:
@@ -259,3 +283,63 @@ def test_the_validator_does_no_io() -> None:
     text = Path(module_source).read_text(encoding="utf-8")
     for forbidden in ("import psycopg", "import httpx", "import socket", "urlopen"):
         assert forbidden not in text
+
+
+# Fix round 1, finding 1. Each of these three reached `model_artifacts` or
+# `entity_embeddings` — the two tables the allowlist exists to protect —
+# through the regex scanner this module originally used. They are the reason
+# the validator now parses instead of scanning.
+
+
+def test_a_quoted_table_name_is_still_checked() -> None:
+    """`FROM "model_artifacts"` is the same table with different punctuation."""
+    refusal = _rejection('SELECT * FROM "model_artifacts" LIMIT 1')
+    assert refusal.rule == "table_allowlist"
+    assert "model_artifacts" in refusal.reason
+
+
+def test_a_comma_joined_table_is_still_checked() -> None:
+    """Only the first FROM item follows the word FROM. The rest are tables too."""
+    refusal = _rejection("SELECT * FROM dim_campaign, model_artifacts LIMIT 1")
+    assert refusal.rule == "table_allowlist"
+    assert "model_artifacts" in refusal.reason
+
+
+def test_a_string_literal_cannot_forge_a_cte_name() -> None:
+    """Text inside quotes is data. It must not register `model_artifacts` as a CTE."""
+    refusal = _rejection(
+        "SELECT 'x, model_artifacts as (' AS note FROM dim_campaign "
+        "JOIN model_artifacts m ON true LIMIT 1"
+    )
+    assert refusal.rule == "table_allowlist"
+    assert "model_artifacts" in refusal.reason
+
+
+def test_a_mixed_case_excluded_table_is_still_checked() -> None:
+    refusal = _rejection("SELECT * FROM Model_Artifacts LIMIT 1")
+    assert refusal.rule == "table_allowlist"
+
+
+def test_a_string_literal_containing_a_comment_marker_is_not_a_comment() -> None:
+    """A parser knows `'--'` inside quotes is data; a substring scan does not."""
+    assert validate_sql("SELECT campaign_id FROM dim_campaign WHERE channel = '--' LIMIT 5")
+
+
+def test_a_string_literal_containing_a_semicolon_is_not_a_second_statement() -> None:
+    assert validate_sql("SELECT campaign_id FROM dim_campaign WHERE channel = 'a;b' LIMIT 5")
+
+
+def test_a_small_subquery_limit_does_not_suppress_the_outer_cap() -> None:
+    """Fix round 1, finding 2: an inner LIMIT is not a bound on what comes back."""
+    safe = validate_sql(
+        "SELECT * FROM (SELECT campaign_id FROM dim_campaign LIMIT 5) t JOIN dim_campaign d ON true"
+    )
+    assert safe.rstrip().upper().endswith(f"LIMIT {MAX_ROWS}")
+
+
+def test_a_cte_the_query_really_defines_is_still_allowed() -> None:
+    safe = validate_sql(
+        "WITH recent AS (SELECT campaign_id FROM fct_campaign_daily) "
+        "SELECT campaign_id FROM recent LIMIT 10"
+    )
+    assert "recent" in safe

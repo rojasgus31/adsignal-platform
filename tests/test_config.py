@@ -6,6 +6,17 @@ import pytest
 
 from adsignal.config import Settings
 
+# The same four names `conftest.py` blanks for the whole suite. Repeated
+# rather than imported because `tests/` is not a package; the assertion in
+# `test_providers.py` fails if the two ever disagree, because a key this
+# module forgot to re-blank would then be visible to `Settings`.
+PROVIDER_KEY_VARS = (
+    "ADSIGNAL_GEMINI_API_KEY",
+    "ADSIGNAL_GROQ_API_KEY",
+    "ADSIGNAL_JEV_API_KEY",
+    "ADSIGNAL_ANTHROPIC_API_KEY",
+)
+
 
 @pytest.fixture(autouse=True)
 def _no_ambient_adsignal_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -19,6 +30,14 @@ def _no_ambient_adsignal_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in tuple(os.environ):
         if name.startswith("ADSIGNAL_"):
             monkeypatch.delenv(name, raising=False)
+
+    # Deleting the variables un-blanks them: `conftest.py` sets every provider
+    # key to "" for the whole suite precisely so nothing calls a live model,
+    # and removing the variable lets `Settings` fall back to the developer's
+    # `.env`, which may hold a real key. Re-blank them here so this module's
+    # isolation cannot reintroduce the one thing that blanking prevents.
+    for name in PROVIDER_KEY_VARS:
+        monkeypatch.setenv(name, "")
 
 
 def test_settings_have_documented_defaults() -> None:

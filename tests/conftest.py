@@ -43,6 +43,33 @@ from adsignal.warehouse.writer import write_events_parquet, write_labels_parquet
 
 _DBT_DIR = Path(__file__).resolve().parents[1] / "dbt"
 
+# Every model-provider key a `Settings` can read, blanked for the whole suite
+# before any test module imports and long before anything constructs
+# `Settings`. `Settings` reads `.env`, and the environment wins over it, so
+# this is what stops the suite calling a live model.
+#
+# This is structural on purpose. Three tests were found making live, billed
+# Gemini calls the moment a real key reached `.env`; fixing those three left
+# every future test one bare `Settings()` away from doing it again, and
+# `install_request_runtime` builds a real provider from the environment
+# before every single test. A per-test fix is a fix that has to be remembered.
+# A test that genuinely wants a configured key passes it explicitly, which
+# beats the environment.
+PROVIDER_KEY_VARS = (
+    "ADSIGNAL_GEMINI_API_KEY",
+    "ADSIGNAL_GROQ_API_KEY",
+    "ADSIGNAL_JEV_API_KEY",
+    "ADSIGNAL_ANTHROPIC_API_KEY",
+)
+for _key_var in PROVIDER_KEY_VARS:
+    os.environ[_key_var] = ""
+
+# A stand-in for a real key, used where a test needs the app under test to
+# actually hold one so that a "no key reached the response" assertion can
+# fail. It is not a credential and reaches no network: every test that uses
+# it replaces the generator with a stub.
+FAKE_PROVIDER_KEY = "sk-test-sentinel-must-never-be-served"
+
 # The database the demo/dashboard reads. Tests must never point at it - see
 # `_ensure_test_database` below (I2 in the ML layer review).
 _SERVING_DSN = "postgresql://adsignal:adsignal@localhost:5432/adsignal"
@@ -697,6 +724,11 @@ def ask_client(_api_seed: str):
         Settings(
             postgres_dsn=TEST_DSN,
             postgres_readonly_dsn=readonly_dsn_for(TEST_DSN, password),
+            # A configured key, so `test_a_refusal_never_leaks_a_dsn_or_a_key`
+            # is checking a key the app really holds rather than a string it
+            # was never given. Every test on this client installs its own
+            # generator, so nothing ever calls a provider with it.
+            gemini_api_key=FAKE_PROVIDER_KEY,
         )
     )
     with TestClient(app) as test_client:

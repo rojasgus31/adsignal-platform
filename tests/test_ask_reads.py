@@ -25,6 +25,7 @@ from adsignal.warehouse.ask_reads import (
     ensure_readonly_role,
     readonly_dsn_for,
     run_readonly_query,
+    verify_readonly_dsn,
 )
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
@@ -224,7 +225,12 @@ def test_ensure_readonly_role_is_idempotent() -> None:
 
 
 def test_the_role_has_select_on_exactly_the_allowlisted_tables(readonly_dsn: str) -> None:
-    """The grant and the allowlist are the same set, checked against the catalog."""
+    """The grant and the allowlist are the same set, checked against the catalog.
+
+    Equality, not containment: `model_artifacts` and `entity_embeddings`
+    being absent is the point, and a subset assertion plus two named
+    absences would miss any third table someone grants later.
+    """
     from adsignal.warehouse.ask_schema import ALLOWED_TABLES
 
     with psycopg.connect(ASK_TEST_DSN) as conn:
@@ -236,7 +242,47 @@ def test_the_role_has_select_on_exactly_the_allowlisted_tables(readonly_dsn: str
                 (READONLY_ROLE,),
             ).fetchall()
         }
-    missing = ALLOWED_TABLES - granted
-    assert missing == set(), f"the role cannot read {sorted(missing)}"
-    assert "model_artifacts" not in granted
-    assert "entity_embeddings" not in granted
+    # Exactly the allowlist, not a superset: a grant the allowlist does not
+    # name is a table the validator would refuse but the role could still
+    # read if the validator were bypassed.
+    assert granted == set(ALLOWED_TABLES)
+
+
+# Fix round 1, finding 3. Control 1 is only a control if something checks
+# that the DSN generated SQL runs on is the restricted role. Pasting the
+# admin DSN into `ADSIGNAL_POSTGRES_READONLY_DSN` silently deleted it.
+
+
+def test_the_executor_refuses_an_unrestricted_dsn(readonly_dsn: str) -> None:
+    """The admin DSN in the read-only slot must be refused, not used.
+
+    `ASK_TEST_DSN` is the admin connection. Handing it to the executor is
+    exactly the misconfiguration this check exists for, and the query below
+    is a harmless SELECT the admin role could perfectly well run — the point
+    is that it must not be allowed to.
+    """
+    with pytest.raises(QueryRefused) as refused:
+        run_readonly_query(ASK_TEST_DSN, "SELECT campaign_id FROM dim_campaign LIMIT 1")
+    assert refused.value.rule == "readonly_dsn_unverified"
+    assert "postgresql://" not in refused.value.reason
+    assert "adsignal" not in refused.value.reason.lower()
+
+
+def test_the_restricted_dsn_passes_verification(readonly_dsn: str) -> None:
+    verify_readonly_dsn(readonly_dsn)
+
+
+def test_verification_rejects_a_role_that_can_write(readonly_dsn: str) -> None:
+    with pytest.raises(QueryRefused) as refused:
+        verify_readonly_dsn(ASK_TEST_DSN)
+    assert refused.value.rule == "readonly_dsn_unverified"
+
+
+def test_the_fetch_is_bounded_even_if_the_query_is_not(readonly_dsn: str) -> None:
+    """Fix round 1, finding 2: `fetchall` on an uncapped query is unbounded memory.
+
+    The validator caps the outer query, so this only happens if the validator
+    is bypassed — which is precisely the case the executor must survive.
+    """
+    result = run_readonly_query(readonly_dsn, "SELECT campaign_id FROM dim_campaign", max_rows=3)
+    assert len(result.rows) <= 3

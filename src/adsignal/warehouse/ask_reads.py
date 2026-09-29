@@ -10,7 +10,11 @@ Three things live here, in the order they matter:
    that role, inside a transaction that sets `transaction_read_only` and a
    statement timeout. A query that gets past the validator still has to get
    past both of these.
-3. `QueryRefused` is how any database failure reaches the caller: a short
+3. `verify_readonly_dsn` proves, before the first query runs on a DSN, that
+   the connection really is restricted — not a superuser, unable to write to
+   an allowlisted table, unable to read an excluded one. Without it, an admin
+   DSN pasted into the read-only setting would delete control 1 in silence.
+4. `QueryRefused` is how any database failure reaches the caller: a short
    reason and a rule name, never a DSN, a password or driver text.
 
 Nothing here validates SQL — `warehouse.sql_guard` does that, and
@@ -19,6 +23,7 @@ Nothing here validates SQL — `warehouse.sql_guard` does that, and
 the database refuses it on its own.
 """
 
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -36,6 +41,7 @@ from adsignal.warehouse.narrative_store import ensure_narrative_schema
 from adsignal.warehouse.pool import connection
 from adsignal.warehouse.run_log import ensure_run_log_schema
 from adsignal.warehouse.schema import SCHEMA_LOCK_KEY
+from adsignal.warehouse.sql_guard import MAX_ROWS
 
 # The login role generated SQL runs as. One name, used by the DDL below and
 # by whoever writes `ADSIGNAL_POSTGRES_READONLY_DSN`.
@@ -50,6 +56,32 @@ STATEMENT_TIMEOUT = "5s"
 # TABLES IN SCHEMA public` run by someone else would otherwise hand the role
 # pickled estimator bytes and raw embedding vectors.
 EXCLUDED_TABLES = ("model_artifacts", "entity_embeddings")
+
+
+# Asked of the read-only connection before the first query runs on it. A
+# privilege check rather than an attempted write: `has_table_privilege`
+# accounts for superuser status, role membership and default grants, and it
+# touches no row, so verification cannot itself change anything.
+_PRIVILEGE_PROBE = """
+SELECT
+    (SELECT rolsuper FROM pg_roles WHERE rolname = current_user),
+    CASE WHEN to_regclass(%(allowed)s) IS NULL THEN NULL
+         ELSE has_table_privilege(%(allowed)s, 'INSERT, UPDATE, DELETE') END,
+    CASE WHEN to_regclass(%(excluded)s) IS NULL THEN NULL
+         ELSE has_table_privilege(%(excluded)s, 'SELECT') END
+"""
+
+# The table the probe tests for write access (always created by
+# `ensure_schema`) and the one it tests for read access (never granted).
+_PROBE_ALLOWED_TABLE = "dim_campaign"
+_PROBE_EXCLUDED_TABLE = "model_artifacts"
+
+# DSNs already proven restricted, so the probe costs one round trip per DSN
+# per process rather than one per question. Only successes are remembered: a
+# DSN that failed verification must be re-checked, because the fix is a grant
+# change that this process would otherwise never notice.
+_VERIFIED_DSNS: set[str] = set()
+_VERIFY_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,8 +190,73 @@ def readonly_dsn_for(admin_dsn: str, ro_password: str, role: str = READONLY_ROLE
     return psycopg.conninfo.make_conninfo(**info)
 
 
+def verify_readonly_dsn(readonly_dsn: str) -> None:
+    """Prove `readonly_dsn` really is the restricted role, or raise `QueryRefused`.
+
+    Control 1 is a read-only database role. Nothing previously checked that
+    the DSN generated SQL runs on *is* that role: pasting the admin DSN into
+    `ADSIGNAL_POSTGRES_READONLY_DSN` deleted the control silently, and left
+    every other control to hold on its own. A control nobody verifies is a
+    control that might not be there.
+
+    Three ways to fail, any one of which means this is not the read-only
+    role: the connection is a superuser, it can write to an allowlisted
+    table, or it can read one of the excluded ones. The check reads
+    `has_table_privilege` and writes nothing.
+
+    Memoized per DSN after it passes, so a healthy deployment pays one round
+    trip per process.
+    """
+    if readonly_dsn in _VERIFIED_DSNS:
+        return
+
+    try:
+        with connection(readonly_dsn) as conn:
+            row = conn.execute(
+                _PRIVILEGE_PROBE,
+                {"allowed": _PROBE_ALLOWED_TABLE, "excluded": _PROBE_EXCLUDED_TABLE},
+            ).fetchone()
+    except psycopg.Error:
+        raise QueryRefused(
+            "the read-only database connection could not be checked",
+            "readonly_dsn_unverified",
+        ) from None
+
+    if row is None:  # pragma: no cover - a one-row probe always returns a row
+        raise QueryRefused(
+            "the read-only database connection could not be checked",
+            "readonly_dsn_unverified",
+        )
+
+    is_superuser, can_write, can_read_excluded = row
+    if is_superuser or can_write or can_read_excluded:
+        # Deliberately says nothing about which check failed, which role was
+        # used or which host it reached: this text is rendered to whoever
+        # asked a question. The operator's copy of this is the grant itself.
+        raise QueryRefused(
+            "ask is misconfigured: its database connection is not the read-only role",
+            "readonly_dsn_unverified",
+        )
+
+    with _VERIFY_LOCK:
+        _VERIFIED_DSNS.add(readonly_dsn)
+
+
+def forget_verified_dsns() -> None:
+    """Forget which DSNs passed verification. Test-only.
+
+    A test that changes a role's grants mid-session needs the next call to
+    re-probe rather than trust a memo taken before the change.
+    """
+    with _VERIFY_LOCK:
+        _VERIFIED_DSNS.clear()
+
+
 def run_readonly_query(
-    readonly_dsn: str, query: str, statement_timeout: str = STATEMENT_TIMEOUT
+    readonly_dsn: str,
+    query: str,
+    statement_timeout: str = STATEMENT_TIMEOUT,
+    max_rows: int = MAX_ROWS,
 ) -> QueryResult:
     """Run one already-validated statement as the read-only role.
 
@@ -174,7 +271,13 @@ def run_readonly_query(
     This function does **not** validate `query`. Every caller in the
     application validates first; the tests deliberately do not, because a
     control that only works when the validator agrees is not a control.
+
+    `max_rows` bounds the fetch itself. The validator already caps the outer
+    query, so this only bites when the validator was bypassed — which is the
+    one case this function is written to survive, and `fetchall()` on an
+    uncapped query is the API process's memory.
     """
+    verify_readonly_dsn(readonly_dsn)
     try:
         with connection(readonly_dsn) as conn, conn.transaction():
             conn.execute("SET LOCAL transaction_read_only = on")
@@ -183,14 +286,19 @@ def run_readonly_query(
             )
             cursor = conn.execute(query)
             columns = tuple(column.name for column in cursor.description or ())
-            fetched = cursor.fetchall()
+            fetched = cursor.fetchmany(max_rows)
     except psycopg.Error as error:
-        raise _refusal(error) from None
+        raise _refusal(error, statement_timeout) from None
     return QueryResult(columns=columns, rows=[_row_to_dict(columns, row) for row in fetched])
 
 
-def _refusal(error: psycopg.Error) -> QueryRefused:
-    """Translate a driver error into a refusal that carries none of its text."""
+def _refusal(error: psycopg.Error, statement_timeout: str) -> QueryRefused:
+    """Translate a driver error into a refusal that carries none of its text.
+
+    `statement_timeout` is the value this call actually ran with, not the
+    module default: a caller that shortened it must not be told the query
+    survived five seconds when it was cancelled after 250 ms.
+    """
     if isinstance(error, psycopg.errors.InsufficientPrivilege):
         return QueryRefused(
             "the read-only role is not allowed to touch that", "database_permission"
@@ -199,7 +307,7 @@ def _refusal(error: psycopg.Error) -> QueryRefused:
         return QueryRefused("this connection may only read", "database_readonly")
     if isinstance(error, psycopg.errors.QueryCanceled):
         return QueryRefused(
-            f"the query ran longer than {STATEMENT_TIMEOUT} and was cancelled",
+            f"the query ran longer than {statement_timeout} and was cancelled",
             "statement_timeout",
         )
     if isinstance(error, psycopg.errors.UndefinedTable | psycopg.errors.UndefinedColumn):

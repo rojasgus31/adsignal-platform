@@ -37,31 +37,47 @@ def generate_text(
 ) -> str:
     """POST `prompt` to Gemini and return the text, with the key redacted on failure.
 
-    Every exception raised here is a fresh `RuntimeError` with `from None`:
-    httpx puts the request URL in its own exception text, the key travels in
-    that URL as a query parameter, and a chained exception would carry it
-    into the traceback of whatever caught this.
+    Every exception raised here is a fresh `RuntimeError` raised outside the
+    `except` block that recorded it, so neither `__cause__` nor `__context__`
+    links back to the httpx exception. httpx puts the request URL in its own
+    exception text and the key travels in that URL as a query parameter, so
+    an exception chain that reaches it is an exception chain that leaks it.
     """
     url = _ENDPOINT.format(model=model)
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     http = client or httpx.Client(timeout=timeout)
 
+    # The failure is recorded here and raised *below*, outside every `except`
+    # block. `raise ... from None` clears `__cause__` but leaves
+    # `__context__` pointing at the httpx exception whose text contains the
+    # request URL - and the key travels in that URL as a query parameter.
+    # Standard traceback printing honours `__suppress_context__` and hides
+    # it, but anything that walks the chain itself (a structured logger, an
+    # error reporter, a test) can still read the key out of it. Raising with
+    # no exception being handled is what makes `__context__` genuinely None.
+    failure: str | None = None
+    response: httpx.Response | None = None
+
     try:
-        response = http.post(url, params={"key": api_key}, json=payload, timeout=timeout)
-        response.raise_for_status()
-    except httpx.HTTPStatusError as error:
-        raise RuntimeError(
-            f"gemini returned {error.response.status_code} (url REDACTED, key REDACTED)"
-        ) from None
-    except httpx.TimeoutException:
-        raise RuntimeError("gemini request timed out (url REDACTED, key REDACTED)") from None
-    except httpx.ConnectError:
-        raise RuntimeError("gemini connection failed (url REDACTED, key REDACTED)") from None
-    except httpx.HTTPError:
-        raise RuntimeError("gemini request failed (url REDACTED, key REDACTED)") from None
+        try:
+            response = http.post(url, params={"key": api_key}, json=payload, timeout=timeout)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            failure = f"gemini returned {error.response.status_code} (url REDACTED, key REDACTED)"
+        except httpx.TimeoutException:
+            failure = "gemini request timed out (url REDACTED, key REDACTED)"
+        except httpx.ConnectError:
+            failure = "gemini connection failed (url REDACTED, key REDACTED)"
+        except httpx.HTTPError:
+            failure = "gemini request failed (url REDACTED, key REDACTED)"
     finally:
         if client is None:
             http.close()
+
+    if failure is not None:
+        raise RuntimeError(failure)
+    if response is None:  # pragma: no cover - unreachable while failure is None
+        raise RuntimeError("gemini returned no response (url REDACTED, key REDACTED)")
 
     return _extract_text(response.json())
 

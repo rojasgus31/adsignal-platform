@@ -149,13 +149,32 @@ Three independent controls replace it, and each is sufficient on its own.**
    sets `SET LOCAL transaction_read_only = on` and `SET LOCAL
    statement_timeout = '5s'`, so a write slips past nothing and a runaway
    cross join dies on its own.
-3. **A pure validator** (`warehouse/sql_guard.py`, no I/O, tested against
-   stacked statements, comment-hidden payloads, `UNION SELECT` against an
-   excluded table, `pg_read_file`, `LIMIT 100000`, fullwidth-Unicode
-   keywords and writing CTEs). One statement only, opening with `SELECT` or
-   `WITH`; no comments; no writing, administrative or catalog construct; no
-   table outside the allowlist; a `LIMIT` of 200 appended when absent and
-   refused when larger.
+3. **A pure validator** (`warehouse/sql_guard.py`, no I/O). One statement
+   only, opening with `SELECT` or `WITH`; no comments; no writing,
+   administrative or catalog construct; no table outside the allowlist; a
+   `LIMIT` of 200 on the outermost query, refused when larger.
+
+   **It parses with sqlglot rather than matching patterns, because patterns
+   were not enough.** The first implementation was a regex scanner, and
+   review found three inputs that reached `model_artifacts` through it:
+   `FROM "model_artifacts"` (a quoted identifier never matched the FROM
+   pattern), `FROM dim_campaign, model_artifacts` (only the first item
+   follows the word FROM), and a string literal containing
+   `, model_artifacts as (` that registered the name as a trusted CTE. Each
+   was a place where a pattern encoded a guess about SQL's grammar and the
+   guess was wrong; a fourth pattern would have been a fourth guess.
+   **What runs is what the validator understood** — the SQL is rendered back
+   from the parsed tree, so anything sqlglot did not model is absent from
+   what reaches Postgres rather than passing through unexamined. `LIMIT ALL`
+   is the concrete case: the scanner saw the word LIMIT and appended no cap.
+
+**Control 1 is verified, not assumed.** `verify_readonly_dsn` runs before the
+first query on a DSN and refuses to serve `/ask` unless the connection is
+genuinely restricted: not a superuser, unable to write to an allowlisted
+table, unable to read an excluded one. Pasting the admin DSN into
+`ADSIGNAL_POSTGRES_READONLY_DSN` previously deleted control 1 in silence,
+which is the failure mode that turns a validator bug into an exfiltration.
+A control nobody verifies is a control that might not be there.
 
 The allowlist is exactly `fct_campaign_daily`, `dim_campaign`,
 `anomaly_predictions`, `model_metrics`, `pipeline_runs`, `narrative_runs`
@@ -197,6 +216,16 @@ fabricated answer.
 
 The generated SQL is returned to the caller on purpose. A reader who can see
 the query can judge the answer; one who cannot has to trust it.
+
+**What these controls do not cover.** Two residual exposures, both accepted:
+`psycopg_pool` logs a failing connection's host, port and database user (never
+the password), so an operator's log can name the read-only role and the host
+it reached; and `ensure_readonly_role` must send the role's password to
+Postgres as part of a `CREATE ROLE`/`ALTER ROLE` statement, which the server's
+own `log_statement` would record if it were enabled. Neither is reachable from
+an API response. The second is why that DDL does not go through
+`apply_schema`, whose memo would otherwise retain the password in this
+process for the life of the run.
 
 ---
 
