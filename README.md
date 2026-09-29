@@ -85,6 +85,25 @@ vanishes with the job. `python -m adsignal.cli.load_marts` is the step that
 copies the built marts into hosted Postgres, which is what makes the result
 outlive the runner.
 
+**Run the `/ask` bootstrap once per deploy.** The read-only role
+`adsignal_ro` is not created by starting the API — it is created by a
+command, because applying its grants needs the *admin* DSN and the serving
+process must never hold one:
+
+```bash
+ADSIGNAL_POSTGRES_DSN=<admin dsn> \
+ADSIGNAL_POSTGRES_READONLY_DSN=<adsignal_ro dsn> \
+  python -m adsignal.cli.bootstrap_readonly_role
+```
+
+It reads the role name and password out of `ADSIGNAL_POSTGRES_READONLY_DSN`
+itself, applies the grants, and verifies the resulting connection is the
+restricted role. It is idempotent, so it belongs in the deploy hook, not in
+a runbook step someone remembers. Skipping it produces a deployment that
+starts cleanly and then refuses every question with
+`rule: "database_permission"` — the role exists and connects, but holds no
+grant on anything.
+
 Set `ADSIGNAL_TRUSTED_PROXY_HOPS=1` behind Render's edge (it terminates TLS
 and appends the peer it saw to `X-Forwarded-For`). Leave it at `0` anywhere
 the API is reached directly — too high lets a caller forge an address and
@@ -362,9 +381,11 @@ the paid provider has been 404ing every night.
 **Not configured is a first-class state.** With `ADSIGNAL_GEMINI_API_KEY`
 unset (the default here), `/ask` answers 200 with
 `rule: "not_configured"` and an explanation the dashboard renders. It never
-500s and never invents an answer. To switch it on: set the key, run
-`ensure_readonly_role(admin_dsn, password)` once, and point
-`ADSIGNAL_POSTGRES_READONLY_DSN` at the resulting role.
+500s and never invents an answer. To switch it on: set the key, point
+`ADSIGNAL_POSTGRES_READONLY_DSN` at the `adsignal_ro` login, and run
+`python -m adsignal.cli.bootstrap_readonly_role` to apply that role's grants
+(see **Deployment**). Without that last step every question is refused with
+`rule: "database_permission"`.
 
 Because `/ask` does live work per request — now a model call as well as a
 query — it is guarded by a per-IP `TokenBucket`

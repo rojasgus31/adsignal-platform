@@ -186,6 +186,15 @@ ASK_TEST_DSN = os.environ.get(
     "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_ask",
 )
 
+# An eighth, separate database for `test_deploy_bootstrap.py`. Those tests
+# strip every grant off `adsignal_ro` to reproduce a deployment that has
+# never run the bootstrap, and a stripped role would break `ask_client` and
+# `test_ask_reads.py` if they shared a database with it.
+BOOTSTRAP_TEST_DSN = os.environ.get(
+    "ADSIGNAL_BOOTSTRAP_TEST_DSN",
+    "postgresql://adsignal:adsignal@localhost:5432/adsignal_test_bootstrap",
+)
+
 _ensure_test_database(TEST_DSN)
 _ensure_test_database(EMPTY_TEST_DSN)
 _ensure_test_database(DROPPED_TEST_DSN)
@@ -193,6 +202,18 @@ _ensure_test_database(CONCURRENCY_TEST_DSN)
 _ensure_test_database(DB_ONLY_TEST_DSN)
 _ensure_test_database(DIM_TEST_DSN)
 _ensure_test_database(ASK_TEST_DSN)
+_ensure_test_database(BOOTSTRAP_TEST_DSN)
+
+
+# Every client fixture below that is not `ask_client` passes
+# `postgres_readonly_dsn=""` explicitly. `Settings` reads `.env`, and a
+# developer who has configured `/ask` locally has
+# `ADSIGNAL_POSTGRES_READONLY_DSN` in theirs — which these fixtures would
+# otherwise inherit, pointing `/ask` at a database the test never set up and
+# turning `test_no_readonly_dsn_configured_also_degrades_honestly` red on
+# their machine and green in CI. The unconfigured state is part of what these
+# clients are, so they state it.
+_UNCONFIGURED_ASK = ""
 
 
 def _postgres_available(dsn: str) -> bool:
@@ -678,7 +699,9 @@ def db_only_client(_db_only_seed: str):
     sufficient serving source on its own, not just a fallback the loader
     happens to prefer.
     """
-    app = create_app(Settings(postgres_dsn=DB_ONLY_TEST_DSN))
+    app = create_app(
+        Settings(postgres_dsn=DB_ONLY_TEST_DSN, postgres_readonly_dsn=_UNCONFIGURED_ASK)
+    )
     with TestClient(app) as test_client:
         yield test_client
 
@@ -698,7 +721,7 @@ def seeded_narrative(_api_seed: str) -> NarrativeResult:
 @pytest.fixture(scope="module")
 def client(_api_seed: str):
     """A `TestClient` against a `create_app` pointed at the seeded `TEST_DSN`."""
-    app = create_app(Settings(postgres_dsn=TEST_DSN))
+    app = create_app(Settings(postgres_dsn=TEST_DSN, postgres_readonly_dsn=_UNCONFIGURED_ASK))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -767,7 +790,7 @@ def empty_client():
             conn.execute(f"TRUNCATE TABLE {table}")  # noqa: S608
         conn.commit()
 
-    app = create_app(Settings(postgres_dsn=EMPTY_TEST_DSN))
+    app = create_app(Settings(postgres_dsn=EMPTY_TEST_DSN, postgres_readonly_dsn=_UNCONFIGURED_ASK))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -807,7 +830,9 @@ def dropped_tables_client():
             conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")  # noqa: S608
         conn.commit()
 
-    app = create_app(Settings(postgres_dsn=DROPPED_TEST_DSN))
+    app = create_app(
+        Settings(postgres_dsn=DROPPED_TEST_DSN, postgres_readonly_dsn=_UNCONFIGURED_ASK)
+    )
     with TestClient(app) as test_client:
         yield test_client
 

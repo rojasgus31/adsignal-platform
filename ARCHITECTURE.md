@@ -145,6 +145,26 @@ Three independent controls replace it, and each is sufficient on its own.**
    executor. `tests/test_ask_reads.py` opens a connection with this role and
    issues `DROP TABLE dim_campaign` in an ordinary read-write transaction —
    no validator, no read-only transaction — and asserts Postgres refuses it.
+
+   **The grants are applied by a deployment command, not by the API.**
+   `python -m adsignal.cli.bootstrap_readonly_role` reads the admin DSN and
+   the read-only DSN from the environment, takes the role name and password
+   out of the latter, applies the grants and then runs the same privilege
+   probe `/ask` makes before its first query. It is a command rather than a
+   request-time action because applying grants needs the admin DSN, and the
+   serving process holding one would delete the point of the role. It is
+   idempotent and belongs in the deploy hook.
+
+   Nothing in `src/` called `ensure_readonly_role` until that command
+   existed; only `tests/conftest.py` did. Every test of the role passed
+   while a real deployment refused every question with
+   `rule: "database_permission"`, because the fixture was doing the
+   deployment's job. `tests/test_deploy_bootstrap.py` is the test that
+   closes that: it strips the role's grants, asks a question and asserts the
+   refusal, runs only the documented command, and asserts the same question
+   is answered. `tests/test_wiring.py` is the general guard — a written-down
+   list of functions that shipped code must call, checked against every call
+   expression under `src/`.
 2. **A read-only transaction with a 5 s statement timeout, pinned parsing
    settings, and the extended query protocol.** Every execution sets `SET LOCAL transaction_read_only =
    on` and `SET LOCAL statement_timeout = '5s'`, so a write slips past

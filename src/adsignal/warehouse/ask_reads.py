@@ -293,6 +293,28 @@ def readonly_dsn_for(admin_dsn: str, ro_password: str, role: str = READONLY_ROLE
     return psycopg.conninfo.make_conninfo(**info)
 
 
+def readonly_credentials(readonly_dsn: str) -> tuple[str, str]:
+    """The role name and password `readonly_dsn` logs in with.
+
+    `cli.bootstrap_readonly_role` grants to the role a deployment actually
+    connects as, rather than to a name and password passed separately: one
+    DSN is the single source of both, so the grants cannot land on a
+    different role than `/ask` uses, and a deployment needs no environment
+    variable beyond the DSN it already sets.
+
+    Raises `ValueError` naming which field is missing. The message never
+    carries the DSN or any part of it, because the caller prints it.
+    """
+    info = psycopg.conninfo.conninfo_to_dict(readonly_dsn)
+    role = info.get("user")
+    password = info.get("password")
+    if not isinstance(role, str) or not role:
+        raise ValueError("the read-only DSN names no user")
+    if not isinstance(password, str) or not password:
+        raise ValueError("the read-only DSN carries no password")
+    return role, password
+
+
 def verify_readonly_dsn(readonly_dsn: str) -> None:
     """Prove `readonly_dsn` really is the restricted role, or raise `QueryRefused`.
 
