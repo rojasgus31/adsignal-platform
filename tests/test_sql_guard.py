@@ -621,3 +621,38 @@ def test_a_genuine_unit_keyword_is_left_alone() -> None:
     assert "WEEK" in validate_sql("SELECT EXTRACT(week FROM event_date) FROM fct_campaign_daily")
     trunc = validate_sql("SELECT date_trunc('month', event_date) FROM fct_campaign_daily")
     assert "'MONTH'" in trunc
+
+
+# Fix round 6. `_requoted` makes a trade that cannot be avoided, so the trade
+# is pinned here rather than left to a future round to revert by accident.
+
+
+def test_a_bare_column_origin_is_rewritten_into_a_literal() -> None:
+    """The traded case, stated as a test so it cannot change silently.
+
+    sqlglot parses `date_bin('1 week', ts, 'event_date')` and
+    `date_bin('1 week', ts, event_date)` into the *same* node, so no rule can
+    tell a string literal from a bare column reference in that position.
+    Treating it as a literal is the deliberate choice: it makes the literal
+    case correct and the bare-column case a refusal at Postgres, and a
+    refusal beats the silent wrong answer the other direction produced.
+
+    This query was accepted and correct before fix round 5 and is a refusal
+    after it. `tests/test_ask_reads.py` asserts the database end of that.
+    """
+    safe = validate_sql(
+        "SELECT date_bin('1 week', event_date, event_date) AS b FROM fct_campaign_daily"
+    )
+    assert "'EVENT_DATE'" in safe
+
+
+def test_extract_keeps_its_bare_unit_word() -> None:
+    """`DateBin` is not the only node rendering a `Var` bare, only the one rewritten.
+
+    `date_part('week', d)` becomes `EXTRACT(WEEK FROM d)`, where the bare word
+    is a unit name rather than a column reference — so it is meaning-
+    preserving and must be left alone.
+    """
+    safe = validate_sql("SELECT date_part('week', event_date) FROM fct_campaign_daily")
+    assert "EXTRACT(WEEK FROM" in safe
+    assert "'WEEK'" not in safe

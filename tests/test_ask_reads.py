@@ -29,6 +29,7 @@ from adsignal.warehouse.ask_reads import (
     run_readonly_query,
     verify_readonly_dsn,
 )
+from adsignal.warehouse.ask_schema import ALLOWED_TABLES
 from adsignal.warehouse.loader import ensure_schema as ensure_mart_schema
 from adsignal.warehouse.metrics_store import ensure_ml_schema
 from adsignal.warehouse.sql_guard import validate_sql
@@ -115,8 +116,12 @@ def _password_of(dsn: str) -> str:
     `test_a_refusal_carries_no_dsn_no_password_and_no_driver_text`.
     """
     password = psycopg.conninfo.conninfo_to_dict(dsn)["password"]
-    assert isinstance(password, str)
-    return password
+    # Reduced to a boolean before asserting, for the same reason the callers
+    # do: pytest renders a failing assert's operands by value, and this one
+    # holds the raw password.
+    is_a_string = isinstance(password, str)
+    assert is_a_string, "the DSN carried no password to check against"
+    return str(password)
 
 
 def _table_exists(table: str) -> bool:
@@ -565,3 +570,63 @@ def test_a_jsonb_object_reaches_the_client_as_a_mapping(readonly_dsn: str) -> No
         readonly_dsn, "SELECT jsonb_build_object('a', 1) AS obj FROM dim_campaign LIMIT 1"
     )
     assert result.rows[0]["obj"] == {"a": 1}
+
+
+# Fix round 6.
+
+# Bare words Postgres accepts as datetime constants. A bare-column origin in
+# `date_bin` is rewritten to a quoted string by `sql_guard._requoted` and then
+# fails the cast — unless the column happens to be named one of these, in
+# which case it would cast successfully and silently answer the wrong
+# question. Today no allowlisted table has such a column; this list is here so
+# that stays true by test rather than by luck.
+_DATETIME_SPECIAL_NAMES = frozenset(
+    {"epoch", "today", "now", "yesterday", "tomorrow", "allballs", "infinity"}
+)
+
+
+def test_no_allowlisted_column_is_named_like_a_datetime_constant(readonly_dsn: str) -> None:
+    """Closes the silent-wrong-answer path by enforcement rather than by luck.
+
+    `date_bin('1 week', ts, some_column)` is rewritten to
+    `date_bin('1 week', ts, 'SOME_COLUMN')` — see `sql_guard._requoted` for
+    why that trade is unavoidable — and Postgres then rejects the cast. That
+    refusal is what keeps the rewrite safe. If an allowlisted table ever gains
+    a column called `epoch`, `today`, `now`, `yesterday`, `tomorrow`,
+    `allballs` or `infinity`, the cast starts succeeding and the query
+    silently answers something else.
+
+    Do not delete this test because it looks like it asserts nothing: what it
+    asserts is that a schema change cannot quietly re-open that path.
+    """
+    with psycopg.connect(ASK_TEST_DSN) as conn:
+        columns = conn.execute(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = ANY(%s)",
+            (sorted(ALLOWED_TABLES),),
+        ).fetchall()
+    assert columns, "no allowlisted table was found, so this test proved nothing"
+    collisions = [
+        f"{table}.{column}"
+        for table, column in columns
+        if column.lower() in _DATETIME_SPECIAL_NAMES
+    ]
+    assert collisions == [], (
+        f"{collisions} would cast as a datetime constant, so a bare-column "
+        "date_bin origin would silently answer the wrong question"
+    )
+
+
+def test_a_bare_column_date_bin_origin_is_refused_by_the_database(readonly_dsn: str) -> None:
+    """The other end of the trade `sql_guard._requoted` makes.
+
+    Accepted and correct before fix round 5; a refusal after it. Pinning it
+    here means a future change to `_requoted` cannot revert the trade without
+    a test going red.
+    """
+    approved = validate_sql(
+        "SELECT date_bin('1 week', event_date, event_date) AS b FROM fct_campaign_daily"
+    )
+    with pytest.raises(QueryRefused) as refused:
+        run_readonly_query(readonly_dsn, approved)
+    assert refused.value.rule in ("invalid_query", "database_error", "undefined")

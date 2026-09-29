@@ -237,18 +237,39 @@ def test_truncated_sql_from_the_model_is_a_refusal_not_a_500(ask_client) -> None
 
 
 def test_an_unexpected_exception_is_still_a_two_hundred(ask_client) -> None:
-    """The catch-all, tested through something no rule anticipates."""
+    """The route's catch-all, exercised for real.
 
-    class _Exploding:
+    The first version of this test installed a `SqlGenerator` wrapping a
+    provider that raised — but `SqlGenerator` converts any provider failure
+    into `SqlGenerationFailed`, which `_answer` handles itself, so the
+    catch-all was never reached and the assertion
+    `rule in ("generation_failed", "unexpected_error")` only ever took the
+    first branch. A disjunction that always resolves the same way is a
+    vacuous assertion wearing a specific name.
+
+    This installs a generator that is not a `SqlGenerator`, so the exception
+    leaves `_answer` unconverted and only the catch-all can stop it.
+    """
+
+    class _Unwrapped:
+        """Duck-typed like `SqlGenerator`, but nothing catches what it raises."""
+
         name = "stub"
 
-        def generate_sql(self, request: SqlQuestion) -> str:
-            raise MemoryError("not enough memory")
+        def generate(self, request: SqlQuestion) -> object:
+            raise MemoryError("not enough memory for postgresql://u:p@h/db")
 
-    ask_client.app.state.sql_generator = SqlGenerator(_Exploding())
-    body = _ask(ask_client, "anything")
-    assert body["rule"] in ("generation_failed", "unexpected_error")
+    ask_client.app.state.sql_generator = _Unwrapped()
+    response = ask_client.post("/ask", json={"question": "anything at all"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["rule"] == "unexpected_error"
     assert body["rows"] == []
+    assert body["sql"] is None
+    # The exception's own text carried a DSN. None of it may be echoed.
+    assert "postgresql://" not in response.text
+    assert "MemoryError" not in response.text
 
 
 def test_a_deeply_nested_query_is_a_refusal_not_a_500(ask_client) -> None:

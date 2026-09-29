@@ -285,30 +285,38 @@ def _requoted(statement: exp.Query) -> exp.Query:
     refused it, correctly — but the query was ordinary and the renderer was
     at fault, so a refusal was the wrong answer to give the user.
 
-    Two cases, and the first version fixed only one of them.
+    **The two forms are indistinguishable after parsing, and this function
+    chooses one.** sqlglot parses `date_bin('1 week', ts, 'event_date')` and
+    `date_bin('1 week', ts, event_date)` — a string literal and a bare column
+    reference — into the *same* node: `Var('EVENT_DATE')` under `unit`, with
+    a `DateBin` parent. Nothing in the tree distinguishes them, so no rule
+    here can get both right. Round 4 treated the position as a column and got
+    the literal case wrong (the literal silently became a column reference and
+    Postgres returned a row). This version treats the position as a literal,
+    which gets the literal case right and makes a bare-column origin a
+    refusal: it renders as `'EVENT_DATE'`, and Postgres rejects the cast.
 
-    **Not identifier-shaped** (`'2024-01-01'`): renders as the arithmetic
-    `2024 - 01 - 01`, so the round-trip check refused it. Fail-closed, and a
-    refusal was the wrong answer to an ordinary query.
+    That is the deliberate direction. A refusal is a worse answer than a
+    correct one and a far better outcome than a wrong one, and the wrong
+    answer in the other direction was silent — round-trip and fixed-point
+    cannot see it, because the rendering is stable and the table set is
+    unchanged.
 
-    **Identifier-shaped** (`'event_date'`): renders as the bare word
-    `EVENT_DATE`, which Postgres reads as a **column reference**. It ran and
-    returned a row. Round-trip and fixed-point cannot see this one — the
-    rendering is stable and the table set is unchanged — so it was fail-open,
-    and it is the reason this function is now positional rather than
-    shape-based.
+    The other half of the job is unambiguous and is not a trade: a `Var`
+    whose text is not a valid identifier (`'2024-01-01'`) can only have come
+    from a string literal, and rendering it bare produced the arithmetic
+    `2024 - 01 - 01`, which the round-trip check refused. Quoting it is a
+    plain repair of a rendering defect.
 
-    `date_bin`'s third argument is an origin *timestamp*, never a bare word,
-    and `exp.DateBin` is the only node sqlglot renders a `Var` bare from
-    (`DATE_TRUNC` quotes its unit; `EXTRACT(week FROM …)` genuinely is a bare
-    word and is left alone). So a `Var` in that position is always a string
-    literal and is always put back as one.
+    **Case is not preserved and cannot be.** sqlglot upper-cases the token
+    while tokenising, so the original text is gone before this runs. For a
+    date or timestamp origin that changes nothing.
 
-    **Case is not preserved**, and cannot be: sqlglot upper-cases the token
-    while tokenising, so the literal is gone before this runs. For the only
-    legal content of that argument — a date or timestamp — upper-casing
-    changes nothing, and anything else fails the cast at Postgres rather than
-    meaning something different.
+    `DateBin` is not the only node sqlglot renders a `Var` bare from —
+    `Extract` does too, reachable as `date_part('week', d)` → `EXTRACT(WEEK
+    FROM d)`. That one is left alone and is meaning-preserving: Postgres's
+    EXTRACT field is a unit name, not a column reference, so a bare word
+    there is what was meant. Only `DateBin` is rewritten.
 
     Applied inside `_analyse`, so both passes normalise identically —
     otherwise the rendering would be re-parsed back into a `Var` and the
