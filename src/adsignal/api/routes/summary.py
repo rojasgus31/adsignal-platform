@@ -28,15 +28,20 @@ from adsignal.api.deps import (
     get_summary_rate_limiter,
 )
 from adsignal.api.ratelimit import TokenBucket
-from adsignal.api.schemas import CampaignSummaryOut
+from adsignal.api.schemas import CampaignSummaryOut, PortfolioSummaryOut
 from adsignal.config import Settings
 from adsignal.narrative.campaign_summary import (
-    CampaignFacts,
     build_campaign_prompt,
     summarize_campaign,
 )
+from adsignal.narrative.portfolio_summary import (
+    PortfolioFacts,
+    build_portfolio_prompt,
+    summarize_portfolio,
+)
 from adsignal.narrative.providers.gemini import generate_text
 from adsignal.warehouse.campaign_summary_reads import read_campaign_facts
+from adsignal.warehouse.portfolio_summary_reads import read_portfolio_facts
 
 router = APIRouter(tags=["campaigns"])
 
@@ -58,11 +63,13 @@ SUMMARY_CACHE_CAPACITY = 256
 LOCAL_PROVIDER = "stub"
 
 
-def _written_by_model(facts: CampaignFacts, settings: Settings) -> tuple[str, str] | None:
+def _written_by_model(prompt: str, settings: Settings) -> tuple[str, str] | None:
     """Return `(text, provider)` from the model, or `None` to fall back.
 
-    Every failure returns `None` rather than raising: a summary is a nicety
-    and the local one is genuinely good, so a model outage must degrade the
+    Takes a built prompt rather than a facts object so the campaign and
+    portfolio summaries share one key check, one timeout and one failure
+    policy. Every failure returns `None` rather than raising: a summary is a
+    nicety and the local one is genuinely good, so a model outage degrades the
     paragraph rather than the page. Nothing about the failure reaches the
     caller, because a provider exception can carry a key-bearing URL.
     """
@@ -71,7 +78,7 @@ def _written_by_model(facts: CampaignFacts, settings: Settings) -> tuple[str, st
         return None
     try:
         text = generate_text(
-            build_campaign_prompt(facts),
+            prompt,
             api_key=key,
             model=settings.gemini_model,
             timeout=settings.narrative_timeout_seconds,
@@ -103,7 +110,7 @@ def get_campaign_summary(
     if cached is not None:
         return cached
 
-    written = _written_by_model(facts, settings)
+    written = _written_by_model(build_campaign_prompt(facts), settings)
     text, provider = written if written is not None else (summarize_campaign(facts), LOCAL_PROVIDER)
 
     response = CampaignSummaryOut(
@@ -120,4 +127,56 @@ def get_campaign_summary(
         escalated_days=facts.escalated_days,
     )
     cache.put(campaign_id, response)
+    return response
+
+
+#: The whole warehouse is one thing, so one cache entry serves every caller.
+PORTFOLIO_CACHE_KEY = "__portfolio__"
+
+
+@router.get("/summary", response_model=PortfolioSummaryOut)
+def get_portfolio_summary(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    rate_limiter: TokenBucket = Depends(get_summary_rate_limiter),
+    cache: TtlCache[Any] = Depends(get_summary_cache),
+) -> PortfolioSummaryOut:
+    """Summarise every campaign at once. 404 on a warehouse with no rows.
+
+    Shares the campaign summary's limiter and cache: both spend from the same
+    model quota, and a reader who has just generated five campaign summaries
+    should not also get a free portfolio one.
+    """
+    if not rate_limiter.allow(client_key(request, settings.trusted_proxy_hops)):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+    facts: PortfolioFacts | None = read_portfolio_facts(settings.postgres_dsn)
+    if facts is None:
+        raise HTTPException(status_code=404, detail="no campaign data to summarise")
+
+    cached: PortfolioSummaryOut | None = cache.get(PORTFOLIO_CACHE_KEY)
+    if cached is not None:
+        return cached
+
+    written = _written_by_model(build_portfolio_prompt(facts), settings)
+    text, provider = (
+        written if written is not None else (summarize_portfolio(facts), LOCAL_PROVIDER)
+    )
+
+    response = PortfolioSummaryOut(
+        text=text,
+        provider=provider,
+        campaign_count=facts.campaign_count,
+        channel_count=facts.channel_count,
+        first_day=facts.first_day,
+        last_day=facts.last_day,
+        days=facts.days,
+        spend=facts.spend,
+        revenue=facts.revenue,
+        conversions=facts.conversions,
+        flagged_days=facts.flagged_days,
+        escalated_days=facts.escalated_days,
+        worst_campaign=facts.worst_campaign,
+    )
+    cache.put(PORTFOLIO_CACHE_KEY, response)
     return response

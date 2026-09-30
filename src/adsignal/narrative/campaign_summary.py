@@ -55,13 +55,17 @@ class CampaignFacts:
         return self.spend / self.conversions if self.conversions > 0 else None
 
 
-def _money(value: float) -> str:
-    """Whole dollars with separators. Prompts and prose share one format."""
+def money(value: float) -> str:
+    """Whole dollars with separators. Prompts and prose share one format.
+
+    Public because `portfolio_summary` writes the same figures the same way,
+    and two summaries that format spend differently read as two systems.
+    """
     return f"${value:,.0f}"
 
 
-def _humanize(cause: str) -> str:
-    """`budget_pacing` -> `budget pacing`."""
+def humanize_cause(cause: str) -> str:
+    """`budget_pacing` -> `budget pacing`. Shared for the reason `money` is."""
     return cause.replace("_", " ")
 
 
@@ -72,9 +76,9 @@ def build_campaign_prompt(facts: CampaignFacts) -> str:
     model shown two similar counts reliably conflates them, and the sentence
     that comes back claims the detector found every planted problem.
     """
-    causes = ", ".join(_humanize(cause) for cause in facts.top_causes) or "none recorded"
+    causes = ", ".join(humanize_cause(cause) for cause in facts.top_causes) or "none recorded"
     cpa = facts.cost_per_conversion
-    cpa_line = _money(cpa) if cpa is not None else "not applicable, no conversions"
+    cpa_line = money(cpa) if cpa is not None else "not applicable, no conversions"
     return (
         "You are summarising one advertising campaign's performance for a "
         "marketing executive. Write two or three plain sentences. Say how the "
@@ -84,7 +88,7 @@ def build_campaign_prompt(facts: CampaignFacts) -> str:
         f"Channel: {facts.channel}\n"
         f"Ran from {facts.first_day.isoformat()} to {facts.last_day.isoformat()} "
         f"({facts.days} days with figures)\n"
-        f"Total spend: {_money(facts.spend)}\n"
+        f"Total spend: {money(facts.spend)}\n"
         f"Total conversions: {facts.conversions}\n"
         f"Cost per conversion: {cpa_line}\n"
         f"Days the detector flagged as unusual: {facts.flagged_days}\n"
@@ -105,19 +109,19 @@ def summarize_campaign(facts: CampaignFacts) -> str:
     span = f"over {facts.days} day{'' if facts.days == 1 else 's'}"
     sentences.append(
         f"{facts.campaign_name} ran on {facts.channel} {span}, "
-        f"spending {_money(facts.spend)} for {facts.conversions:,} "
+        f"spending {money(facts.spend)} for {facts.conversions:,} "
         f"conversion{'' if facts.conversions == 1 else 's'}."
     )
 
     cpa = facts.cost_per_conversion
     if cpa is not None:
-        sentences.append(f"That is {_money(cpa)} per conversion.")
+        sentences.append(f"That is {money(cpa)} per conversion.")
 
     if facts.flagged_days == 0:
         sentences.append("The detector flagged none of its days as unusual.")
     else:
         days = f"{facts.flagged_days} day{'' if facts.flagged_days == 1 else 's'}"
-        causes = ", ".join(_humanize(cause) for cause in facts.top_causes)
+        causes = ", ".join(humanize_cause(cause) for cause in facts.top_causes)
         tail = f" The most common causes were {causes}." if causes else ""
         sentences.append(f"The detector flagged {days} as unusual.{tail}")
 

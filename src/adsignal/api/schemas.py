@@ -238,3 +238,27 @@ class CampaignSummaryOut(BaseModel):
     conversions: int
     flagged_days: int
     escalated_days: int
+
+
+class PortfolioSummaryOut(BaseModel):
+    """Prose about every campaign at once, plus the figures behind it.
+
+    The whole-warehouse sibling of `CampaignSummaryOut`. The figures travel
+    with the text for the same reason: a summary a reader cannot check is a
+    summary they have to trust.
+    """
+
+    text: str
+    provider: str
+    """Who wrote it: a model's name, or `stub` when composed locally."""
+    campaign_count: int
+    channel_count: int
+    first_day: date
+    last_day: date
+    days: int
+    spend: float
+    revenue: float
+    conversions: int
+    flagged_days: int
+    escalated_days: int
+    worst_campaign: str

@@ -1,3 +1,5 @@
+from datetime import date
+
 from fastapi.testclient import TestClient
 
 from adsignal.warehouse.paging import (
@@ -418,3 +420,31 @@ def test_campaign_summary_is_empty_not_an_error_on_a_fresh_database(empty_client
     must not surface as a server fault.
     """
     assert empty_client.get("/campaigns/anything/summary").status_code == 404
+
+
+def test_portfolio_summary_runs_its_sql_and_answers(client) -> None:
+    """The whole-warehouse query, against real tables.
+
+    The campaign summary's SQL shipped broken because only its prose was
+    tested. This one counts DISTINCT event_date rather than rows, which is
+    the equivalent trap: the mart holds one row per campaign-day, so COUNT(*)
+    would report tens of thousands of "days" for a two-year window.
+    """
+    response = client.get("/summary")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["text"].strip() != ""
+    assert body["provider"] == "stub"
+    assert body["campaign_count"] >= 1
+    assert body["first_day"] <= body["last_day"]
+    # Days are calendar days, never campaign-days: the second would exceed the
+    # span between the two dates, which is the bug this pins.
+    span = (date.fromisoformat(body["last_day"]) - date.fromisoformat(body["first_day"])).days + 1
+    assert 1 <= body["days"] <= span
+    assert body["escalated_days"] <= body["flagged_days"]
+
+
+def test_portfolio_summary_is_404_not_500_on_a_fresh_database(empty_client) -> None:
+    """A warehouse with no rows has nothing to summarise, and must say so."""
+    assert empty_client.get("/summary").status_code == 404
