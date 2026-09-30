@@ -319,13 +319,17 @@ def test_a_provider_error_the_model_layer_did_not_write_is_still_typed_only() ->
     assert str(failed.value) == "gemini could not answer (ValueError)"
 
 
-# --- the single retry on an intermittent 503 -------------------------------
+# --- the single retry, on an intermittent 503 or a timeout -----------------
 #
 # Gemini's free tier returns 503 at roughly one call in twelve, measured six
 # calls apart through `GeminiSqlProvider`. The owner met three in a row and
-# concluded the feature was broken. One retry takes a user-visible failure
-# from ~8% to under 1%; the cost is bounded because a 503 arrives fast and
-# nothing else is retried.
+# concluded the feature was broken.
+#
+# Timeouts were later measured far worse: one call in three exceeded the old
+# 20 s budget while the others answered in 5 and 6.5 s, so a third of asks
+# spent twenty seconds to fail. The budget dropped to 12 s and the timeout
+# joined the retry. A 4xx still is not retried: it is a real answer about a
+# real problem, and waiting again changes nothing.
 
 
 class _SequenceProvider:
@@ -400,10 +404,39 @@ def test_no_status_other_than_503_is_retried(status: int) -> None:
     assert "retried once" not in str(failed.value)
 
 
-def test_a_timeout_is_not_retried() -> None:
-    """A second full wait is worse for the caller than a fast refusal."""
+def test_a_timeout_is_retried_once() -> None:
+    """Reverses an earlier ruling, on measurement.
+
+    A timeout used to fail immediately, on the reasoning that a second full
+    wait is worse than a fast refusal. That held while one attempt cost the
+    whole 20 s budget. Measured, a third of calls timed out and the rest
+    answered in under 7 s, so the old behaviour spent twenty seconds to fail
+    on a model that is usually fast. The per-attempt budget is now 12 s and
+    this is the retry.
+    """
+    timeout = ProviderUnavailable(
+        "gemini request timed out (url REDACTED, key REDACTED)", cause="timeout"
+    )
+    provider = _SequenceProvider(timeout, "SELECT 1")
+    assert _generator(provider).generate(QUESTION).sql == "SELECT 1"
+    assert provider.calls == 2
+
+
+def test_two_timeouts_are_a_refusal_that_says_it_was_retried() -> None:
+    timeout = ProviderUnavailable(
+        "gemini request timed out (url REDACTED, key REDACTED)", cause="timeout"
+    )
+    provider = _SequenceProvider(timeout, timeout)
+    with pytest.raises(SqlGenerationFailed) as failed:
+        _generator(provider).generate(QUESTION)
+    assert provider.calls == 2
+    assert "retried once" in str(failed.value)
+
+
+def test_a_transport_failure_that_is_not_a_timeout_is_not_retried() -> None:
+    """A refused connection is not a slow model; waiting again changes nothing."""
     provider = _SequenceProvider(
-        ProviderUnavailable("gemini request timed out (url REDACTED, key REDACTED)")
+        ProviderUnavailable("gemini could not be reached (url REDACTED)", cause="unreachable")
     )
     with pytest.raises(SqlGenerationFailed):
         _generator(provider).generate(QUESTION)

@@ -73,14 +73,23 @@ question. If the tables can answer it even partially, write the query.
 # conclude the feature is broken, which is what happened to this project's
 # owner.
 #
-# **Only 503, and only once.** A 4xx is a real answer about a real problem —
-# a retired model, a rejected key, an exhausted quota — and retrying it hides
-# the diagnosis behind a delay while changing nothing. A timeout is not
-# retried either: a second full wait is worse for the caller than a fast
-# refusal, and it is the one failure mode that would genuinely double this
-# endpoint's worst case. Restricting the retry to a status the server
-# actually returned keeps the added latency to one fast round trip plus the
-# backoff, because a 503 arrives quickly by definition.
+# **A 4xx is never retried.** It is a real answer about a real problem — a
+# retired model, a rejected key, an exhausted quota — and retrying it hides
+# the diagnosis behind a delay while changing nothing.
+#
+# **A timeout now is**, reversing the decision this comment used to record.
+# That decision said a second full wait is worse for the caller than a fast
+# refusal, and it was right about the endpoint as it then stood, where one
+# attempt used the whole 20 s budget. It was wrong about how often a timeout
+# happens: measured against `gemini-3.5-flash-lite`, one call in three
+# exceeded 20 s while the other two answered in 5 and 6.5 s. So the old
+# behaviour spent twenty seconds to fail, a third of the time, on a model
+# that is usually fast.
+#
+# The budget moved with the policy. `ask_timeout_seconds` is 12 s, which
+# covers every healthy call measured, so the worst case is 12 + 0.5 + 12 and
+# barely exceeds the 20 s a single attempt used to cost — while most of those
+# one-in-three failures now come back with an answer instead.
 RETRY_STATUS = 503
 RETRY_BACKOFF_SECONDS = 0.5
 
@@ -231,14 +240,17 @@ class SqlGenerator:
 
 
 def _is_retriable(error: Exception) -> bool:
-    """Whether this failure is the intermittent 503 worth one more attempt.
+    """Whether this failure is worth one more attempt: an intermittent 503, or
+    a timeout.
 
-    Reads `ProviderUnavailable.status`, which the provider set from the
-    response, rather than matching on the message. A retry predicate that
-    parses prose breaks the first time the prose is reworded, and this one
-    decides whether a user waits.
+    Reads `ProviderUnavailable.status` and `.cause`, both set by the branch in
+    the provider that caught the failure, rather than matching on the message.
+    A retry predicate that parses prose breaks the first time the prose is
+    reworded, and this one decides whether a user waits.
     """
-    return isinstance(error, ProviderUnavailable) and error.status == RETRY_STATUS
+    if not isinstance(error, ProviderUnavailable):
+        return False
+    return error.status == RETRY_STATUS or error.cause == "timeout"
 
 
 def _breaker_open_reason(provider_name: str) -> str:
@@ -328,9 +340,7 @@ def build_sql_generator(settings: Settings) -> SqlGenerator | None:
     if not key:
         return None
     return SqlGenerator(
-        GeminiSqlProvider(
-            key, model=settings.gemini_model, timeout=settings.narrative_timeout_seconds
-        )
+        GeminiSqlProvider(key, model=settings.gemini_model, timeout=settings.ask_timeout_seconds)
     )
 
 

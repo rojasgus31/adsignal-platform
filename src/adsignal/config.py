@@ -127,6 +127,14 @@ class Settings(BaseSettings):
     change on a running deployment, not a code edit and a rebuild.
     """
     narrative_timeout_seconds: float = 20.0
+
+    # `/ask` gets its own, shorter budget, because it is the one model call a
+    # person waits on. Measured against `gemini-3.5-flash-lite`: a healthy
+    # answer arrives in 5 to 7 seconds, and the slow tail runs past 20. Twelve
+    # covers every healthy call with room over and turns the tail into a fast
+    # failure that `sqlgen` retries, instead of one long wait that does not.
+    # The nightly narrative keeps the longer budget: nobody is watching it.
+    ask_timeout_seconds: float = 12.0
     # The chain's total deadline across every provider, distinct from the
     # per-provider timeout above: four providers each allowed 20 s can stall
     # the nightly job for 80 s or more without this. See `NarrativeChain`.
