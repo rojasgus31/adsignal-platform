@@ -28,6 +28,7 @@ from adsignal.api.routes import (
     operations,
     score,
     search,
+    summary,
 )
 from adsignal.api.routes.ask import (
     ASK_CACHE_CAPACITY,
@@ -42,6 +43,12 @@ from adsignal.api.routes.score import (
 from adsignal.api.routes.search import (
     SEARCH_RATE_LIMIT_CAPACITY,
     SEARCH_RATE_LIMIT_REFILL_PER_SECOND,
+)
+from adsignal.api.routes.summary import (
+    SUMMARY_CACHE_CAPACITY,
+    SUMMARY_CACHE_TTL_SECONDS,
+    SUMMARY_RATE_LIMIT_CAPACITY,
+    SUMMARY_RATE_LIMIT_REFILL_PER_SECOND,
 )
 from adsignal.config import Settings
 from adsignal.ml.embeddings import EmbeddingModel
@@ -87,6 +94,13 @@ def install_request_runtime(app: FastAPI) -> None:
     app.state.score_rate_limiter = TokenBucket(
         capacity=SCORE_RATE_LIMIT_CAPACITY,
         refill_per_second=SCORE_RATE_LIMIT_REFILL_PER_SECOND,
+    )
+    app.state.summary_rate_limiter = TokenBucket(
+        capacity=SUMMARY_RATE_LIMIT_CAPACITY,
+        refill_per_second=SUMMARY_RATE_LIMIT_REFILL_PER_SECOND,
+    )
+    app.state.summary_cache = TtlCache[Any](
+        capacity=SUMMARY_CACHE_CAPACITY, ttl_seconds=SUMMARY_CACHE_TTL_SECONDS
     )
 
 
@@ -145,5 +159,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(score.router)
     app.include_router(ask.router)
+    app.include_router(summary.router)
 
     return app

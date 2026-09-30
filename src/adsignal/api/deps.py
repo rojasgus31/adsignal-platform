@@ -85,3 +85,15 @@ def get_scoring_models(request: Request) -> ScoringModelHolder:
     """Return the holder for this app's one shared detector/triage pair."""
     holder: ScoringModelHolder = request.app.state.scoring_models
     return holder
+
+
+def get_summary_rate_limiter(request: Request) -> TokenBucket:
+    """Return the `TokenBucket` bounding campaign summaries for this app."""
+    bucket: TokenBucket = request.app.state.summary_rate_limiter
+    return bucket
+
+
+def get_summary_cache(request: Request) -> TtlCache[Any]:
+    """Return the bounded cache campaign summaries are served from."""
+    cache: TtlCache[Any] = request.app.state.summary_cache
+    return cache

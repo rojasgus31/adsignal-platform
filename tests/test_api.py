@@ -377,3 +377,44 @@ def test_each_collection_declares_the_page_default_its_own_reader_uses(client) -
     assert DEFAULT_RUN_PAGE_LIMIT == 50
     assert DEFAULT_SERVING_PAGE_LIMIT == 100
     assert MAX_PAGE_LIMIT == 500
+
+
+def test_campaign_summary_runs_its_sql_and_answers(client) -> None:
+    """The endpoint's real query, against real tables.
+
+    This exists because the prose and the prompt were unit tested and the SQL
+    was not, and the SQL is where the bug was: `fct_campaign_daily` has its
+    own `channel` column, so grouping by the SELECT alias was ambiguous and
+    Postgres refused it. Every assertion below would have passed against a
+    mocked read.
+    """
+    campaigns = client.get("/campaigns").json()
+    assert campaigns, "the seeded fixture should hold at least one campaign"
+    campaign_id = campaigns[0]["campaign_id"]
+
+    response = client.get(f"/campaigns/{campaign_id}/summary")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["campaign_id"] == campaign_id
+    assert body["text"].strip() != ""
+    # No key is configured for this app, so the local writer answered.
+    assert body["provider"] == "stub"
+    assert body["days"] >= 1
+    assert body["first_day"] <= body["last_day"]
+    # Counts are counts, never null: a missing prediction row is zero.
+    assert body["flagged_days"] >= 0
+    assert body["escalated_days"] <= body["flagged_days"]
+
+
+def test_campaign_summary_404s_for_an_unknown_campaign(client) -> None:
+    assert client.get("/campaigns/no_such_campaign/summary").status_code == 404
+
+
+def test_campaign_summary_is_empty_not_an_error_on_a_fresh_database(empty_client) -> None:
+    """A database the pipeline has never touched has no campaign to summarise.
+
+    404, never 500: the tables may not exist at all, and a missing relation
+    must not surface as a server fault.
+    """
+    assert empty_client.get("/campaigns/anything/summary").status_code == 404

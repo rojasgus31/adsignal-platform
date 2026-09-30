@@ -216,3 +216,25 @@ class ScoreOut(BaseModel):
     confidence: float | None = None
     severity: int | None = None
     escalate: bool | None = None
+
+
+class CampaignSummaryOut(BaseModel):
+    """Prose about one campaign's whole run, plus the figures behind it.
+
+    The figures travel with the text so the dashboard can show what the
+    paragraph was written from. A summary a reader cannot check is a summary
+    they have to trust.
+    """
+
+    campaign_id: str
+    campaign_name: str
+    text: str
+    provider: str
+    """Who wrote it: a model's name, or `stub` when composed locally."""
+    first_day: date
+    last_day: date
+    days: int
+    spend: float
+    conversions: int
+    flagged_days: int
+    escalated_days: int
