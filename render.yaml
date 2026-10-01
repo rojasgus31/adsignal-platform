@@ -1,0 +1,39 @@
+# Render blueprint for the AdSignal API.
+#
+# The database is NOT defined here. Render's own free Postgres expires after
+# 30 days, which would quietly take the dashboard down a month after anyone
+# looked at it; Neon's free tier does not. So `ADSIGNAL_POSTGRES_DSN` points
+# at Neon and is set in the dashboard, not committed.
+#
+# Free instances sleep after 15 minutes idle and take about a minute to wake.
+# The dashboard already renders that as a "waking the service up" state rather
+# than an error, which is why the free tier is a workable choice here.
+services:
+  - type: web
+    name: adsignal-api
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # The API serves reads and runs the models; it never runs the pipeline.
+    dockerCommand: uvicorn adsignal.api.app:create_app --factory --host 0.0.0.0 --port $PORT
+    envVars:
+      # Every secret is `sync: false`: Render prompts for it once in the
+      # dashboard and never stores it in this file or in git.
+      - key: ADSIGNAL_POSTGRES_DSN
+        sync: false
+      - key: ADSIGNAL_POSTGRES_READONLY_DSN
+        sync: false
+      - key: ADSIGNAL_GEMINI_API_KEY
+        sync: false
+      - key: ADSIGNAL_GEMINI_MODEL
+        value: gemini-3.5-flash-lite
+      # The portfolio's own origin. Without it the browser blocks every call
+      # from the dashboard as a cross-origin request.
+      - key: ADSIGNAL_CORS_ORIGINS
+        sync: false
+      # Render terminates TLS one hop in front of the app, so the client IP
+      # the rate limiters key on is the first entry in X-Forwarded-For.
+      - key: ADSIGNAL_TRUSTED_PROXY_HOPS
+        value: "1"

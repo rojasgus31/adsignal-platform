@@ -1,0 +1,68 @@
+# The nightly run, which is the claim the Operations tab makes.
+#
+# GitHub Actions rather than a scheduler on the API host: the free web
+# instance sleeps after 15 minutes idle and cannot be relied on to wake itself
+# at 3am, and a cron inside a sleeping container is a cron that does not run.
+# This also keeps the pipeline off the serving instance entirely, so a long
+# training run never competes with a visitor's request.
+name: Nightly pipeline
+
+on:
+  schedule:
+    # 06:10 UTC, a little past the hour because the scheduler queues bursts on
+    # the hour and a delayed run is less visible than a skipped one.
+    - cron: "10 6 * * *"
+  # So a run can be triggered by hand after a deploy, without waiting a day.
+  workflow_dispatch:
+
+concurrency:
+  # Two pipelines writing the same mart would interleave their loads. A queued
+  # run is dropped rather than cancelling the one already training.
+  group: nightly-pipeline
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # Generating two years of events, training both models and writing the
+    # mart takes well over the 6 minute default.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --no-dev
+
+      - name: Install dbt packages
+        run: uv run dbt deps --project-dir dbt --profiles-dir dbt
+
+      - name: Materialise every asset
+        env:
+          # The serving database. The pipeline is the only writer.
+          ADSIGNAL_POSTGRES_DSN: ${{ secrets.ADSIGNAL_POSTGRES_DSN }}
+          # Only the narrative asset uses this. Absent, the chain falls back to
+          # its local writer and the run still succeeds, which is why this is
+          # not guarded: a missing key degrades the paragraph, not the job.
+          ADSIGNAL_GEMINI_API_KEY: ${{ secrets.ADSIGNAL_GEMINI_API_KEY }}
+          ADSIGNAL_GEMINI_MODEL: gemini-3.5-flash-lite
+        run: uv run dagster asset materialize --select '*' -m adsignal.pipeline.definitions
+
+      - name: Grant the read-only role its SELECTs
+        env:
+          # The admin DSN creates and grants; the read-only DSN is the exact
+          # one the API uses, password included, because the CLI verifies it
+          # by connecting as that role rather than trusting the grants.
+          ADSIGNAL_POSTGRES_DSN: ${{ secrets.ADSIGNAL_POSTGRES_DSN }}
+          ADSIGNAL_POSTGRES_READONLY_DSN: ${{ secrets.ADSIGNAL_POSTGRES_READONLY_DSN }}
+        # `/ask` runs generated SQL as `adsignal_ro`, which must be able to
+        # read tables the pipeline may have just recreated. Re-running this is
+        # idempotent and is what stops a fresh mart refusing every question.
+        run: uv run python -m adsignal.cli.bootstrap_readonly_role
